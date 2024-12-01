@@ -567,6 +567,7 @@ class FluxPipeline(
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        mul_sigmas: Optional[float] = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -629,6 +630,8 @@ class FluxPipeline(
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeline class.
             max_sequence_length (`int` defaults to 512): Maximum sequence length to use with the `prompt`.
+            mul_sigmas (`float`, *optional*, defaults to 1.0):
+                The factor to multiply `sigmas` by. By preventing excessive noise removal, it may improve the depiction of details and prevent bokeh. This was suggested on [Reddit](https://www.reddit.com/r/comfyui/comments/1g9wfbq/simple_way_to_increase_detail_in_flux_and_remove/). The original proposal recommended 0.95.
 
         Examples:
 
@@ -700,6 +703,7 @@ class FluxPipeline(
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        sigmas = sigmas * mul_sigmas if mul_sigmas is not None else sigmas
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
