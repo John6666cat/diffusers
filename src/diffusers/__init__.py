@@ -205,6 +205,7 @@ else:
             "MagCacheConfig",
             "PyramidAttentionBroadcastConfig",
             "SmoothedEnergyGuidanceConfig",
+            "SpectrumCacheConfig",
             "TaylorSeerCacheConfig",
             "TextKVCacheConfig",
             "apply_faster_cache",
@@ -212,6 +213,7 @@ else:
             "apply_layer_skip",
             "apply_mag_cache",
             "apply_pyramid_attention_broadcast",
+            "apply_spectrum_cache",
             "apply_taylorseer_cache",
             "apply_text_kv_cache",
         ]
@@ -1084,6 +1086,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             SmoothedEnergyGuidanceConfig,
+            SpectrumCacheConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
             apply_faster_cache,
@@ -1091,6 +1094,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             apply_layer_skip,
             apply_mag_cache,
             apply_pyramid_attention_broadcast,
+            apply_spectrum_cache,
             apply_taylorseer_cache,
             apply_text_kv_cache,
         )

@@ -26,6 +26,7 @@ if is_torch_available():
     from .mag_cache import MagCacheConfig, apply_mag_cache
     from .pyramid_attention_broadcast import PyramidAttentionBroadcastConfig, apply_pyramid_attention_broadcast
     from .smoothed_energy_guidance_utils import SmoothedEnergyGuidanceConfig
+    from .spectrum_cache import SpectrumCacheConfig, apply_spectrum_cache
     from .taylorseer_cache import TaylorSeerCacheConfig, apply_taylorseer_cache
     from .tensor_parallel import apply_tensor_parallel
     from .text_kv_cache import TextKVCacheConfig, apply_text_kv_cache
