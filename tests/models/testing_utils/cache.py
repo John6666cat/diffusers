@@ -20,6 +20,7 @@ import torch
 
 from diffusers.hooks import (
     FasterCacheConfig,
+    HookRegistry,
     FirstBlockCacheConfig,
     MagCacheConfig,
     PyramidAttentionBroadcastConfig,
@@ -207,6 +208,10 @@ class CacheTesterMixin:
         model.eval()
 
         config = self._get_cache_config()
+
+        # Build the root child-registry cache before cache hooks are registered. Enabling a cache
+        # must invalidate this stale topology so context propagation reaches newly-added stateful hooks.
+        HookRegistry.check_if_exists_or_initialize(model)._get_child_registries()
         model.enable_cache(config)
 
         # Run inference in first context
@@ -226,6 +231,20 @@ class CacheTesterMixin:
             msg="First pass in different cache contexts should produce the same output.",
         )
 
+        model.disable_cache()
+
+        # Re-enable after structural hook removal and verify context propagation still works.
+        model.enable_cache(config)
+        with model.cache_context("context_after_reenable"):
+            output_after_reenable = model(**inputs_dict, return_dict=False)[0]
+
+        assert_tensors_close(
+            output_ctx1,
+            output_after_reenable,
+            atol=atol,
+            rtol=rtol,
+            msg="Cache should remain usable after disable/re-enable with a rebuilt hook topology.",
+        )
         model.disable_cache()
 
     @torch.no_grad()
