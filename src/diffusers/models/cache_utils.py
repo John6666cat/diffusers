@@ -69,6 +69,7 @@ class CacheMixin:
         from ..hooks import (
             FasterCacheConfig,
             FirstBlockCacheConfig,
+            HookRegistry,
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             TaylorSeerCacheConfig,
@@ -100,6 +101,11 @@ class CacheMixin:
             apply_taylorseer_cache(self, config)
         else:
             raise ValueError(f"Cache config {type(config)} is not supported.")
+
+        # Applying a cache technique registers hooks on child blocks, which stales any
+        # `_child_registries_cache` built earlier (e.g. by a prior `cache_context`). Invalidate it
+        # so `_set_context` reaches the freshly-registered block hooks.
+        HookRegistry.check_if_exists_or_initialize(self).invalidate_child_registries_cache()
 
         self._cache_config = config
 
@@ -144,6 +150,9 @@ class CacheMixin:
         else:
             raise ValueError(f"Cache config {type(self._cache_config)} is not supported.")
 
+        # Removing the cache hooks stales any `_child_registries_cache` that included them.
+        registry.invalidate_child_registries_cache()
+
         self._cache_config = None
 
     def _reset_stateful_cache(self, recurse: bool = True) -> None:
@@ -159,6 +168,7 @@ class CacheMixin:
         registry = HookRegistry.check_if_exists_or_initialize(self)
         registry._set_context(name)
 
-        yield
-
-        registry._set_context(None)
+        try:
+            yield
+        finally:
+            registry._set_context(None)

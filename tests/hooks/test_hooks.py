@@ -19,6 +19,8 @@ import pytest
 import torch
 
 from diffusers.hooks import HookRegistry, ModelHook
+from diffusers.hooks.hooks import BaseState, StateManager
+from diffusers.models.cache_utils import CacheMixin
 from diffusers.training_utils import free_memory
 from diffusers.utils.logging import get_logger
 
@@ -120,6 +122,26 @@ class StatefulAddHook(ModelHook):
         self.increment = 0
 
 
+class ContextState(BaseState):
+    def reset(self):
+        pass
+
+
+class ContextStateHook(ModelHook):
+    _is_stateful = True
+
+    def __init__(self):
+        super().__init__()
+        self.state_manager = StateManager(ContextState)
+
+    def reset_state(self, module):
+        self.state_manager.reset()
+
+
+class CacheContextDummyModel(CacheMixin, DummyModel):
+    pass
+
+
 class SkipLayerHook(ModelHook):
     def __init__(self, skip_layer: bool):
         super().__init__()
@@ -205,6 +227,45 @@ class TestHooks:
 
         assert registry.get_hook("stateful_add_hook").increment == 1
         assert torch.allclose(output1, output2)
+
+    def test_child_registries_cache_invalidation(self):
+        # Unit-level part of the regression test for
+        # https://github.com/huggingface/diffusers/issues/14037: the parent registry caches its
+        # child registries, so a hook registered on a child block after the cache was built is
+        # invisible to the parent until the cache is invalidated.
+        parent = HookRegistry.check_if_exists_or_initialize(self.model)
+
+        # Build the parent's child-registry cache while no block carries a hook yet.
+        assert parent._get_child_registries() == []
+
+        # Register a hook on a child block. The parent's cached (empty) list is now stale.
+        block = self.model.blocks[0]
+        child = HookRegistry.check_if_exists_or_initialize(block)
+        child.register_hook(AddHook(1), "add_hook")
+        assert parent._get_child_registries() == []  # still stale before invalidation
+
+        # Invalidating across the tree makes the new child registry reachable from the parent.
+        parent.invalidate_child_registries_cache()
+        assert child in parent._get_child_registries()
+
+    def test_cache_context_clears_state_manager_context_on_exception(self):
+        model = CacheContextDummyModel(4, 8, 4, 1)
+        block = model.blocks[0]
+        child = HookRegistry.check_if_exists_or_initialize(block)
+        hook = ContextStateHook()
+        child.register_hook(hook, "context_state_hook")
+
+        with pytest.raises(RuntimeError, match="intentional cache-context test error"):
+            with model.cache_context("exception_context"):
+                assert hook.state_manager._current_context == "exception_context"
+                raise RuntimeError("intentional cache-context test error")
+
+        assert hook.state_manager._current_context is None
+
+        with model.cache_context("recovery_context"):
+            assert hook.state_manager._current_context == "recovery_context"
+
+        assert hook.state_manager._current_context is None
 
     def test_inference(self):
         registry = HookRegistry.check_if_exists_or_initialize(self.model)
