@@ -14,6 +14,7 @@
 
 import inspect
 import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,7 @@ _SPECTRUM_DENOISER_HOOK = "spectrum_cache_denoiser"
 _SPECTRUM_HEAD_BLOCK_HOOK = "spectrum_cache_head_block"
 _SPECTRUM_BLOCK_HOOK = "spectrum_cache_block"
 _SPECTRUM_UNET_FEATURE_HOOK = "spectrum_cache_unet_feature"
+_SPECTRUM_COSMOS_FEATURE_HOOK = "spectrum_cache_cosmos_feature"
 _FLUX_BLOCK_GROUPS = ("transformer_blocks", "single_transformer_blocks")
 _CONTROL_ARGUMENTS = ("controlnet_block_samples", "controlnet_single_block_samples")
 _UNET_RESIDUAL_ARGUMENTS = (
@@ -42,7 +44,7 @@ _UNET_RESIDUAL_ARGUMENTS = (
 
 @dataclass
 class SpectrumCacheConfig:
-    """Configuration for SPECTRUM cache on FLUX.1 transformers.
+    """Configuration for SPECTRUM cache on supported denoisers.
 
     SPECTRUM predicts the final image-stream transformer feature on selected denoising steps and skips the expensive
     transformer blocks on those prediction steps. The initial defaults reproduce the 50-step FLUX.1 research profile
@@ -82,6 +84,11 @@ class SpectrumCacheConfig:
             Explicitly allow IP-Adapter image embeddings carried in `added_cond_kwargs["image_embeds"]` to use SPECTRUM.
             The default remains fail-closed. Mixed special conditioning paths remain fail-closed even when their
             individual opt-ins are enabled. Autograd and non-default PEFT scale also remain fail-closed.
+        cosmos_runtime_state_callback (`Callable`, *optional*):
+            Runtime-state callback required for the experimental Anima / `CosmosTransformer3DModel` adapter. It must
+            return a mapping containing `step`, `num_inference_steps`, `num_conditions`, and `label` (`"cond"` or
+            `"uncond"`). It may also return `dynamic_conditioning=True` to force sticky fail-closed behavior for the
+            full trajectory. The callback is intentionally explicit because the model does not own guider state.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -102,6 +109,7 @@ class SpectrumCacheConfig:
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
+    cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.num_inference_steps < 1:
@@ -126,6 +134,8 @@ class SpectrumCacheConfig:
             raise ValueError("tail_actual_steps must be >= 0")
         if self.tail_actual_steps > self.num_inference_steps:
             raise ValueError("tail_actual_steps must be <= num_inference_steps")
+        if self.cosmos_runtime_state_callback is not None and not callable(self.cosmos_runtime_state_callback):
+            raise ValueError("cosmos_runtime_state_callback must be callable when provided")
 
 
 class SpectrumSchedule:
@@ -294,6 +304,134 @@ class SpectrumState(BaseState):
         return self.forecaster.predict(self.step_index)
 
 
+def _spectrum_tensor_signature(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return tuple(_spectrum_tensor_signature(item) for item in value)
+    if torch.is_tensor(value):
+        return (tuple(value.shape), str(value.dtype), str(value.device))
+    return type(value).__name__
+
+
+class SpectrumCosmosState(BaseState):
+    """Mutable state for the Anima / Cosmos SPECTRUM adapter."""
+
+    def __init__(self, config: SpectrumCacheConfig):
+        self.config = config
+        self.schedule = SpectrumSchedule(config)
+        self.reset()
+
+    def reset(self) -> None:
+        self.schedule.reset()
+        self.forecasters: dict[str, SpectrumForecaster] = {}
+        self.decisions: dict[int, bool] = {}
+        self.last_num_conditions: int | None = None
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.slot_signatures: dict[str, dict[str, Any]] = {}
+        self.current_label: str | None = None
+        self.current_step = -1
+        self.should_compute = True
+        self.bypass = False
+        self.compute_steps: list[int] = []
+        self.forecast_steps: list[int] = []
+        self.records: list[dict[str, Any]] = []
+        self.predict_failures: list[dict[str, Any]] = []
+        self.peak_history_bytes = 0
+
+    def latch(self, step: int, reason: str) -> None:
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = int(step)
+        record = {"step": int(step), "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def prepare_call(
+        self,
+        *,
+        step: int,
+        label: str,
+        num_conditions: int,
+        dynamic_conditioning: bool,
+        signature: dict[str, Any],
+    ) -> None:
+        self.current_step = int(step)
+        self.current_label = label
+
+        if self.current_step < 0 or self.current_step >= self.config.num_inference_steps:
+            self.latch(self.current_step, "logical step outside configured inference-step range")
+        if dynamic_conditioning:
+            self.latch(self.current_step, "dynamic guider/conditioning schedule declared by runtime callback")
+        if self.last_num_conditions is not None and num_conditions != self.last_num_conditions:
+            self.latch(
+                self.current_step,
+                f"guider condition-count changed {self.last_num_conditions}->{num_conditions}",
+            )
+        self.last_num_conditions = int(num_conditions)
+
+        previous_signature = self.slot_signatures.get(label)
+        if previous_signature is None:
+            self.slot_signatures[label] = signature
+        elif previous_signature != signature:
+            self.latch(self.current_step, f"conditioning/input signature changed for {label}")
+
+        if self.guard_latched:
+            self.should_compute = True
+            return
+
+        if self.current_step not in self.decisions:
+            self.decisions[self.current_step] = bool(self.schedule.decide(self.current_step))
+            target = self.compute_steps if self.decisions[self.current_step] else self.forecast_steps
+            target.append(self.current_step)
+        self.should_compute = self.decisions[self.current_step]
+
+    def _forecaster(self, label: str) -> SpectrumForecaster:
+        forecaster = self.forecasters.get(label)
+        if forecaster is None:
+            forecaster = SpectrumForecaster(self.config)
+            self.forecasters[label] = forecaster
+        return forecaster
+
+    def record_real_feature(self, feature: torch.Tensor) -> None:
+        if self.current_label is None:
+            raise RuntimeError("SPECTRUM Cosmos feature record has no active guider label.")
+        forecaster = self._forecaster(self.current_label)
+        forecaster.update(self.current_step, feature)
+        total = sum(item.history_bytes() for item in self.forecasters.values())
+        self.peak_history_bytes = max(self.peak_history_bytes, total)
+
+    def can_predict(self) -> bool:
+        if self.current_label is None:
+            return False
+        return bool(self._forecaster(self.current_label).features)
+
+    def predict(self) -> torch.Tensor:
+        if self.current_label is None:
+            raise RuntimeError("SPECTRUM Cosmos forecast has no active guider label.")
+        return self._forecaster(self.current_label).predict(self.current_step)
+
+    def summary(self) -> dict[str, Any]:
+        logical_prediction_steps = sorted(
+            {record["logical_step"] for record in self.records if record["predicted_body_used"]}
+        )
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "logical_prediction_steps_used": logical_prediction_steps,
+            "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
+            "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
+            "predict_failures": list(self.predict_failures),
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "peak_history_bytes": self.peak_history_bytes,
+            "records": list(self.records),
+        }
+
+
 class SpectrumDenoiserHook(ModelHook):
     """Root state owner and fail-closed gate for unsupported FLUX conditioning paths."""
 
@@ -404,6 +542,252 @@ class SpectrumBlockHook(ModelHook):
         hidden_states, encoder_hidden_states = _get_block_inputs(self._metadata, args, kwargs)
         return _pack_block_output(self._metadata, hidden_states, encoder_hidden_states)
 
+
+
+class SpectrumCosmosDenoiserHook(ModelHook):
+    """Root adapter for Anima's `CosmosTransformer3DModel`.
+
+    Full-compute steps execute the model's original forward. Forecast steps reproduce only the source-faithful
+    pre-block preparation and `norm_out -> proj_out -> unpatchify` tail around a predicted post-block feature.
+    Guider ownership is supplied explicitly by `cosmos_runtime_state_callback`; unsupported or changing conditions
+    latch sticky fail-closed behavior.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def _runtime_state(self, config: SpectrumCacheConfig) -> dict[str, Any]:
+        callback = config.cosmos_runtime_state_callback
+        if callback is None:
+            raise RuntimeError("Cosmos SPECTRUM requires cosmos_runtime_state_callback.")
+        runtime = callback()
+        if not isinstance(runtime, Mapping):
+            raise TypeError("cosmos_runtime_state_callback must return a mapping.")
+        required = ("step", "num_inference_steps", "num_conditions", "label")
+        missing = [name for name in required if name not in runtime]
+        if missing:
+            raise ValueError(f"Cosmos runtime-state callback is missing required keys: {missing}")
+        label = str(runtime["label"])
+        if label not in {"cond", "uncond"}:
+            raise ValueError(f"Cosmos runtime-state label must be 'cond' or 'uncond', got {label!r}.")
+        return dict(runtime)
+
+    def _record(self, state: SpectrumCosmosState, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": state.current_step,
+                "guider_label": state.current_label,
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        block_controlnet_hidden_states: list[torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        fps: int | None = None,
+        condition_mask: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        return_dict: bool = True,
+    ):
+        from torchvision import transforms
+
+        from ..models.modeling_outputs import Transformer2DModelOutput
+
+        state: SpectrumCosmosState = self.state_manager.get_state()
+        runtime = self._runtime_state(state.config)
+        step = int(runtime["step"])
+        num_inference_steps = int(runtime["num_inference_steps"])
+        num_conditions = int(runtime["num_conditions"])
+        label = str(runtime["label"])
+        dynamic_conditioning = bool(runtime.get("dynamic_conditioning", False))
+
+        if num_inference_steps != state.config.num_inference_steps:
+            state.latch(
+                step,
+                f"runtime num_inference_steps {num_inference_steps} != configured {state.config.num_inference_steps}",
+            )
+        if torch.is_grad_enabled() or module.training:
+            state.latch(step, "autograd/training entry")
+        if block_controlnet_hidden_states is not None:
+            state.latch(step, "block_controlnet_hidden_states present")
+        if condition_mask is not None:
+            state.latch(step, "condition_mask present")
+        if fps is not None:
+            state.latch(step, "video/fps path is not qualified by the Anima adapter")
+        if isinstance(encoder_hidden_states, tuple):
+            state.latch(step, "tuple/image-context encoder_hidden_states path is not qualified")
+
+        signature = {
+            "encoder": _spectrum_tensor_signature(encoder_hidden_states),
+            "attention_mask": _spectrum_tensor_signature(attention_mask),
+            "padding_mask": _spectrum_tensor_signature(padding_mask),
+            "input_shape": tuple(hidden_states.shape),
+        }
+        state.prepare_call(
+            step=step,
+            label=label,
+            num_conditions=num_conditions,
+            dynamic_conditioning=dynamic_conditioning,
+            signature=signature,
+        )
+
+        if state.guard_latched:
+            state.bypass = True
+            try:
+                output = self.fn_ref.original_forward(
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                    block_controlnet_hidden_states=block_controlnet_hidden_states,
+                    attention_mask=attention_mask,
+                    fps=fps,
+                    condition_mask=condition_mask,
+                    padding_mask=padding_mask,
+                    return_dict=return_dict,
+                )
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False)
+            return output
+
+        if state.should_compute or not state.can_predict():
+            output = self.fn_ref.original_forward(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                block_controlnet_hidden_states=block_controlnet_hidden_states,
+                attention_mask=attention_mask,
+                fps=fps,
+                condition_mask=condition_mask,
+                padding_mask=padding_mask,
+                return_dict=return_dict,
+            )
+            self._record(state, predicted=False)
+            return output
+
+        try:
+            predicted = state.predict()
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite predicted Cosmos body feature")
+        except Exception as error:
+            fallback_reason = f"{type(error).__name__}: {error}"
+            state.predict_failures.append(
+                {"step": step, "label": label, "error": fallback_reason}
+            )
+            state.latch(step, "forecast failure; fail closed")
+            state.should_compute = True
+            output = self.fn_ref.original_forward(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                block_controlnet_hidden_states=block_controlnet_hidden_states,
+                attention_mask=attention_mask,
+                fps=fps,
+                condition_mask=condition_mask,
+                padding_mask=padding_mask,
+                return_dict=return_dict,
+            )
+            self._record(state, predicted=False, fallback_reason=fallback_reason)
+            return output
+
+        unwrapped = unwrap_module(module)
+        batch_size, _, num_frames, height, width = hidden_states.shape
+
+        if unwrapped.config.concat_padding_mask:
+            if padding_mask is None:
+                raise ValueError("Cosmos SPECTRUM requires padding_mask when concat_padding_mask is enabled.")
+            padding_mask_resized = transforms.functional.resize(
+                padding_mask,
+                list(hidden_states.shape[-2:]),
+                interpolation=transforms.InterpolationMode.NEAREST,
+            )
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    padding_mask_resized.unsqueeze(2).repeat(batch_size, 1, num_frames, 1, 1),
+                ],
+                dim=1,
+            )
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+
+        # Preserve the source forward's preparation path even though the expensive block stack is skipped.
+        unwrapped.rope(hidden_states, fps=fps)
+        if unwrapped.config.extra_pos_embed_type:
+            unwrapped.learnable_pos_embed(hidden_states)
+
+        p_t, p_h, p_w = unwrapped.config.patch_size
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p_h
+        post_patch_width = width // p_w
+        patch_hidden_states = unwrapped.patch_embed(hidden_states).flatten(1, 3)
+
+        if timestep.ndim == 1:
+            temb, embedded_timestep = unwrapped.time_embed(patch_hidden_states, timestep)
+        elif timestep.ndim == 5:
+            if tuple(timestep.shape) != (batch_size, 1, num_frames, 1, 1):
+                raise ValueError(f"Unexpected Cosmos timestep shape {tuple(timestep.shape)}")
+            flat_timestep = timestep.flatten()
+            temb, embedded_timestep = unwrapped.time_embed(patch_hidden_states, flat_timestep)
+            temb, embedded_timestep = (
+                value.view(batch_size, post_patch_num_frames, 1, 1, -1)
+                .expand(-1, -1, post_patch_height, post_patch_width, -1)
+                .flatten(1, 3)
+                for value in (temb, embedded_timestep)
+            )
+        else:
+            raise ValueError(f"Unexpected Cosmos timestep ndim {timestep.ndim}")
+
+        hidden_states = unwrapped.norm_out(predicted, embedded_timestep, temb)
+        hidden_states = unwrapped.proj_out(hidden_states)
+        hidden_states = hidden_states.unflatten(2, (p_h, p_w, p_t, -1))
+        hidden_states = hidden_states.unflatten(
+            1, (post_patch_num_frames, post_patch_height, post_patch_width)
+        )
+        hidden_states = hidden_states.permute(0, 7, 1, 6, 2, 4, 3, 5)
+        hidden_states = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+        self._record(state, predicted=True)
+        if not return_dict:
+            return (hidden_states,)
+        return Transformer2DModelOutput(sample=hidden_states)
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumCosmosFeatureHook(ModelHook):
+    """Record the real post-`transformer_blocks` feature at the `norm_out` boundary."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def pre_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumCosmosState = self.state_manager.get_state()
+        if state.bypass or not state.should_compute:
+            return args, kwargs
+        if args:
+            feature = args[0]
+        else:
+            feature = kwargs.get("hidden_states")
+        if feature is None:
+            raise RuntimeError("SPECTRUM Cosmos feature hook could not locate norm_out input.")
+        state.record_real_feature(feature)
+        return args, kwargs
 
 
 class SpectrumUNetDenoiserHook(ModelHook):
@@ -619,17 +1003,47 @@ def _pack_block_output(
 
 
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
-    """Apply native-style SPECTRUM caching to supported FLUX and 2D conditional UNet denoisers.
+    """Apply native-style SPECTRUM caching to supported FLUX, Anima/Cosmos, and 2D conditional UNet denoisers.
 
-    FLUX uses block-stack hooks. UNet/SDXL uses the official SPECTRUM boundary immediately before
+    FLUX uses block-stack hooks. Anima/Cosmos predicts the post-transformer-block feature and recomputes
+    `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
     ``conv_norm_out``: real steps record that feature, while forecast steps skip the UNet body and
     execute only ``conv_norm_out -> conv_act -> conv_out``. Unsupported conditioning paths fail closed.
     """
 
+    from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped_module = unwrap_module(module)
+
+    if isinstance(unwrapped_module, CosmosTransformer3DModel):
+        if config.cosmos_runtime_state_callback is None:
+            raise ValueError(
+                "SPECTRUM Cosmos/Anima support requires cosmos_runtime_state_callback so guider ownership is explicit."
+            )
+        if (
+            unwrapped_module.config.use_crossattn_projection
+            or unwrapped_module.config.img_context_dim_in
+            or unwrapped_module.config.controlnet_block_every_n is not None
+        ):
+            raise ValueError(
+                "The current SPECTRUM Cosmos adapter is qualified only for Anima's text-only CosmosTransformer3DModel "
+                "configuration without image-context projection or ControlNet block injection."
+            )
+
+        state_manager = StateManager(SpectrumCosmosState, init_args=(config,))
+        root_registry = HookRegistry.check_if_exists_or_initialize(module)
+        root_registry.register_hook(SpectrumCosmosDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+        feature_registry = HookRegistry.check_if_exists_or_initialize(unwrapped_module.norm_out)
+        feature_registry.register_hook(SpectrumCosmosFeatureHook(state_manager), _SPECTRUM_COSMOS_FEATURE_HOOK)
+
+        logger.debug(
+            "Applied SPECTRUM cache to CosmosTransformer3DModel with %d expected inference steps.",
+            config.num_inference_steps,
+        )
+        return
 
     if isinstance(unwrapped_module, UNet2DConditionModel):
         if unwrapped_module.conv_norm_out is None:
@@ -650,7 +1064,8 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     if not isinstance(unwrapped_module, FluxTransformer2DModel):
         raise ValueError(
-            "SpectrumCacheConfig currently supports FluxTransformer2DModel and UNet2DConditionModel, "
+            "SpectrumCacheConfig currently supports FluxTransformer2DModel, CosmosTransformer3DModel, "
+            "and UNet2DConditionModel, "
             f"got {type(unwrapped_module)}."
         )
 

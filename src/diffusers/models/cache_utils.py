@@ -132,6 +132,7 @@ class CacheMixin:
         from ..hooks.pyramid_attention_broadcast import _PYRAMID_ATTENTION_BROADCAST_HOOK
         from ..hooks.spectrum_cache import (
             _SPECTRUM_BLOCK_HOOK,
+            _SPECTRUM_COSMOS_FEATURE_HOOK,
             _SPECTRUM_DENOISER_HOOK,
             _SPECTRUM_HEAD_BLOCK_HOOK,
             _SPECTRUM_UNET_FEATURE_HOOK,
@@ -165,6 +166,7 @@ class CacheMixin:
             registry.remove_hook(_SPECTRUM_HEAD_BLOCK_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_BLOCK_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_UNET_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_COSMOS_FEATURE_HOOK, recurse=True)
         else:
             raise ValueError(f"Cache config {type(self._cache_config)} is not supported.")
 
