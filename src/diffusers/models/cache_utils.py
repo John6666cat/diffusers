@@ -28,7 +28,7 @@ class CacheMixin:
         - [Pyramid Attention Broadcast](https://huggingface.co/papers/2408.12588)
         - [FasterCache](https://huggingface.co/papers/2410.19355)
         - [FirstBlockCache](https://github.com/chengzeyi/ParaAttention/blob/7a266123671b55e7e5a2fe9af3121f07a36afc78/README.md#first-block-cache-our-dynamic-caching)
-        - SPECTRUM (experimental FLUX.1 feature forecasting)
+        - SPECTRUM (experimental denoiser feature forecasting)
     """
 
     _cache_config = None
@@ -130,7 +130,12 @@ class CacheMixin:
         from ..hooks.first_block_cache import _FBC_BLOCK_HOOK, _FBC_LEADER_BLOCK_HOOK
         from ..hooks.mag_cache import _MAG_CACHE_BLOCK_HOOK, _MAG_CACHE_LEADER_BLOCK_HOOK
         from ..hooks.pyramid_attention_broadcast import _PYRAMID_ATTENTION_BROADCAST_HOOK
-        from ..hooks.spectrum_cache import _SPECTRUM_BLOCK_HOOK, _SPECTRUM_DENOISER_HOOK, _SPECTRUM_HEAD_BLOCK_HOOK
+        from ..hooks.spectrum_cache import (
+            _SPECTRUM_BLOCK_HOOK,
+            _SPECTRUM_DENOISER_HOOK,
+            _SPECTRUM_HEAD_BLOCK_HOOK,
+            _SPECTRUM_UNET_FEATURE_HOOK,
+        )
         from ..hooks.taylorseer_cache import _TAYLORSEER_CACHE_HOOK
         from ..hooks.text_kv_cache import _TEXT_KV_CACHE_BLOCK_HOOK, _TEXT_KV_CACHE_TRANSFORMER_HOOK
 
@@ -159,6 +164,7 @@ class CacheMixin:
             registry.remove_hook(_SPECTRUM_DENOISER_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_HEAD_BLOCK_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_UNET_FEATURE_HOOK, recurse=True)
         else:
             raise ValueError(f"Cache config {type(self._cache_config)} is not supported.")
 

@@ -29,6 +29,18 @@ def test_spectrum_default_refresh_schedule():
     assert len(compute_steps) == 14
 
 
+def test_spectrum_tail_actual_steps_preserves_default_and_forces_final_steps():
+    default = SpectrumCacheConfig(num_inference_steps=24)
+    default_schedule = SpectrumSchedule(default)
+    default_compute = [step for step in range(24) if default_schedule.decide(step)]
+    assert default_compute == [0, 1, 2, 3, 4, 6, 8, 11, 15, 20]
+
+    guarded = SpectrumCacheConfig(num_inference_steps=24, tail_actual_steps=3)
+    guarded_schedule = SpectrumSchedule(guarded)
+    guarded_compute = [step for step in range(24) if guarded_schedule.decide(step)]
+    assert guarded_compute == [0, 1, 2, 3, 4, 6, 8, 11, 15, 20, 21, 22, 23]
+
+
 def test_spectrum_forecaster_preserves_shape_dtype_and_history_limit():
     config = SpectrumCacheConfig(degree=2, history_limit=3)
     forecaster = SpectrumForecaster(config)
@@ -67,6 +79,8 @@ def test_spectrum_forecaster_rejects_shape_change():
         {"blend_w": 1.1},
         {"history_limit": 0},
         {"coordinate_max": 0},
+        {"tail_actual_steps": -1},
+        {"num_inference_steps": 4, "tail_actual_steps": 5},
     ],
 )
 def test_spectrum_config_validation(kwargs):
