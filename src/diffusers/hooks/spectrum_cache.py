@@ -305,6 +305,40 @@ class SpectrumState(BaseState):
         return self.forecaster.predict(self.step_index)
 
 
+class SpectrumWanState(SpectrumState):
+    """Context-local mutable state for the qualified Wan2.1 T2V 1.3B SPECTRUM route."""
+
+    def reset(self) -> None:
+        super().reset()
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.records: list[dict[str, Any]] = []
+
+    def latch(self, reason: str) -> None:
+        logical_step = max(int(self.step_index) + 1, 0)
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
+            "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "peak_history_bytes": self.peak_history_bytes,
+            "records": list(self.records),
+        }
+
+
 def _spectrum_tensor_signature(value: Any) -> Any:
     if value is None:
         return None
@@ -585,7 +619,7 @@ class SpectrumHeadBlockHook(ModelHook):
         predicted = state.predict()
         if predicted.shape != hidden_states.shape:
             raise ValueError(
-                f"SPECTRUM predicted feature shape {predicted.shape} does not match FLUX image feature shape "
+                f"SPECTRUM predicted feature shape {predicted.shape} does not match denoiser feature shape "
                 f"{hidden_states.shape}."
             )
         return _pack_block_output(self._metadata, predicted, encoder_hidden_states)
@@ -615,8 +649,7 @@ class SpectrumBlockHook(ModelHook):
             output = self.fn_ref.original_forward(*args, **kwargs)
             if self.is_tail:
                 hidden_states, _ = _get_block_outputs(self._metadata, output)
-                # FLUX keeps encoder/image streams separate in its registered block metadata; this tail hidden state is
-                # already the final image feature for the transformer stack.
+                # The registered block metadata exposes the body feature forecasted by SPECTRUM.
                 state.record_real_feature(hidden_states)
             return output
 
@@ -624,6 +657,95 @@ class SpectrumBlockHook(ModelHook):
         return _pack_block_output(self._metadata, hidden_states, encoder_hidden_states)
 
 
+
+
+class SpectrumWanDenoiserHook(ModelHook):
+    """Fail-closed root adapter for the qualified Wan2.1 T2V 1.3B text-only route.
+
+    The actual feature forecasting is handled by the generic head/middle/tail block hooks. This root hook owns
+    context-local safety guards only. Image-conditioned routes, Wan 2.2 sequence timesteps, autograd/training,
+    non-empty attention kwargs, and changing context-local structural signatures latch sticky full-compute behavior.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def _record(self, state: SpectrumWanState, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": max(int(state.step_index), 0),
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: torch.Tensor | None = None,
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+    ):
+        state: SpectrumWanState = self.state_manager.get_state()
+
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "timestep": _spectrum_tensor_signature(timestep),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for Wan SPECTRUM")
+        if encoder_hidden_states_image is not None:
+            state.latch("image-conditioned Wan route is not qualified")
+        if timestep is None or timestep.ndim != 1:
+            state.latch("non-1D Wan timestep route is not qualified")
+        if attention_kwargs:
+            state.latch("non-empty Wan attention_kwargs are not qualified")
+
+        if state.guard_latched:
+            state.bypass = True
+            reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else "sticky fail-closed guard"
+            try:
+                output = self.fn_ref.original_forward(
+                    hidden_states=hidden_states,
+                    timestep=timestep,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_image=encoder_hidden_states_image,
+                    return_dict=return_dict,
+                    attention_kwargs=attention_kwargs,
+                )
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False, fallback_reason=reason)
+            return output
+
+        output = self.fn_ref.original_forward(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+            return_dict=return_dict,
+            attention_kwargs=attention_kwargs,
+        )
+        self._record(state, predicted=not state.should_compute)
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
 
 
 class SpectrumFlux2DenoiserHook(ModelHook):
@@ -1234,9 +1356,10 @@ def _pack_block_output(
 
 
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
-    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Anima/Cosmos, and 2D conditional UNet denoisers.
+    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Wan, Anima/Cosmos, and 2D UNet denoisers.
 
-    FLUX.1 uses block-stack hooks. FLUX.2 Klein predicts the post-single-block image feature and recomputes
+    FLUX.1 and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
+    post-single-block image feature and recomputes
     `time_guidance_embed -> norm_out -> proj_out`. Anima/Cosmos predicts the post-transformer-block feature and recomputes
     `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
     ``conv_norm_out``: real steps record that feature, while forecast steps skip the UNet body and
@@ -1246,10 +1369,62 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
     from ..models.transformers.transformer_flux2 import Flux2Transformer2DModel
+    from ..models.transformers.transformer_wan import WanTransformer3DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped_module = unwrap_module(module)
 
+    if isinstance(unwrapped_module, WanTransformer3DModel):
+        expected_signature = {
+            "num_layers": 30,
+            "num_attention_heads": 12,
+            "attention_head_dim": 128,
+            "ffn_dim": 8960,
+            "text_dim": 4096,
+            "in_channels": 16,
+            "out_channels": 16,
+            "patch_size": (1, 2, 2),
+        }
+        observed_signature = {
+            key: tuple(getattr(unwrapped_module.config, key))
+            if key == "patch_size"
+            else getattr(unwrapped_module.config, key)
+            for key in expected_signature
+        }
+        if observed_signature != expected_signature:
+            raise ValueError(
+                "The current SPECTRUM Wan adapter is qualified only for the Wan2.1 T2V 1.3B transformer "
+                f"architecture. Expected {expected_signature}, got {observed_signature}."
+            )
+        if getattr(unwrapped_module.config, "image_dim", None) is not None or getattr(
+            unwrapped_module.config, "added_kv_proj_dim", None
+        ) is not None:
+            raise ValueError(
+                "The current SPECTRUM Wan adapter is qualified only for the text-only Wan2.1 T2V 1.3B route."
+            )
+
+        blocks = list(unwrapped_module.blocks)
+        if len(blocks) < 2:
+            raise ValueError("SPECTRUM Wan support requires at least two transformer blocks.")
+
+        state_manager = StateManager(SpectrumWanState, init_args=(config,))
+        root_registry = HookRegistry.check_if_exists_or_initialize(module)
+        root_registry.register_hook(SpectrumWanDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+        head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+        head_registry.register_hook(SpectrumHeadBlockHook(state_manager), _SPECTRUM_HEAD_BLOCK_HOOK)
+        for block in blocks[1:-1]:
+            registry = HookRegistry.check_if_exists_or_initialize(block)
+            registry.register_hook(SpectrumBlockHook(state_manager), _SPECTRUM_BLOCK_HOOK)
+        tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+        tail_registry.register_hook(SpectrumBlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
+
+        logger.debug(
+            "Applied SPECTRUM cache to qualified Wan2.1 T2V 1.3B transformer with %d blocks and %d expected steps.",
+            len(blocks),
+            config.num_inference_steps,
+        )
+        return
 
     if isinstance(unwrapped_module, Flux2Transformer2DModel):
         if bool(getattr(unwrapped_module.config, "guidance_embeds", False)):
@@ -1321,7 +1496,8 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     if not isinstance(unwrapped_module, FluxTransformer2DModel):
         raise ValueError(
             "SpectrumCacheConfig currently supports FluxTransformer2DModel, Flux2Transformer2DModel, "
-            "CosmosTransformer3DModel, and UNet2DConditionModel, "
+            "the qualified Wan2.1 T2V 1.3B WanTransformer3DModel route, CosmosTransformer3DModel, "
+            "and UNet2DConditionModel, "
             f"got {type(unwrapped_module)}."
         )
 
