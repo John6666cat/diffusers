@@ -33,6 +33,7 @@ _SPECTRUM_HEAD_BLOCK_HOOK = "spectrum_cache_head_block"
 _SPECTRUM_BLOCK_HOOK = "spectrum_cache_block"
 _SPECTRUM_UNET_FEATURE_HOOK = "spectrum_cache_unet_feature"
 _SPECTRUM_COSMOS_FEATURE_HOOK = "spectrum_cache_cosmos_feature"
+_SPECTRUM_FLUX2_FEATURE_HOOK = "spectrum_cache_flux2_feature"
 _FLUX_BLOCK_GROUPS = ("transformer_blocks", "single_transformer_blocks")
 _CONTROL_ARGUMENTS = ("controlnet_block_samples", "controlnet_single_block_samples")
 _UNET_RESIDUAL_ARGUMENTS = (
@@ -314,6 +315,86 @@ def _spectrum_tensor_signature(value: Any) -> Any:
     return type(value).__name__
 
 
+
+class SpectrumFlux2State(BaseState):
+    """Context-local mutable state for the FLUX.2 Klein SPECTRUM adapter."""
+
+    def __init__(self, config: SpectrumCacheConfig):
+        self.config = config
+        self.schedule = SpectrumSchedule(config)
+        self.forecaster = SpectrumForecaster(config)
+        self.reset()
+
+    def reset(self) -> None:
+        self.schedule.reset()
+        self.forecaster.reset()
+        self.step_index = -1
+        self.should_compute = True
+        self.record_real_feature_enabled = False
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.compute_steps: list[int] = []
+        self.forecast_steps: list[int] = []
+        self.records: list[dict[str, Any]] = []
+        self.predict_failures: list[dict[str, Any]] = []
+        self.peak_history_bytes = 0
+
+    def latch(self, reason: str) -> None:
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = int(self.step_index)
+        record = {"step": int(self.step_index), "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def start_call(self, signature: dict[str, Any]) -> None:
+        self.step_index += 1
+        if self.step_index >= self.config.num_inference_steps:
+            self.latch(
+                f"logical step {self.step_index} outside configured inference-step range "
+                f"{self.config.num_inference_steps}"
+            )
+
+        if self.signature is None:
+            self.signature = signature
+        elif self.signature != signature:
+            self.latch("context-local input signature changed")
+
+        if self.guard_latched:
+            self.should_compute = True
+            return
+
+        self.should_compute = bool(self.schedule.decide(self.step_index))
+        target = self.compute_steps if self.should_compute else self.forecast_steps
+        target.append(self.step_index)
+
+    def record_real_feature(self, feature: torch.Tensor) -> None:
+        self.forecaster.update(self.step_index, feature)
+        self.peak_history_bytes = max(self.peak_history_bytes, self.forecaster.history_bytes())
+
+    def can_predict(self) -> bool:
+        return bool(self.forecaster.features)
+
+    def predict(self) -> torch.Tensor:
+        return self.forecaster.predict(self.step_index)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
+            "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
+            "predict_failures": list(self.predict_failures),
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "peak_history_bytes": self.peak_history_bytes,
+            "records": list(self.records),
+        }
+
+
 class SpectrumCosmosState(BaseState):
     """Mutable state for the Anima / Cosmos SPECTRUM adapter."""
 
@@ -542,6 +623,156 @@ class SpectrumBlockHook(ModelHook):
         hidden_states, encoder_hidden_states = _get_block_inputs(self._metadata, args, kwargs)
         return _pack_block_output(self._metadata, hidden_states, encoder_hidden_states)
 
+
+
+
+class SpectrumFlux2DenoiserHook(ModelHook):
+    """Root adapter for standard non-distilled FLUX.2 Klein denoising.
+
+    Cache contexts supplied by `Flux2KleinPipeline` own independent `SpectrumFlux2State` instances, so `cond` and
+    `uncond` histories remain isolated without an external callback. Forecast steps bypass the expensive input/block
+    path and recompute only the source-faithful `time_guidance_embed -> norm_out -> proj_out` tail.
+
+    KV/reference-image routes, guidance-distilled transformer inputs, autograd/training, non-empty attention kwargs,
+    and changing context-local structural signatures latch sticky fail-closed behavior.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def _record(self, state: SpectrumFlux2State, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": state.step_index,
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        timestep: torch.Tensor | None = None,
+        img_ids: torch.Tensor | None = None,
+        txt_ids: torch.Tensor | None = None,
+        guidance: torch.Tensor | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+        kv_cache: Any = None,
+        kv_cache_mode: str | None = None,
+        num_ref_tokens: int = 0,
+        ref_fixed_timestep: float = 0.0,
+    ):
+        from ..models.transformers.transformer_flux2 import Flux2Transformer2DModelOutput
+
+        state: SpectrumFlux2State = self.state_manager.get_state()
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "img_ids": _spectrum_tensor_signature(img_ids),
+            "txt_ids": _spectrum_tensor_signature(txt_ids),
+            "guidance_is_none": guidance is None,
+        }
+        state.start_call(signature)
+
+        if torch.is_grad_enabled() or module.training:
+            state.latch("autograd/training is not qualified for FLUX.2 SPECTRUM")
+        if kv_cache_mode is not None or kv_cache is not None or int(num_ref_tokens) != 0:
+            state.latch("KV/reference-token route is not qualified for FLUX.2 SPECTRUM")
+        if guidance is not None:
+            state.latch("guidance-distilled transformer route is not qualified for FLUX.2 SPECTRUM")
+        if isinstance(joint_attention_kwargs, dict) and joint_attention_kwargs:
+            state.latch("non-empty joint_attention_kwargs is not qualified for FLUX.2 SPECTRUM")
+
+        if state.guard_latched:
+            state.should_compute = True
+
+        if state.should_compute or not state.can_predict():
+            state.record_real_feature_enabled = not state.guard_latched
+            try:
+                output = self.fn_ref.original_forward(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    timestep=timestep,
+                    img_ids=img_ids,
+                    txt_ids=txt_ids,
+                    guidance=guidance,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    return_dict=return_dict,
+                    kv_cache=kv_cache,
+                    kv_cache_mode=kv_cache_mode,
+                    num_ref_tokens=num_ref_tokens,
+                    ref_fixed_timestep=ref_fixed_timestep,
+                )
+            finally:
+                state.record_real_feature_enabled = False
+            self._record(state, predicted=False)
+            return output
+
+        try:
+            predicted = state.predict()
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite predicted FLUX.2 body feature")
+
+            tail_timestep = timestep.to(hidden_states.dtype) * 1000
+            temb = module.time_guidance_embed(tail_timestep, None)
+            output = module.proj_out(module.norm_out(predicted, temb))
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+            state.predict_failures.append({"step": state.step_index, "error": reason})
+            state.latch("forecast failure; sticky fail-closed")
+            state.record_real_feature_enabled = False
+            result = self.fn_ref.original_forward(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                img_ids=img_ids,
+                txt_ids=txt_ids,
+                guidance=guidance,
+                joint_attention_kwargs=joint_attention_kwargs,
+                return_dict=return_dict,
+                kv_cache=kv_cache,
+                kv_cache_mode=kv_cache_mode,
+                num_ref_tokens=num_ref_tokens,
+                ref_fixed_timestep=ref_fixed_timestep,
+            )
+            self._record(state, predicted=False, fallback_reason=reason)
+            return result
+
+        self._record(state, predicted=True)
+        if not return_dict:
+            return (output,)
+        return Flux2Transformer2DModelOutput(sample=output)
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumFlux2FeatureHook(ModelHook):
+    """Record the post-single-block image feature immediately before FLUX.2 `norm_out`."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def pre_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumFlux2State = self.state_manager.get_state()
+        if not state.record_real_feature_enabled:
+            return args, kwargs
+
+        feature = args[0] if args else kwargs.get("hidden_states")
+        if not torch.is_tensor(feature):
+            raise RuntimeError("SPECTRUM FLUX.2 feature hook could not locate norm_out input.")
+        state.record_real_feature(feature)
+        return args, kwargs
 
 
 class SpectrumCosmosDenoiserHook(ModelHook):
@@ -1003,9 +1234,10 @@ def _pack_block_output(
 
 
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
-    """Apply native-style SPECTRUM caching to supported FLUX, Anima/Cosmos, and 2D conditional UNet denoisers.
+    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Anima/Cosmos, and 2D conditional UNet denoisers.
 
-    FLUX uses block-stack hooks. Anima/Cosmos predicts the post-transformer-block feature and recomputes
+    FLUX.1 uses block-stack hooks. FLUX.2 Klein predicts the post-single-block image feature and recomputes
+    `time_guidance_embed -> norm_out -> proj_out`. Anima/Cosmos predicts the post-transformer-block feature and recomputes
     `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
     ``conv_norm_out``: real steps record that feature, while forecast steps skip the UNet body and
     execute only ``conv_norm_out -> conv_act -> conv_out``. Unsupported conditioning paths fail closed.
@@ -1013,9 +1245,33 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
+    from ..models.transformers.transformer_flux2 import Flux2Transformer2DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped_module = unwrap_module(module)
+
+
+    if isinstance(unwrapped_module, Flux2Transformer2DModel):
+        if bool(getattr(unwrapped_module.config, "guidance_embeds", False)):
+            raise ValueError(
+                "The current SPECTRUM FLUX.2 adapter is qualified only for the non-distilled Klein Base route "
+                "with guidance_embeds=False."
+            )
+        if getattr(unwrapped_module, "norm_out", None) is None or getattr(unwrapped_module, "proj_out", None) is None:
+            raise ValueError("SPECTRUM FLUX.2 support requires norm_out and proj_out.")
+
+        state_manager = StateManager(SpectrumFlux2State, init_args=(config,))
+        root_registry = HookRegistry.check_if_exists_or_initialize(module)
+        root_registry.register_hook(SpectrumFlux2DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+        feature_registry = HookRegistry.check_if_exists_or_initialize(unwrapped_module.norm_out)
+        feature_registry.register_hook(SpectrumFlux2FeatureHook(state_manager), _SPECTRUM_FLUX2_FEATURE_HOOK)
+
+        logger.debug(
+            "Applied SPECTRUM cache to Flux2Transformer2DModel with %d expected inference steps.",
+            config.num_inference_steps,
+        )
+        return
 
     if isinstance(unwrapped_module, CosmosTransformer3DModel):
         if config.cosmos_runtime_state_callback is None:
@@ -1064,8 +1320,8 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     if not isinstance(unwrapped_module, FluxTransformer2DModel):
         raise ValueError(
-            "SpectrumCacheConfig currently supports FluxTransformer2DModel, CosmosTransformer3DModel, "
-            "and UNet2DConditionModel, "
+            "SpectrumCacheConfig currently supports FluxTransformer2DModel, Flux2Transformer2DModel, "
+            "CosmosTransformer3DModel, and UNet2DConditionModel, "
             f"got {type(unwrapped_module)}."
         )
 
