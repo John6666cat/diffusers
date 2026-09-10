@@ -53,13 +53,19 @@ def make_unqualified_model():
     ).eval()
 
 
-def make_inputs(step=0, *, attention_kwargs=None, additional_t_cond=None):
+def make_inputs(step=0, *, edit=False, references=1, attention_kwargs=None, additional_t_cond=None):
+    if edit:
+        img_shapes = [[(1, 4, 4)] + [(1, 4, 4)] * references]
+        hidden_tokens = 16 * (1 + references)
+    else:
+        img_shapes = [[(1, 4, 4)]]
+        hidden_tokens = 16
     return {
-        "hidden_states": torch.randn(1, 16, 4),
+        "hidden_states": torch.randn(1, hidden_tokens, 4),
         "encoder_hidden_states": torch.randn(1, 4, 8),
         "encoder_hidden_states_mask": None,
         "timestep": torch.tensor([1.0 - step / 20.0]),
-        "img_shapes": [[(1, 4, 4)]],
+        "img_shapes": img_shapes,
         "guidance": None,
         "attention_kwargs": attention_kwargs,
         "controlnet_block_samples": None,
@@ -164,15 +170,65 @@ def test_spectrum_qwenimage_2512_shape_change_latches_sticky_failclosed():
 
 
 @torch.no_grad()
-def test_spectrum_qwenimage_rejects_edit_zero_cond_t_at_enable():
+def test_spectrum_qwenimage_edit2511_exact_selected6_schedule_and_block_accounting():
     model = make_model(zero_cond_t=True)
+    calls = [0 for _ in model.transformer_blocks]
+    hooks = []
+    for i, block in enumerate(model.transformer_blocks):
+        hooks.append(block.attn.register_forward_hook(lambda *args, i=i: calls.__setitem__(i, calls[i] + 1)))
     try:
         model.enable_cache(make_config())
-    except ValueError as error:
-        assert "Qwen-Image-2512 standard T2I transformer architecture" in str(error)
-        assert "zero_cond_t" in str(error)
-    else:
-        raise AssertionError("Expected Qwen-Image Edit-style zero_cond_t architecture to be rejected.")
+        for step in range(20):
+            with model.cache_context("cond"):
+                output = model(**make_inputs(step, edit=True))
+            assert_finite_sample(output)
+
+        root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+        assert root.route == "edit"
+        summary = root.state_manager._state_cache["cond"].summary()
+        assert summary["compute_steps"] == [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 16, 17, 18, 19]
+        assert summary["forecast_steps"] == [6, 8, 10, 12, 14, 15]
+        assert summary["prediction_call_count"] == 6
+        assert summary["full_call_count"] == 14
+        assert not summary["guard_latched"]
+        assert calls == [14] * 60
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_edit2511_requires_exactly_one_reference_latent():
+    model = make_model(zero_cond_t=True)
+    model.enable_cache(make_config())
+
+    with model.cache_context("cond"):
+        output = model(**make_inputs(0, edit=True, references=0))
+    assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    summary = root.state_manager._state_cache["cond"].summary()
+    assert summary["guard_latched"]
+    assert summary["prediction_call_count"] == 0
+    assert summary["full_call_count"] == 1
+    assert any("exactly one reference latent" in item["reason"] for item in summary["guard_reasons"])
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_edit2511_rejects_multiple_reference_latents_failclosed():
+    model = make_model(zero_cond_t=True)
+    model.enable_cache(make_config())
+
+    with model.cache_context("cond"):
+        output = model(**make_inputs(0, edit=True, references=2))
+    assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    summary = root.state_manager._state_cache["cond"].summary()
+    assert summary["guard_latched"]
+    assert summary["prediction_call_count"] == 0
+    assert summary["full_call_count"] == 1
+    assert any("exactly one reference latent" in item["reason"] for item in summary["guard_reasons"])
 
 
 def test_spectrum_qwenimage_autograd_latches_failclosed():
@@ -195,6 +251,6 @@ def test_spectrum_qwenimage_rejects_unqualified_architecture_at_enable():
     try:
         model.enable_cache(make_config())
     except ValueError as error:
-        assert "Qwen-Image-2512 standard T2I transformer architecture" in str(error)
+        assert "Qwen-Image-2512 T2I and Qwen-Image-Edit-2511 transformer architectures" in str(error)
     else:
         raise AssertionError("Expected unqualified Qwen-Image architecture to be rejected.")
