@@ -339,6 +339,10 @@ class SpectrumWanState(SpectrumState):
         }
 
 
+class SpectrumZImageState(SpectrumWanState):
+    """Context-local mutable state for the qualified Z-Image Turbo standard T2I SPECTRUM route."""
+
+
 def _spectrum_tensor_signature(value: Any) -> Any:
     if value is None:
         return None
@@ -740,6 +744,112 @@ class SpectrumWanDenoiserHook(ModelHook):
             return_dict=return_dict,
             attention_kwargs=attention_kwargs,
         )
+        self._record(state, predicted=not state.should_compute)
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumZImageDenoiserHook(ModelHook):
+    """Fail-closed root adapter for the qualified Z-Image Turbo standard T2I route.
+
+    The generic head/middle/tail block hooks forecast the unified post-refiner stream across the 30 main
+    transformer blocks. Omni/nested-image, ControlNet, SigLIP, image-noise-mask, non-default patching,
+    autograd/training, and changing context-local structural signatures latch sticky full-compute behavior.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    @staticmethod
+    def _sequence_signature(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return tuple(_spectrum_tensor_signature(item) for item in value)
+        return _spectrum_tensor_signature(value)
+
+    def _record(self, state: SpectrumZImageState, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": max(int(state.step_index), 0),
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        x,
+        t,
+        cap_feats,
+        return_dict: bool = True,
+        controlnet_block_samples: dict[int, torch.Tensor] | None = None,
+        siglip_feats=None,
+        image_noise_mask=None,
+        patch_size: int = 2,
+        f_patch_size: int = 1,
+    ):
+        state: SpectrumZImageState = self.state_manager.get_state()
+
+        signature = {
+            "x": self._sequence_signature(x),
+            "t": _spectrum_tensor_signature(t),
+            "cap_feats": self._sequence_signature(cap_feats),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for Z-Image Turbo SPECTRUM")
+        if not isinstance(x, (list, tuple)) or not x:
+            state.latch("non-sequence Z-Image input is not qualified")
+        elif isinstance(x[0], list):
+            state.latch("Omni/nested-image Z-Image route is not qualified")
+        if isinstance(cap_feats, (list, tuple)) and cap_feats and isinstance(cap_feats[0], list):
+            state.latch("nested caption-feature Z-Image route is not qualified")
+        if controlnet_block_samples is not None:
+            state.latch("ControlNet Z-Image route is not qualified")
+        if siglip_feats is not None:
+            state.latch("SigLIP Z-Image route is not qualified")
+        if image_noise_mask is not None:
+            state.latch("image-noise-mask Z-Image route is not qualified")
+        if int(patch_size) != 2 or int(f_patch_size) != 1:
+            state.latch("non-default Z-Image patch geometry is not qualified")
+        if t is None or not torch.is_tensor(t) or t.ndim != 1:
+            state.latch("non-1D Z-Image timestep route is not qualified")
+
+        call_kwargs = {
+            "x": x,
+            "t": t,
+            "cap_feats": cap_feats,
+            "return_dict": return_dict,
+            "controlnet_block_samples": controlnet_block_samples,
+            "siglip_feats": siglip_feats,
+            "image_noise_mask": image_noise_mask,
+            "patch_size": patch_size,
+            "f_patch_size": f_patch_size,
+        }
+
+        if state.guard_latched:
+            state.bypass = True
+            reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else "sticky fail-closed guard"
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False, fallback_reason=reason)
+            return output
+
+        output = self.fn_ref.original_forward(**call_kwargs)
         self._record(state, predicted=not state.should_compute)
         return output
 
@@ -1326,7 +1436,7 @@ class SpectrumUNetFeatureHook(ModelHook):
 def _get_block_inputs(
     metadata: TransformerBlockMetadata, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    hidden_states = metadata._get_parameter_from_args_kwargs("hidden_states", args, kwargs)
+    hidden_states = metadata._get_parameter_from_args_kwargs(metadata.hidden_states_argument_name, args, kwargs)
     encoder_hidden_states = None
     if metadata.return_encoder_hidden_states_index is not None:
         encoder_hidden_states = metadata._get_parameter_from_args_kwargs("encoder_hidden_states", args, kwargs)
@@ -1356,9 +1466,9 @@ def _pack_block_output(
 
 
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
-    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Wan, Anima/Cosmos, and 2D UNet denoisers.
+    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Z-Image, Wan, Anima/Cosmos, and 2D UNet denoisers.
 
-    FLUX.1 and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
+    FLUX.1, the qualified Z-Image Turbo standard T2I route, and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
     post-single-block image feature and recomputes
     `time_guidance_embed -> norm_out -> proj_out`. Anima/Cosmos predicts the post-transformer-block feature and recomputes
     `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
@@ -1370,9 +1480,59 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
     from ..models.transformers.transformer_flux2 import Flux2Transformer2DModel
     from ..models.transformers.transformer_wan import WanTransformer3DModel
+    from ..models.transformers.transformer_z_image import ZImageTransformer2DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped_module = unwrap_module(module)
+
+    if isinstance(unwrapped_module, ZImageTransformer2DModel):
+        expected_signature = {
+            "all_patch_size": (2,),
+            "all_f_patch_size": (1,),
+            "in_channels": 16,
+            "dim": 3840,
+            "n_layers": 30,
+            "n_refiner_layers": 2,
+            "n_heads": 30,
+            "n_kv_heads": 30,
+            "cap_feat_dim": 2560,
+            "siglip_feat_dim": None,
+        }
+        observed_signature = {
+            key: tuple(getattr(unwrapped_module.config, key))
+            if key in {"all_patch_size", "all_f_patch_size"}
+            else getattr(unwrapped_module.config, key)
+            for key in expected_signature
+        }
+        if observed_signature != expected_signature:
+            raise ValueError(
+                "The current SPECTRUM Z-Image adapter is qualified only for the Z-Image Turbo standard "
+                f"T2I transformer architecture. Expected {expected_signature}, got {observed_signature}."
+            )
+
+        blocks = list(unwrapped_module.layers)
+        if len(blocks) != 30:
+            raise ValueError("SPECTRUM Z-Image Turbo support requires exactly 30 main transformer blocks.")
+
+        state_manager = StateManager(SpectrumZImageState, init_args=(config,))
+        root_registry = HookRegistry.check_if_exists_or_initialize(module)
+        root_registry.register_hook(SpectrumZImageDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+        head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+        head_registry.register_hook(SpectrumHeadBlockHook(state_manager), _SPECTRUM_HEAD_BLOCK_HOOK)
+        for block in blocks[1:-1]:
+            registry = HookRegistry.check_if_exists_or_initialize(block)
+            registry.register_hook(SpectrumBlockHook(state_manager), _SPECTRUM_BLOCK_HOOK)
+        tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+        tail_registry.register_hook(SpectrumBlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
+
+        logger.debug(
+            "Applied SPECTRUM cache to qualified Z-Image Turbo standard T2I transformer with %d main blocks "
+            "and %d expected steps.",
+            len(blocks),
+            config.num_inference_steps,
+        )
+        return
 
     if isinstance(unwrapped_module, WanTransformer3DModel):
         expected_signature = {
@@ -1496,6 +1656,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     if not isinstance(unwrapped_module, FluxTransformer2DModel):
         raise ValueError(
             "SpectrumCacheConfig currently supports FluxTransformer2DModel, Flux2Transformer2DModel, "
+            "the qualified Z-Image Turbo ZImageTransformer2DModel route, "
             "the qualified Wan2.1 T2V 1.3B WanTransformer3DModel route, CosmosTransformer3DModel, "
             "and UNet2DConditionModel, "
             f"got {type(unwrapped_module)}."

@@ -350,6 +350,7 @@ def _register_transformer_blocks_metadata():
         metadata=TransformerBlockMetadata(
             return_hidden_states_index=0,
             return_encoder_hidden_states_index=None,
+            hidden_states_argument_name="x",
         ),
     )
 

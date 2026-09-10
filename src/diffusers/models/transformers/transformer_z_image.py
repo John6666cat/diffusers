@@ -26,6 +26,7 @@ from ...models.modeling_utils import ModelMixin
 from ...models.normalization import RMSNorm
 from ...utils.torch_utils import maybe_allow_in_graph
 from ..attention_dispatch import dispatch_attention_fn
+from ..cache_utils import CacheMixin
 from ..modeling_outputs import Transformer2DModelOutput
 
 
@@ -356,7 +357,7 @@ class RopeEmbedder:
         return torch.cat(result, dim=-1)
 
 
-class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
+class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _repeated_blocks = ["ZImageTransformerBlock"]
