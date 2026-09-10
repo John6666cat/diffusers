@@ -340,7 +340,7 @@ class SpectrumWanState(SpectrumState):
 
 
 class SpectrumZImageState(SpectrumWanState):
-    """Context-local mutable state for the qualified Z-Image Turbo standard T2I SPECTRUM route."""
+    """Context-local mutable state for the qualified Z-Image standard T2I Base/Turbo SPECTRUM route."""
 
 
 def _spectrum_tensor_signature(value: Any) -> Any:
@@ -753,7 +753,7 @@ class SpectrumWanDenoiserHook(ModelHook):
 
 
 class SpectrumZImageDenoiserHook(ModelHook):
-    """Fail-closed root adapter for the qualified Z-Image Turbo standard T2I route.
+    """Fail-closed root adapter for the qualified Z-Image standard T2I Base/Turbo route.
 
     The generic head/middle/tail block hooks forecast the unified post-refiner stream across the 30 main
     transformer blocks. Omni/nested-image, ControlNet, SigLIP, image-noise-mask, non-default patching,
@@ -809,7 +809,7 @@ class SpectrumZImageDenoiserHook(ModelHook):
             state.latch("context-local input signature changed")
 
         if module.training or torch.is_grad_enabled():
-            state.latch("autograd/training is not qualified for Z-Image Turbo SPECTRUM")
+            state.latch("autograd/training is not qualified for Z-Image standard T2I SPECTRUM")
         if not isinstance(x, (list, tuple)) or not x:
             state.latch("non-sequence Z-Image input is not qualified")
         elif isinstance(x[0], list):
@@ -1468,7 +1468,7 @@ def _pack_block_output(
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
     """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Z-Image, Wan, Anima/Cosmos, and 2D UNet denoisers.
 
-    FLUX.1, the qualified Z-Image Turbo standard T2I route, and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
+    FLUX.1, the qualified Z-Image standard T2I Base/Turbo route, and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
     post-single-block image feature and recomputes
     `time_guidance_embed -> norm_out -> proj_out`. Anima/Cosmos predicts the post-transformer-block feature and recomputes
     `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
@@ -1506,13 +1506,13 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         }
         if observed_signature != expected_signature:
             raise ValueError(
-                "The current SPECTRUM Z-Image adapter is qualified only for the Z-Image Turbo standard "
-                f"T2I transformer architecture. Expected {expected_signature}, got {observed_signature}."
+                "The current SPECTRUM Z-Image adapter is qualified only for the Z-Image standard T2I Base/Turbo "
+                f"transformer architecture. Expected {expected_signature}, got {observed_signature}."
             )
 
         blocks = list(unwrapped_module.layers)
         if len(blocks) != 30:
-            raise ValueError("SPECTRUM Z-Image Turbo support requires exactly 30 main transformer blocks.")
+            raise ValueError("SPECTRUM Z-Image standard T2I Base/Turbo support requires exactly 30 main transformer blocks.")
 
         state_manager = StateManager(SpectrumZImageState, init_args=(config,))
         root_registry = HookRegistry.check_if_exists_or_initialize(module)
@@ -1527,7 +1527,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         tail_registry.register_hook(SpectrumBlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
 
         logger.debug(
-            "Applied SPECTRUM cache to qualified Z-Image Turbo standard T2I transformer with %d main blocks "
+            "Applied SPECTRUM cache to qualified Z-Image standard T2I Base/Turbo transformer with %d main blocks "
             "and %d expected steps.",
             len(blocks),
             config.num_inference_steps,
@@ -1656,7 +1656,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     if not isinstance(unwrapped_module, FluxTransformer2DModel):
         raise ValueError(
             "SpectrumCacheConfig currently supports FluxTransformer2DModel, Flux2Transformer2DModel, "
-            "the qualified Z-Image Turbo ZImageTransformer2DModel route, "
+            "the qualified Z-Image standard T2I Base/Turbo ZImageTransformer2DModel route, "
             "the qualified Wan2.1 T2V 1.3B WanTransformer3DModel route, CosmosTransformer3DModel, "
             "and UNet2DConditionModel, "
             f"got {type(unwrapped_module)}."

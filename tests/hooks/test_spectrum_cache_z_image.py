@@ -5,7 +5,7 @@ from diffusers.hooks._helpers import TransformerBlockRegistry
 from diffusers.hooks.spectrum_cache import SpectrumCacheConfig
 
 
-ZIMAGE_TURBO_CONFIG_SIGNATURE = {
+ZIMAGE_STANDARD_T2I_CONFIG_SIGNATURE = {
     "all_patch_size": (2,),
     "all_f_patch_size": (1,),
     "in_channels": 16,
@@ -34,8 +34,8 @@ def make_model():
         axes_dims=[4, 2, 2],
         axes_lens=[1024, 512, 512],
     ).eval()
-    # Tiny mechanics graph; adapter itself is fail-closed to the exact Turbo config.
-    model.register_to_config(**ZIMAGE_TURBO_CONFIG_SIGNATURE)
+    # Tiny mechanics graph; adapter itself is fail-closed to the exact qualified standard T2I Base/Turbo config.
+    model.register_to_config(**ZIMAGE_STANDARD_T2I_CONFIG_SIGNATURE)
     return model
 
 
@@ -56,10 +56,10 @@ def make_unqualified_model():
     ).eval()
 
 
-def make_inputs(step=0, *, controlnet_block_samples=None):
+def make_inputs(step=0, *, total_steps=8, controlnet_block_samples=None):
     return {
         "x": [torch.randn(4, 1, 8, 8)],
-        "t": torch.tensor([1.0 - step / 8.0]),
+        "t": torch.tensor([1.0 - step / float(total_steps)]),
         "cap_feats": [torch.randn(12, 16)],
         "return_dict": True,
         "controlnet_block_samples": controlnet_block_samples,
@@ -82,6 +82,21 @@ def make_config():
         history_limit=20,
         coordinate_max=8.0,
         tail_actual_steps=0,
+    )
+
+
+def make_base_config():
+    return SpectrumCacheConfig(
+        num_inference_steps=28,
+        warmup_steps=9,
+        window_size=2.0,
+        flex_window=0.0,
+        degree=3,
+        ridge_lambda=0.1,
+        blend_w=0.5,
+        history_limit=28,
+        coordinate_max=28.0,
+        tail_actual_steps=4,
     )
 
 
@@ -129,6 +144,38 @@ def test_spectrum_zimage_turbo_standard_context_exact_schedule_and_block_account
         model.disable_cache()
         assert not model.is_cache_enabled
         assert model._diffusers_hook.get_hook("spectrum_cache_denoiser") is None
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+@torch.no_grad()
+def test_spectrum_zimage_base_standard_context_exact_28step_schedule_and_block_accounting():
+    model = make_model()
+    calls = [0 for _ in model.layers]
+    hooks = []
+    for i, layer in enumerate(model.layers):
+        hooks.append(
+            layer.attention.register_forward_hook(
+                lambda *args, i=i: calls.__setitem__(i, calls[i] + 1)
+            )
+        )
+    try:
+        model.enable_cache(make_base_config())
+        for step in range(28):
+            with model.cache_context("cond"):
+                output = model(**make_inputs(step, total_steps=28))
+            assert_finite_sample(output)
+
+        root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+        summary = root.state_manager._state_cache["cond"].summary()
+        assert summary["compute_steps"] == [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 25, 26, 27]
+        assert summary["forecast_steps"] == [9, 11, 13, 15, 17, 19, 21, 23]
+        assert summary["prediction_call_count"] == 8
+        assert summary["full_call_count"] == 20
+        assert not summary["guard_latched"]
+        assert calls == [20] * 30
+        assert sum(calls) == 600
     finally:
         for hook in hooks:
             hook.remove()
@@ -200,6 +247,6 @@ def test_spectrum_zimage_rejects_unqualified_architecture_at_enable():
     try:
         model.enable_cache(make_config())
     except ValueError as error:
-        assert "Z-Image Turbo standard T2I transformer architecture" in str(error)
+        assert "Z-Image standard T2I Base/Turbo transformer architecture" in str(error)
     else:
-        raise AssertionError("Expected non-Turbo Z-Image architecture to be rejected.")
+        raise AssertionError("Expected unqualified Z-Image architecture to be rejected.")
