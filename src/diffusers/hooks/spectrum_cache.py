@@ -343,6 +343,10 @@ class SpectrumZImageState(SpectrumWanState):
     """Context-local mutable state for the qualified Z-Image standard T2I Base/Turbo SPECTRUM route."""
 
 
+class SpectrumQwenImageState(SpectrumWanState):
+    """Context-local mutable state for the qualified Qwen-Image-2512 standard T2I SPECTRUM route."""
+
+
 def _spectrum_tensor_signature(value: Any) -> Any:
     if value is None:
         return None
@@ -744,6 +748,129 @@ class SpectrumWanDenoiserHook(ModelHook):
             return_dict=return_dict,
             attention_kwargs=attention_kwargs,
         )
+        self._record(state, predicted=not state.should_compute)
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumQwenImageDenoiserHook(ModelHook):
+    """Fail-closed root adapter for the qualified Qwen-Image-2512 standard T2I route.
+
+    The generic head/middle/tail block hooks forecast the image stream after the 60 dual-stream transformer blocks.
+    Edit/reference-image semantics, guidance-distilled model inputs, ControlNet/additional timestep conditioning,
+    non-empty attention kwargs, autograd/training, and changing context-local structural signatures latch sticky
+    full-compute behavior.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    @staticmethod
+    def _structure_signature(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return tuple(SpectrumQwenImageDenoiserHook._structure_signature(item) for item in value)
+        if torch.is_tensor(value):
+            return _spectrum_tensor_signature(value)
+        return value
+
+    @staticmethod
+    def _standard_t2i_shapes(img_shapes: Any, hidden_states: torch.Tensor) -> bool:
+        if not isinstance(img_shapes, (list, tuple)) or len(img_shapes) != hidden_states.shape[0]:
+            return False
+        for sample_shapes in img_shapes:
+            if not isinstance(sample_shapes, (list, tuple)) or len(sample_shapes) != 1:
+                return False
+            shape = sample_shapes[0]
+            if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+                return False
+            if math.prod(int(value) for value in shape) != hidden_states.shape[1]:
+                return False
+        return True
+
+    def _record(self, state: SpectrumQwenImageState, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": max(int(state.step_index), 0),
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: list[tuple[int, int, int]] | None = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        controlnet_block_samples=None,
+        additional_t_cond=None,
+        return_dict: bool = True,
+    ):
+        state: SpectrumQwenImageState = self.state_manager.get_state()
+
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "encoder_hidden_states_mask": _spectrum_tensor_signature(encoder_hidden_states_mask),
+            "timestep": _spectrum_tensor_signature(timestep),
+            "img_shapes": self._structure_signature(img_shapes),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for Qwen-Image-2512 SPECTRUM")
+        if not self._standard_t2i_shapes(img_shapes, hidden_states):
+            state.latch("non-standard or reference-image Qwen-Image shape route is not qualified")
+        if timestep is None or not torch.is_tensor(timestep) or timestep.ndim != 1:
+            state.latch("non-1D Qwen-Image timestep route is not qualified")
+        if guidance is not None:
+            state.latch("guidance-distilled Qwen-Image transformer input is not qualified")
+        if attention_kwargs:
+            state.latch("non-empty Qwen-Image attention_kwargs are not qualified")
+        if controlnet_block_samples is not None:
+            state.latch("ControlNet Qwen-Image route is not qualified")
+        if additional_t_cond is not None:
+            state.latch("additional timestep conditioning is not qualified for Qwen-Image-2512 SPECTRUM")
+
+        call_kwargs = {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
+            "timestep": timestep,
+            "img_shapes": img_shapes,
+            "guidance": guidance,
+            "attention_kwargs": attention_kwargs,
+            "controlnet_block_samples": controlnet_block_samples,
+            "additional_t_cond": additional_t_cond,
+            "return_dict": return_dict,
+        }
+
+        if state.guard_latched:
+            state.bypass = True
+            reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else "sticky fail-closed guard"
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False, fallback_reason=reason)
+            return output
+
+        output = self.fn_ref.original_forward(**call_kwargs)
         self._record(state, predicted=not state.should_compute)
         return output
 
@@ -1466,9 +1593,10 @@ def _pack_block_output(
 
 
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
-    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Z-Image, Wan, Anima/Cosmos, and 2D UNet denoisers.
+    """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Qwen-Image, Z-Image, Wan, Anima/Cosmos, and 2D UNet denoisers.
 
-    FLUX.1, the qualified Z-Image standard T2I Base/Turbo route, and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
+    FLUX.1, the qualified Qwen-Image-2512 standard T2I route, the qualified Z-Image standard T2I Base/Turbo route,
+    and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
     post-single-block image feature and recomputes
     `time_guidance_embed -> norm_out -> proj_out`. Anima/Cosmos predicts the post-transformer-block feature and recomputes
     `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
@@ -1479,11 +1607,58 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
     from ..models.transformers.transformer_flux2 import Flux2Transformer2DModel
+    from ..models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
     from ..models.transformers.transformer_wan import WanTransformer3DModel
     from ..models.transformers.transformer_z_image import ZImageTransformer2DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped_module = unwrap_module(module)
+
+    if isinstance(unwrapped_module, QwenImageTransformer2DModel):
+        expected_signature = {
+            "patch_size": 2,
+            "in_channels": 64,
+            "out_channels": 16,
+            "num_layers": 60,
+            "attention_head_dim": 128,
+            "num_attention_heads": 24,
+            "joint_attention_dim": 3584,
+            "guidance_embeds": False,
+            "axes_dims_rope": (16, 56, 56),
+            "zero_cond_t": False,
+        }
+        observed_signature = {
+            key: tuple(getattr(unwrapped_module.config, key)) if key == "axes_dims_rope" else getattr(unwrapped_module.config, key)
+            for key in expected_signature
+        }
+        if observed_signature != expected_signature:
+            raise ValueError(
+                "The current SPECTRUM Qwen-Image adapter is qualified only for the Qwen-Image-2512 standard T2I "
+                f"transformer architecture. Expected {expected_signature}, got {observed_signature}."
+            )
+
+        blocks = list(unwrapped_module.transformer_blocks)
+        if len(blocks) != 60:
+            raise ValueError("SPECTRUM Qwen-Image-2512 support requires exactly 60 transformer blocks.")
+
+        state_manager = StateManager(SpectrumQwenImageState, init_args=(config,))
+        root_registry = HookRegistry.check_if_exists_or_initialize(module)
+        root_registry.register_hook(SpectrumQwenImageDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+        head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+        head_registry.register_hook(SpectrumHeadBlockHook(state_manager), _SPECTRUM_HEAD_BLOCK_HOOK)
+        for block in blocks[1:-1]:
+            registry = HookRegistry.check_if_exists_or_initialize(block)
+            registry.register_hook(SpectrumBlockHook(state_manager), _SPECTRUM_BLOCK_HOOK)
+        tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+        tail_registry.register_hook(SpectrumBlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
+
+        logger.debug(
+            "Applied SPECTRUM cache to qualified Qwen-Image-2512 standard T2I transformer with %d blocks and %d expected steps.",
+            len(blocks),
+            config.num_inference_steps,
+        )
+        return
 
     if isinstance(unwrapped_module, ZImageTransformer2DModel):
         expected_signature = {
@@ -1656,6 +1831,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     if not isinstance(unwrapped_module, FluxTransformer2DModel):
         raise ValueError(
             "SpectrumCacheConfig currently supports FluxTransformer2DModel, Flux2Transformer2DModel, "
+            "the qualified Qwen-Image-2512 standard T2I QwenImageTransformer2DModel route, "
             "the qualified Z-Image standard T2I Base/Turbo ZImageTransformer2DModel route, "
             "the qualified Wan2.1 T2V 1.3B WanTransformer3DModel route, CosmosTransformer3DModel, "
             "and UNet2DConditionModel, "
