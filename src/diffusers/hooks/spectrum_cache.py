@@ -347,6 +347,10 @@ class SpectrumQwenImageState(SpectrumWanState):
     """Context-local mutable state for the qualified Qwen-Image-2512 standard T2I SPECTRUM route."""
 
 
+class SpectrumKrea2State(SpectrumWanState):
+    """Context-local mutable state for the qualified Krea 2 Turbo standard T2I SPECTRUM route."""
+
+
 def _spectrum_tensor_signature(value: Any) -> Any:
     if value is None:
         return None
@@ -1013,6 +1017,127 @@ class SpectrumZImageDenoiserHook(ModelHook):
         return module
 
 
+class SpectrumKrea2DenoiserHook(ModelHook):
+    """Fail-closed root adapter for the qualified Krea 2 Turbo standard T2I route."""
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def _record(self, state: SpectrumKrea2State, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": max(int(state.step_index), 0),
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        position_ids: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+    ):
+        state: SpectrumKrea2State = self.state_manager.get_state()
+
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "timestep": _spectrum_tensor_signature(timestep),
+            "position_ids": _spectrum_tensor_signature(position_ids),
+            "encoder_attention_mask": _spectrum_tensor_signature(encoder_attention_mask),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for Krea 2 Turbo SPECTRUM")
+        if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+            state.latch("Krea image hidden_states must be a rank-3 tensor")
+        if not torch.is_tensor(encoder_hidden_states) or encoder_hidden_states.ndim != 4:
+            state.latch("Krea encoder_hidden_states must be a rank-4 tapped-hidden-state tensor")
+        elif encoder_hidden_states.shape[2] != 12:
+            state.latch("Krea encoder_hidden_states lost the qualified 12-layer prompt contract")
+        if (
+            torch.is_tensor(hidden_states)
+            and hidden_states.ndim == 3
+            and torch.is_tensor(encoder_hidden_states)
+            and encoder_hidden_states.ndim == 4
+            and hidden_states.shape[0] != encoder_hidden_states.shape[0]
+        ):
+            state.latch("Krea image/text batch dimensions differ")
+        if timestep is None or not torch.is_tensor(timestep) or timestep.ndim != 1:
+            state.latch("non-1D Krea timestep route is not qualified")
+        elif (
+            torch.is_tensor(hidden_states)
+            and hidden_states.ndim == 3
+            and timestep.shape[0] != hidden_states.shape[0]
+        ):
+            state.latch("Krea timestep batch dimension differs from image batch")
+        if position_ids is None or not torch.is_tensor(position_ids) or position_ids.ndim != 2 or position_ids.shape[-1] != 3:
+            state.latch("Krea position_ids must have shape (sequence_length, 3)")
+        elif (
+            torch.is_tensor(hidden_states)
+            and hidden_states.ndim == 3
+            and torch.is_tensor(encoder_hidden_states)
+            and encoder_hidden_states.ndim == 4
+            and position_ids.shape[0] != hidden_states.shape[1] + encoder_hidden_states.shape[1]
+        ):
+            state.latch("Krea position_ids length does not equal text + image token length")
+        if encoder_attention_mask is not None:
+            if (
+                not torch.is_tensor(encoder_attention_mask)
+                or encoder_attention_mask.ndim != 2
+                or not torch.is_tensor(encoder_hidden_states)
+                or encoder_hidden_states.ndim != 4
+                or tuple(encoder_attention_mask.shape)
+                != (encoder_hidden_states.shape[0], encoder_hidden_states.shape[1])
+            ):
+                state.latch("Krea encoder_attention_mask shape is not qualified")
+        if attention_kwargs:
+            state.latch("non-empty Krea attention kwargs / LoRA route is not qualified")
+
+        call_kwargs = {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+            "timestep": timestep,
+            "position_ids": position_ids,
+            "encoder_attention_mask": encoder_attention_mask,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": return_dict,
+        }
+
+        if state.guard_latched:
+            state.bypass = True
+            reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else "sticky fail-closed guard"
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False, fallback_reason=reason)
+            return output
+
+        output = self.fn_ref.original_forward(**call_kwargs)
+        self._record(state, predicted=not state.should_compute)
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
 class SpectrumFlux2DenoiserHook(ModelHook):
     """Root adapter for standard non-distilled FLUX.2 Klein denoising.
 
@@ -1635,12 +1760,70 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
     from ..models.transformers.transformer_flux2 import Flux2Transformer2DModel
+    from ..models.transformers.transformer_krea2 import Krea2Transformer2DModel
     from ..models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
     from ..models.transformers.transformer_wan import WanTransformer3DModel
     from ..models.transformers.transformer_z_image import ZImageTransformer2DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped_module = unwrap_module(module)
+
+    if isinstance(unwrapped_module, Krea2Transformer2DModel):
+        expected_signature = {
+            "in_channels": 64,
+            "num_layers": 28,
+            "attention_head_dim": 128,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 12,
+            "intermediate_size": 16384,
+            "timestep_embed_dim": 256,
+            "text_hidden_dim": 2560,
+            "num_text_layers": 12,
+            "text_num_attention_heads": 20,
+            "text_num_key_value_heads": 20,
+            "text_intermediate_size": 6912,
+            "num_layerwise_text_blocks": 2,
+            "num_refiner_text_blocks": 2,
+            "axes_dims_rope": (32, 48, 48),
+            "rope_theta": 1000.0,
+            "norm_eps": 1e-5,
+        }
+        observed_signature = {
+            key: tuple(getattr(unwrapped_module.config, key))
+            if key == "axes_dims_rope"
+            else getattr(unwrapped_module.config, key)
+            for key in expected_signature
+        }
+        if observed_signature != expected_signature:
+            raise ValueError(
+                "The current SPECTRUM Krea 2 adapter is qualified only for the Krea 2 Turbo standard "
+                f"T2I transformer architecture. Expected {expected_signature}, got {observed_signature}."
+            )
+
+        blocks = list(unwrapped_module.transformer_blocks)
+        if len(blocks) != 28:
+            raise ValueError("SPECTRUM Krea 2 Turbo support requires exactly 28 transformer blocks.")
+
+        state_manager = StateManager(SpectrumKrea2State, init_args=(config,))
+        root_registry = HookRegistry.check_if_exists_or_initialize(module)
+        root_registry.register_hook(SpectrumKrea2DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+        head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+        head_registry.register_hook(SpectrumHeadBlockHook(state_manager), _SPECTRUM_HEAD_BLOCK_HOOK)
+        for block in blocks[1:-1]:
+            registry = HookRegistry.check_if_exists_or_initialize(block)
+            registry.register_hook(SpectrumBlockHook(state_manager), _SPECTRUM_BLOCK_HOOK)
+        tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+        tail_registry.register_hook(SpectrumBlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
+
+        logger.debug(
+            "Applied SPECTRUM cache to qualified Krea 2 Turbo standard T2I transformer with %d blocks "
+            "and %d expected steps.",
+            len(blocks),
+            config.num_inference_steps,
+        )
+        return
+
 
     if isinstance(unwrapped_module, QwenImageTransformer2DModel):
         common_signature = {

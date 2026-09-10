@@ -27,6 +27,7 @@ from ...utils.torch_utils import maybe_adjust_dtype_for_device
 from ..attention import AttentionMixin, AttentionModuleMixin
 from ..attention_dispatch import dispatch_attention_fn
 from ..embeddings import apply_rotary_emb, get_1d_rotary_pos_embed
+from ..cache_utils import CacheMixin
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 
@@ -335,7 +336,7 @@ class Krea2RotaryPosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
-class Krea2Transformer2DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftAdapterMixin):
+class Krea2Transformer2DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftAdapterMixin, CacheMixin):
     r"""
     The single-stream MMDiT flow-matching backbone used by the Krea 2 pipeline.
 
