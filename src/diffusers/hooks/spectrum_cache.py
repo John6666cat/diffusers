@@ -75,6 +75,9 @@ class SpectrumCacheConfig:
         tail_actual_steps (`int`, defaults to `0`):
             Number of final denoising steps forced to full compute. This is a generic quality guard; the default `0`
             preserves the source-faithful refresh schedule.
+        forecast_step_indices (`tuple[int, ...]`, *optional*):
+            Explicit denoising-step indices to forecast. When provided, these indices replace the adaptive refresh
+            schedule while preserving all forecaster settings. This is useful for route-qualified sparse schedules.
         allow_unet_controlnet_residuals (`bool`, defaults to `False`):
             Explicitly allow classic UNet ControlNet residual pairs (`down_block_additional_residuals` together with
             `mid_block_additional_residual`) to use SPECTRUM. The default remains fail-closed.
@@ -107,6 +110,7 @@ class SpectrumCacheConfig:
     history_limit: int = 100
     coordinate_max: float = 50.0
     tail_actual_steps: int = 0
+    forecast_step_indices: tuple[int, ...] | None = None
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
@@ -135,6 +139,18 @@ class SpectrumCacheConfig:
             raise ValueError("tail_actual_steps must be >= 0")
         if self.tail_actual_steps > self.num_inference_steps:
             raise ValueError("tail_actual_steps must be <= num_inference_steps")
+        if self.forecast_step_indices is not None:
+            indices = tuple(int(step) for step in self.forecast_step_indices)
+            if len(set(indices)) != len(indices):
+                raise ValueError("forecast_step_indices must not contain duplicate step indices")
+            if any(step < 0 or step >= self.num_inference_steps for step in indices):
+                raise ValueError("forecast_step_indices must be within the configured denoising-step range")
+            indices = tuple(sorted(indices))
+            if self.tail_actual_steps and any(
+                step >= self.num_inference_steps - self.tail_actual_steps for step in indices
+            ):
+                raise ValueError("forecast_step_indices cannot overlap tail_actual_steps")
+            self.forecast_step_indices = indices
         if self.cosmos_runtime_state_callback is not None and not callable(self.cosmos_runtime_state_callback):
             raise ValueError("cosmos_runtime_state_callback must be callable when provided")
 
@@ -144,6 +160,9 @@ class SpectrumSchedule:
 
     def __init__(self, config: SpectrumCacheConfig):
         self.config = config
+        self._explicit_forecast_steps = (
+            frozenset(config.forecast_step_indices) if config.forecast_step_indices is not None else None
+        )
         self.reset()
 
     def reset(self) -> None:
@@ -154,6 +173,9 @@ class SpectrumSchedule:
         if self.config.tail_actual_steps and step_index >= self.config.num_inference_steps - self.config.tail_actual_steps:
             self.cached_run_length = 0
             return True
+
+        if self._explicit_forecast_steps is not None:
+            return step_index not in self._explicit_forecast_steps
 
         should_compute = True
         if step_index >= self.config.warmup_steps:
@@ -351,6 +373,122 @@ class SpectrumKrea2State(SpectrumWanState):
     """Context-local mutable state for the qualified Krea 2 Turbo standard T2I SPECTRUM route."""
 
 
+class SpectrumKrea2RawState(SpectrumWanState):
+    """Context-local dual-lane state for the qualified Krea 2 Raw CFG route."""
+
+    def __init__(self, config: SpectrumCacheConfig):
+        self.config = config
+        self.schedule = SpectrumSchedule(config)
+        self.reset()
+
+    def reset(self) -> None:
+        self.schedule.reset()
+        self.forecasters = {
+            "positive": SpectrumForecaster(self.config),
+            "negative": SpectrumForecaster(self.config),
+        }
+        self.call_index = -1
+        self.step_index = -1
+        self.current_lane: str | None = None
+        self.should_compute = True
+        self.bypass = False
+        self.bypass_latched = False
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.lane_identities: dict[str, Any] = {}
+        self.decisions: dict[int, bool] = {}
+        self.compute_steps: list[int] = []
+        self.forecast_steps: list[int] = []
+        self.records: list[dict[str, Any]] = []
+        self.peak_history_bytes = 0
+
+    def latch(self, reason: str) -> None:
+        logical_step = max(int(self.step_index), 0)
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def prepare_call(self, conditioning_identity: Any) -> None:
+        self.call_index += 1
+        self.step_index = self.call_index // 2
+        self.current_lane = "positive" if self.call_index % 2 == 0 else "negative"
+
+        if self.step_index >= self.config.num_inference_steps:
+            self.latch(
+                f"logical step {self.step_index} outside configured inference-step range "
+                f"{self.config.num_inference_steps}"
+            )
+
+        previous = self.lane_identities.get(self.current_lane)
+        if previous is None:
+            self.lane_identities[self.current_lane] = conditioning_identity
+        elif previous != conditioning_identity:
+            self.latch(f"{self.current_lane} conditioning identity changed")
+
+        if (
+            len(self.lane_identities) == 2
+            and self.lane_identities["positive"] == self.lane_identities["negative"]
+        ):
+            self.latch("Krea 2 Raw CFG positive/negative conditioning identities are not distinct")
+
+    def start_step(self) -> None:
+        if self.current_lane is None:
+            raise RuntimeError("SPECTRUM Krea 2 Raw call has no active CFG lane.")
+        if self.guard_latched:
+            self.should_compute = True
+            return
+
+        if self.current_lane == "positive":
+            decision = bool(self.schedule.decide(self.step_index))
+            self.decisions[self.step_index] = decision
+            target = self.compute_steps if decision else self.forecast_steps
+            target.append(self.step_index)
+        else:
+            if self.step_index not in self.decisions:
+                self.latch("Krea 2 Raw negative CFG lane arrived before its positive lane")
+                self.should_compute = True
+                return
+            decision = self.decisions[self.step_index]
+        self.should_compute = decision
+
+    def _forecaster(self) -> SpectrumForecaster:
+        if self.current_lane is None:
+            raise RuntimeError("SPECTRUM Krea 2 Raw forecaster has no active CFG lane.")
+        return self.forecasters[self.current_lane]
+
+    def record_real_feature(self, image_feature: torch.Tensor) -> None:
+        self._forecaster().update(self.step_index, image_feature)
+        total = sum(forecaster.history_bytes() for forecaster in self.forecasters.values())
+        self.peak_history_bytes = max(self.peak_history_bytes, total)
+
+    def predict(self) -> torch.Tensor:
+        return self._forecaster().predict(self.step_index)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
+            "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "peak_history_bytes": self.peak_history_bytes,
+            "lane_prediction_call_count": {
+                lane: sum(
+                    record["predicted_body_used"] and record.get("lane") == lane for record in self.records
+                )
+                for lane in ("positive", "negative")
+            },
+            "records": list(self.records),
+        }
+
+
 def _spectrum_tensor_signature(value: Any) -> Any:
     if value is None:
         return None
@@ -360,6 +498,19 @@ def _spectrum_tensor_signature(value: Any) -> Any:
         return (tuple(value.shape), str(value.dtype), str(value.device))
     return type(value).__name__
 
+
+def _spectrum_tensor_identity(value: Any) -> Any:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return (
+            int(value.data_ptr()),
+            int(value.storage_offset()),
+            tuple(value.shape),
+            str(value.dtype),
+            str(value.device),
+        )
+    return type(value).__name__
 
 
 class SpectrumFlux2State(BaseState):
@@ -1018,7 +1169,7 @@ class SpectrumZImageDenoiserHook(ModelHook):
 
 
 class SpectrumKrea2DenoiserHook(ModelHook):
-    """Fail-closed root adapter for the qualified Krea 2 Turbo standard T2I route."""
+    """Fail-closed root adapter for qualified Krea 2 Turbo and Raw standard T2I routes."""
 
     _is_stateful = True
 
@@ -1026,16 +1177,19 @@ class SpectrumKrea2DenoiserHook(ModelHook):
         super().__init__()
         self.state_manager = state_manager
 
-    def _record(self, state: SpectrumKrea2State, predicted: bool, fallback_reason: str | None = None) -> None:
-        state.records.append(
-            {
-                "logical_step": max(int(state.step_index), 0),
-                "scheduled_full_compute": bool(state.should_compute),
-                "predicted_body_used": bool(predicted),
-                "guard_latched": bool(state.guard_latched),
-                "fallback_reason": fallback_reason,
-            }
-        )
+    def _record(
+        self, state: SpectrumKrea2State | SpectrumKrea2RawState, predicted: bool, fallback_reason: str | None = None
+    ) -> None:
+        record = {
+            "logical_step": max(int(state.step_index), 0),
+            "scheduled_full_compute": bool(state.should_compute),
+            "predicted_body_used": bool(predicted),
+            "guard_latched": bool(state.guard_latched),
+            "fallback_reason": fallback_reason,
+        }
+        if isinstance(state, SpectrumKrea2RawState):
+            record["lane"] = state.current_lane
+        state.records.append(record)
 
     def new_forward(
         self,
@@ -1048,7 +1202,10 @@ class SpectrumKrea2DenoiserHook(ModelHook):
         attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
     ):
-        state: SpectrumKrea2State = self.state_manager.get_state()
+        state: SpectrumKrea2State | SpectrumKrea2RawState = self.state_manager.get_state()
+
+        if isinstance(state, SpectrumKrea2RawState):
+            state.prepare_call(_spectrum_tensor_identity(encoder_hidden_states))
 
         signature = {
             "hidden_states": _spectrum_tensor_signature(hidden_states),
@@ -1063,7 +1220,7 @@ class SpectrumKrea2DenoiserHook(ModelHook):
             state.latch("context-local input signature changed")
 
         if module.training or torch.is_grad_enabled():
-            state.latch("autograd/training is not qualified for Krea 2 Turbo SPECTRUM")
+            state.latch("autograd/training is not qualified for Krea 2 SPECTRUM")
         if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
             state.latch("Krea image hidden_states must be a rank-3 tensor")
         if not torch.is_tensor(encoder_hidden_states) or encoder_hidden_states.ndim != 4:
@@ -1749,7 +1906,8 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     """Apply native-style SPECTRUM caching to supported FLUX/FLUX.2, Qwen-Image, Z-Image, Wan, Anima/Cosmos, and 2D UNet denoisers.
 
     FLUX.1, the qualified Qwen-Image-2512 standard T2I route, the qualified Z-Image standard T2I Base/Turbo route,
-    and the qualified Wan2.1 T2V 1.3B route use block-stack hooks. FLUX.2 Klein predicts the
+    the qualified Krea 2 Turbo/Raw standard T2I routes, and the qualified Wan2.1 T2V 1.3B route use block-stack
+    hooks. FLUX.2 Klein predicts the
     post-single-block image feature and recomputes
     `time_guidance_embed -> norm_out -> proj_out`. Anima/Cosmos predicts the post-transformer-block feature and recomputes
     `norm_out -> proj_out -> unpatchify`. UNet/SDXL uses the official SPECTRUM boundary immediately before
@@ -1796,15 +1954,24 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         }
         if observed_signature != expected_signature:
             raise ValueError(
-                "The current SPECTRUM Krea 2 adapter is qualified only for the Krea 2 Turbo standard "
-                f"T2I transformer architecture. Expected {expected_signature}, got {observed_signature}."
+                "The current SPECTRUM Krea 2 adapter is qualified only for the Krea 2 standard T2I "
+                f"transformer architecture. Expected {expected_signature}, got {observed_signature}."
             )
 
         blocks = list(unwrapped_module.transformer_blocks)
         if len(blocks) != 28:
-            raise ValueError("SPECTRUM Krea 2 Turbo support requires exactly 28 transformer blocks.")
+            raise ValueError("SPECTRUM Krea 2 support requires exactly 28 transformer blocks.")
 
-        state_manager = StateManager(SpectrumKrea2State, init_args=(config,))
+        if config.num_inference_steps == 52:
+            if config.forecast_step_indices is None:
+                raise ValueError(
+                    "The qualified Krea 2 Raw 52-step CFG route requires explicit forecast_step_indices."
+                )
+            state_cls = SpectrumKrea2RawState
+        else:
+            state_cls = SpectrumKrea2State
+
+        state_manager = StateManager(state_cls, init_args=(config,))
         root_registry = HookRegistry.check_if_exists_or_initialize(module)
         root_registry.register_hook(SpectrumKrea2DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
 
@@ -1817,7 +1984,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         tail_registry.register_hook(SpectrumBlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
 
         logger.debug(
-            "Applied SPECTRUM cache to qualified Krea 2 Turbo standard T2I transformer with %d blocks "
+            "Applied SPECTRUM cache to qualified Krea 2 standard T2I transformer with %d blocks "
             "and %d expected steps.",
             len(blocks),
             config.num_inference_steps,
@@ -2047,6 +2214,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
             "SpectrumCacheConfig currently supports FluxTransformer2DModel, Flux2Transformer2DModel, "
             "the qualified Qwen-Image-2512 T2I / Qwen-Image-Edit-2511 single-reference QwenImageTransformer2DModel routes, "
             "the qualified Z-Image standard T2I Base/Turbo ZImageTransformer2DModel route, "
+            "the qualified Krea 2 Turbo/Raw standard T2I Krea2Transformer2DModel routes, "
             "the qualified Wan2.1 T2V 1.3B WanTransformer3DModel route, CosmosTransformer3DModel, "
             "and UNet2DConditionModel, "
             f"got {type(unwrapped_module)}."
