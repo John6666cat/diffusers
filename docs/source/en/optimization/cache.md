@@ -112,6 +112,94 @@ config = TaylorSeerCacheConfig(
 pipe.transformer.enable_cache(config)
 ```
 
+## SPECTRUM
+
+SPECTRUM accelerates diffusion inference by forecasting a late denoiser feature from features recorded at earlier full-compute steps. On a forecast step, the model-specific SPECTRUM adapter skips the qualified expensive denoiser body and executes the remaining native output path.
+
+Set up and pass a [`SpectrumCacheConfig`] to a supported denoiser to enable it.
+
+```python
+import torch
+from diffusers import FluxPipeline, SpectrumCacheConfig
+
+pipe = FluxPipeline.from_pretrained(
+    "black-forest-labs/FLUX.1-dev",
+    dtype=torch.bfloat16,
+).to("cuda")
+
+config = SpectrumCacheConfig(num_inference_steps=50)
+pipe.transformer.enable_cache(config)
+
+with pipe.transformer.cache_context("generation"):
+    image = pipe(
+        "A small cabin beside a frozen lake at sunrise",
+        num_inference_steps=50,
+    ).images[0]
+
+pipe.transformer.disable_cache()
+```
+
+The main scheduling parameters are:
+
+- `warmup_steps`: number of initial full-compute steps used to establish feature history.
+- `window_size`: initial spacing between full-compute refreshes.
+- `flex_window`: amount added to the adaptive refresh window after each refresh.
+- `degree`: degree of the Chebyshev polynomial used by the forecaster.
+- `blend_w`: blend between the spectral prediction and local first-order extrapolation.
+- `history_limit`: maximum number of full-compute feature snapshots retained per cache context.
+- `forecast_step_indices`: optional explicit denoising-step indices to forecast; when supplied, they replace the adaptive refresh schedule.
+- `tail_actual_steps`: number of final denoising steps forced to full compute.
+
+> [!WARNING]
+> SPECTRUM profiles are route-specific. Match `num_inference_steps` to the number of denoiser forwards observed by SPECTRUM, which may differ from a pipeline's nominal scheduler step count. A profile qualified for one model, scheduler, guidance topology, or model variant should not be assumed to work for another route.
+
+SPECTRUM state is partitioned by [`~CacheMixin.cache_context`]. Use separate context names for denoising trajectories that must not share forecast history.
+
+Supported adapters validate model- and route-specific invariants. When a qualified adapter detects an incompatible runtime state, such as a changed input signature or an unsupported conditioning path, it falls back to the original full-compute forward instead of forecasting from incompatible history. Some adapters latch this fail-closed behavior for the remainder of the cache context.
+
+For UNet routes, special conditioning is disabled by default. The following opt-ins are available for paths that have been separately validated:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=30,
+    allow_unet_controlnet_residuals=True,
+    allow_unet_t2i_adapter_residuals=True,
+    allow_unet_ip_adapter_image_embeds=True,
+)
+```
+
+Model variants can share an integration skeleton without sharing a SPECTRUM schedule. In particular, a profile measured on a distilled or Turbo model should be requalified before it is used on a Base or Raw sibling.
+
+The qualified Krea 2 Raw standard text-to-image route uses 52 denoising steps with classifier-free guidance and an explicit sparse schedule. Its conservative default profile is:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=52,
+    forecast_step_indices=(7, 21, 30, 35, 42, 44),
+    degree=4,
+    history_limit=8,
+    coordinate_max=100.0,
+)
+```
+
+Krea 2 Raw keeps positive and negative CFG forecast histories separate and fails closed if the expected dual-lane conditioning pattern changes. Krea 2 Turbo uses a different route-specific schedule.
+
+An optional aggressive Krea 2 Raw profile is available for the exact L4/NF4 standard text-to-image setup used to validate it:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=52,
+    forecast_step_indices=(7, 10, 21, 28, 30, 32, 35, 37, 42, 44),
+    degree=4,
+    history_limit=8,
+    coordinate_max=100.0,
+)
+```
+
+> [!WARNING]
+> The aggressive profile is experimental and is not the default. It trades additional approximation for speed and was only validated on the current Krea 2 Raw L4/NF4 standard text-to-image representation. Revalidate output quality and fail-closed behavior before using it with a different checkpoint, precision or quantization mode, accelerator or backend, conditioning route, scheduler, or step/guidance settings.
+
+
 ## MagCache
 
 [MagCache](https://github.com/Zehong-Ma/MagCache) accelerates inference by skipping transformer blocks based on the magnitude of the residual update. It observes that the magnitude of updates (Output - Input) decays predictably over the diffusion process. By accumulating an "error budget" based on pre-computed magnitude ratios, it dynamically decides when to skip computation and reuse the previous residual.
