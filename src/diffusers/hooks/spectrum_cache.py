@@ -2249,3 +2249,382 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         len(blocks),
         config.num_inference_steps,
     )
+
+# --- LTX-2.3 native SPECTRUM candidate -------------------------------------------------------------
+
+_SPECTRUM_LTX2_DENOISER_HOOK = "spectrum_cache_ltx2_denoiser"
+_SPECTRUM_LTX2_HEAD_BLOCK_HOOK = "spectrum_cache_ltx2_head_block"
+_SPECTRUM_LTX2_BLOCK_HOOK = "spectrum_cache_ltx2_block"
+
+
+class SpectrumLTX2State(BaseState):
+    """Context-local paired video/audio SPECTRUM state for the qualified LTX-2.3 distilled route."""
+
+    def __init__(self, config: SpectrumCacheConfig):
+        self.config = config
+        self.schedule = SpectrumSchedule(config)
+        self.video_forecaster = SpectrumForecaster(config)
+        self.audio_forecaster = SpectrumForecaster(config)
+        self.reset()
+
+    def reset(self) -> None:
+        self.schedule.reset()
+        self.video_forecaster.reset()
+        self.audio_forecaster.reset()
+        self.step_index = -1
+        self.should_compute = True
+        self.bypass = False
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.compute_steps: list[int] = []
+        self.forecast_steps: list[int] = []
+        self.records: list[dict[str, Any]] = []
+        self.real_block_executions = 0
+        self.bypassed_block_executions = 0
+        self.peak_history_bytes = 0
+
+    def latch(self, reason: str) -> None:
+        logical_step = max(int(self.step_index), 0)
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def start_step(self) -> None:
+        self.step_index += 1
+        if self.step_index >= self.config.num_inference_steps:
+            self.latch(
+                f"logical step {self.step_index} outside configured inference-step range "
+                f"{self.config.num_inference_steps}"
+            )
+            self.should_compute = True
+            return
+        if self.guard_latched:
+            self.should_compute = True
+            return
+        self.should_compute = bool(self.schedule.decide(self.step_index))
+        target = self.compute_steps if self.should_compute else self.forecast_steps
+        target.append(self.step_index)
+
+    def record_real_features(self, video_feature: torch.Tensor, audio_feature: torch.Tensor) -> None:
+        self.video_forecaster.update(self.step_index, video_feature)
+        self.audio_forecaster.update(self.step_index, audio_feature)
+        total = self.video_forecaster.history_bytes() + self.audio_forecaster.history_bytes()
+        self.peak_history_bytes = max(self.peak_history_bytes, total)
+
+    def predict(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.video_forecaster.predict(self.step_index),
+            self.audio_forecaster.predict(self.step_index),
+        )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_call_count": sum(bool(r["predicted_body_used"]) for r in self.records),
+            "full_call_count": sum(not bool(r["predicted_body_used"]) for r in self.records),
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "real_block_executions": self.real_block_executions,
+            "bypassed_block_executions": self.bypassed_block_executions,
+            "total_block_slots": self.real_block_executions + self.bypassed_block_executions,
+            "peak_history_bytes": self.peak_history_bytes,
+            "records": list(self.records),
+        }
+
+
+class SpectrumLTX2DenoiserHook(ModelHook):
+    """Fail-closed root adapter for the qualified LTX-2.3 distilled audiovisual route."""
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+        self._argument_indices: dict[str, int] = {}
+
+    def initialize_hook(self, module: torch.nn.Module):
+        parameters = list(inspect.signature(unwrap_module(module).__class__.forward).parameters)[1:]
+        names = (
+            "hidden_states",
+            "audio_hidden_states",
+            "encoder_hidden_states",
+            "audio_encoder_hidden_states",
+            "isolate_modalities",
+            "spatio_temporal_guidance_blocks",
+            "perturbation_mask",
+            "use_cross_timestep",
+            "attention_kwargs",
+            "video_self_attention_mask",
+            "video_keyframes_mask",
+            "video_coords",
+            "audio_coords",
+        )
+        self._argument_indices = {name: parameters.index(name) for name in names if name in parameters}
+        return module
+
+    def _get_argument(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if name in kwargs:
+            return kwargs[name]
+        index = self._argument_indices.get(name)
+        if index is not None and index < len(args):
+            return args[index]
+        return None
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTX2State = self.state_manager.get_state()
+
+        hidden_states = self._get_argument("hidden_states", args, kwargs)
+        audio_hidden_states = self._get_argument("audio_hidden_states", args, kwargs)
+        encoder_hidden_states = self._get_argument("encoder_hidden_states", args, kwargs)
+        audio_encoder_hidden_states = self._get_argument("audio_encoder_hidden_states", args, kwargs)
+        video_coords = self._get_argument("video_coords", args, kwargs)
+        audio_coords = self._get_argument("audio_coords", args, kwargs)
+
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "audio_hidden_states": _spectrum_tensor_signature(audio_hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "audio_encoder_hidden_states": _spectrum_tensor_signature(audio_encoder_hidden_states),
+            "video_coords": _spectrum_tensor_signature(video_coords),
+            "audio_coords": _spectrum_tensor_signature(audio_coords),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local LTX-2 input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for LTX-2.3 SPECTRUM")
+        if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+            state.latch("LTX-2 video hidden_states must be rank 3")
+        if not torch.is_tensor(audio_hidden_states) or audio_hidden_states.ndim != 3:
+            state.latch("LTX-2 audio_hidden_states must be rank 3")
+        if not torch.is_tensor(encoder_hidden_states) or encoder_hidden_states.ndim != 3:
+            state.latch("LTX-2 video encoder_hidden_states must be rank 3")
+        if not torch.is_tensor(audio_encoder_hidden_states) or audio_encoder_hidden_states.ndim != 3:
+            state.latch("LTX-2 audio encoder_hidden_states must be rank 3")
+        if bool(self._get_argument("isolate_modalities", args, kwargs)):
+            state.latch("isolate_modalities route is not qualified")
+        if self._get_argument("spatio_temporal_guidance_blocks", args, kwargs):
+            state.latch("STG route is not qualified")
+        if self._get_argument("perturbation_mask", args, kwargs) is not None:
+            state.latch("perturbation-mask route is not qualified")
+        if not bool(self._get_argument("use_cross_timestep", args, kwargs)):
+            state.latch("legacy non-cross-timestep LTX route is not qualified")
+        if self._get_argument("attention_kwargs", args, kwargs):
+            state.latch("non-empty attention kwargs / LoRA route is not qualified")
+        if self._get_argument("video_self_attention_mask", args, kwargs) is not None:
+            state.latch("video self-attention mask / IC-LoRA route is not qualified")
+        if self._get_argument("video_keyframes_mask", args, kwargs) is not None:
+            state.latch("keyframe-token route is not qualified")
+        # Standard LTX-2 modular T2VA precomputes and forwards RoPE coordinates.
+        # Qualify the exact ordinary shape contract instead of fail-closing on their presence.
+        if not torch.is_tensor(video_coords) or video_coords.ndim != 4:
+            state.latch("standard modular LTX-2 video_coords tensor is required")
+        elif (
+            video_coords.shape[0] != hidden_states.shape[0]
+            or video_coords.shape[1] != 3
+            or video_coords.shape[2] != hidden_states.shape[1]
+            or video_coords.shape[3] != 2
+        ):
+            state.latch("standard modular LTX-2 video_coords shape contract changed")
+        if not torch.is_tensor(audio_coords) or audio_coords.ndim != 4:
+            state.latch("standard modular LTX-2 audio_coords tensor is required")
+        elif (
+            audio_coords.shape[0] != audio_hidden_states.shape[0]
+            or audio_coords.shape[1] != 1
+            or audio_coords.shape[2] != audio_hidden_states.shape[1]
+            or audio_coords.shape[3] != 2
+        ):
+            state.latch("standard modular LTX-2 audio_coords shape contract changed")
+
+        state.bypass = state.guard_latched
+        reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else None
+        try:
+            output = self.fn_ref.original_forward(*args, **kwargs)
+        finally:
+            state.bypass = False
+
+        if state.guard_latched:
+            state.records.append(
+                {
+                    "logical_step": max(int(state.step_index), 0),
+                    "scheduled_full_compute": True,
+                    "predicted_body_used": False,
+                    "guard_latched": True,
+                    "fallback_reason": reason,
+                }
+            )
+        else:
+            state.records.append(
+                {
+                    "logical_step": int(state.step_index),
+                    "scheduled_full_compute": bool(state.should_compute),
+                    "predicted_body_used": not bool(state.should_compute),
+                    "guard_latched": False,
+                    "fallback_reason": None,
+                }
+            )
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class _SpectrumLTX2BlockHookBase(ModelHook):
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+        self._hidden_index: int | None = None
+        self._audio_index: int | None = None
+
+    def initialize_hook(self, module: torch.nn.Module):
+        parameters = list(inspect.signature(unwrap_module(module).__class__.forward).parameters)[1:]
+        self._hidden_index = parameters.index("hidden_states")
+        self._audio_index = parameters.index("audio_hidden_states")
+        return module
+
+    def _inputs(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        if "hidden_states" in kwargs:
+            hidden_states = kwargs["hidden_states"]
+        else:
+            hidden_states = args[self._hidden_index]
+        if "audio_hidden_states" in kwargs:
+            audio_hidden_states = kwargs["audio_hidden_states"]
+        else:
+            audio_hidden_states = args[self._audio_index]
+        return hidden_states, audio_hidden_states
+
+
+class SpectrumLTX2HeadBlockHook(_SpectrumLTX2BlockHookBase):
+    """Advance the eight-step schedule and inject paired forecasts at the first LTX-2 block."""
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTX2State = self.state_manager.get_state()
+        if state.bypass:
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        hidden_states, audio_hidden_states = self._inputs(args, kwargs)
+        state.start_step()
+
+        if state.should_compute:
+            state.real_block_executions += 1
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        predicted_video, predicted_audio = state.predict()
+        predicted_video = predicted_video.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        predicted_audio = predicted_audio.to(device=audio_hidden_states.device, dtype=audio_hidden_states.dtype)
+        if predicted_video.shape != hidden_states.shape:
+            raise ValueError(
+                f"SPECTRUM LTX-2 predicted video feature shape {predicted_video.shape} "
+                f"does not match {hidden_states.shape}."
+            )
+        if predicted_audio.shape != audio_hidden_states.shape:
+            raise ValueError(
+                f"SPECTRUM LTX-2 predicted audio feature shape {predicted_audio.shape} "
+                f"does not match {audio_hidden_states.shape}."
+            )
+        state.bypassed_block_executions += 1
+        return predicted_video, predicted_audio
+
+
+class SpectrumLTX2BlockHook(_SpectrumLTX2BlockHookBase):
+    """Skip paired middle blocks and record both real tail streams."""
+
+    def __init__(self, state_manager: StateManager, is_tail: bool = False):
+        super().__init__(state_manager)
+        self.is_tail = is_tail
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTX2State = self.state_manager.get_state()
+        if state.bypass:
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        if state.should_compute:
+            state.real_block_executions += 1
+            output = self.fn_ref.original_forward(*args, **kwargs)
+            if self.is_tail:
+                if not isinstance(output, tuple) or len(output) < 2:
+                    raise RuntimeError("LTX-2 transformer block no longer returns paired video/audio states.")
+                state.record_real_features(output[0], output[1])
+            return output
+
+        hidden_states, audio_hidden_states = self._inputs(args, kwargs)
+        state.bypassed_block_executions += 1
+        return hidden_states, audio_hidden_states
+
+
+_apply_spectrum_cache_before_ltx2 = apply_spectrum_cache
+
+
+def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
+    """Apply SPECTRUM, including the qualified LTX-2.3 distilled audiovisual adapter."""
+
+    from ..models.transformers.transformer_ltx2 import LTX2VideoTransformer3DModel
+
+    unwrapped_module = unwrap_module(module)
+    if not isinstance(unwrapped_module, LTX2VideoTransformer3DModel):
+        return _apply_spectrum_cache_before_ltx2(module, config)
+
+    expected_signature = {
+        "in_channels": 128,
+        "out_channels": 128,
+        "num_layers": 48,
+        "num_attention_heads": 32,
+        "attention_head_dim": 128,
+        "cross_attention_dim": 4096,
+        "audio_in_channels": 128,
+        "audio_out_channels": 128,
+        "audio_num_attention_heads": 32,
+        "audio_attention_head_dim": 64,
+        "audio_cross_attention_dim": 2048,
+        "caption_channels": 3840,
+        "cross_attn_mod": True,
+        "audio_cross_attn_mod": True,
+        "gated_attn": True,
+        "audio_gated_attn": True,
+        "perturbed_attn": True,
+        "rope_type": "split",
+        "use_prompt_embeddings": False,
+    }
+    observed_signature = {key: getattr(unwrapped_module.config, key) for key in expected_signature}
+    if observed_signature != expected_signature:
+        raise ValueError(
+            "The current SPECTRUM LTX-2 adapter is qualified only for the LTX-2.3 audiovisual "
+            f"transformer architecture. Expected {expected_signature}, got {observed_signature}."
+        )
+
+    blocks = list(unwrapped_module.transformer_blocks)
+    if len(blocks) != 48:
+        raise ValueError("SPECTRUM LTX-2.3 support requires exactly 48 audiovisual transformer blocks.")
+
+    state_manager = StateManager(SpectrumLTX2State, init_args=(config,))
+
+    root_registry = HookRegistry.check_if_exists_or_initialize(module)
+    root_registry.register_hook(SpectrumLTX2DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+    head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+    head_registry.register_hook(SpectrumLTX2HeadBlockHook(state_manager), _SPECTRUM_HEAD_BLOCK_HOOK)
+
+    for block in blocks[1:-1]:
+        registry = HookRegistry.check_if_exists_or_initialize(block)
+        registry.register_hook(SpectrumLTX2BlockHook(state_manager), _SPECTRUM_BLOCK_HOOK)
+
+    tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+    tail_registry.register_hook(SpectrumLTX2BlockHook(state_manager, is_tail=True), _SPECTRUM_BLOCK_HOOK)
+
+    logger.debug(
+        "Applied SPECTRUM cache to qualified LTX-2.3 audiovisual transformer with %d blocks and %d expected steps.",
+        len(blocks),
+        config.num_inference_steps,
+    )
+
+# --- end LTX-2.3 native SPECTRUM candidate ---------------------------------------------------------
