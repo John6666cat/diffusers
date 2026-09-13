@@ -200,6 +200,83 @@ config = SpectrumCacheConfig(
 > The aggressive profile is experimental and is not the default. It trades additional approximation for speed and was only validated on the current Krea 2 Raw L4/NF4 standard text-to-image representation. Revalidate output quality and fail-closed behavior before using it with a different checkpoint, precision or quantization mode, accelerator or backend, conditioning route, scheduler, or step/guidance settings.
 
 
+### Anima family profiles
+
+The native Cosmos adapter is qualified for the standard Anima text-to-image route when the runtime callback reports a stable sequential CFG label (`cond` or `uncond`) and condition count. The callback should expose the current logical denoising step and keep conditional and unconditional forecast histories separate.
+
+```python
+from diffusers import SpectrumCacheConfig
+
+
+def anima_runtime_state(pipe):
+    guider_state = pipe.guider.get_state()
+    return {
+        "step": int(guider_state["step"]),
+        "num_inference_steps": int(guider_state["num_inference_steps"]),
+        "num_conditions": int(guider_state["num_conditions"]),
+        "label": "cond" if pipe.guider.is_conditional else "uncond",
+        "dynamic_conditioning": False,
+    }
+```
+
+For the 30-step standard route, the following quality/speed knee was requalified on Anima Base, Anima 2.9B, and Anima Aesthetic v1.1. The measured speedup was about 2.1x in the L4/NF4 qualification environment; treat that number as environment-specific rather than a portable guarantee.
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=30,
+    warmup_steps=5,
+    window_size=2.0,
+    flex_window=0.75,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.25,
+    history_limit=100,
+    coordinate_max=50.0,
+    tail_actual_steps=3,
+    cosmos_runtime_state_callback=lambda: anima_runtime_state(pipe),
+)
+```
+
+A more aggressive 30-step profile was also qualified for those routes, with roughly 2.4x measured speedup in the same environment. It trades more approximation for speed and should remain opt-in:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=30,
+    warmup_steps=5,
+    window_size=2.0,
+    flex_window=1.0,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=100,
+    coordinate_max=50.0,
+    tail_actual_steps=2,
+    cosmos_runtime_state_callback=lambda: anima_runtime_state(pipe),
+)
+```
+
+Anima Turbo v1.1 is a separate distilled route. Do not reuse the 30-step profiles. The qualified point uses CFG 1, 12 denoising steps, and forecasts only steps 8 and 10:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=12,
+    forecast_step_indices=(8, 10),
+    degree=1,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=100,
+    coordinate_max=50.0,
+    tail_actual_steps=1,
+    cosmos_runtime_state_callback=lambda: anima_runtime_state(pipe),
+)
+```
+
+> [!WARNING]
+> Anima 3.8B v1.1 is **not** covered by the standard Cosmos adapter above. Its bundled Semantic Connector v2 is timestep-aware and must run for both CFG branches on every denoising step. Current research only qualifies forecasting the post-connector 52-block DiT body with branch-asymmetric schedules. Do not use the standard root Cosmos SPECTRUM hook for that receiver until Diffusers owns a native Semantic Connector v2 runtime and exposes the post-connector body boundary without bypassing the connector.
+
+> [!NOTE]
+> Model-family measurements are route-specific. Revalidate when changing checkpoint, scheduler, guidance topology, precision/quantization mode, accelerator/backend, or denoising-step count.
+
 ## MagCache
 
 [MagCache](https://github.com/Zehong-Ma/MagCache) accelerates inference by skipping transformer blocks based on the magnitude of the residual update. It observes that the magnitude of updates (Output - Input) decays predictably over the diffusion process. By accumulating an "error budget" based on pre-computed magnitude ratios, it dynamically decides when to skip computation and reuse the previous residual.
