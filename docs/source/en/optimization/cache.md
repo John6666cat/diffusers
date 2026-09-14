@@ -288,6 +288,51 @@ The aggressive profile was rechecked on an NVIDIA L4 with the pinned all-residen
 > [!WARNING]
 > The aggressive Qwen-Image-2512 profile is an opt-in profile for the exact qualified standard T2I route above; it does not replace selected6 as the conservative project default. Revalidate when changing checkpoint or revision, Qwen-Image variant, Edit/reference-image semantics, scheduler or denoising-step count, true-CFG settings, precision/quantization, accelerator/backend or offload policy, attention kwargs, ControlNet or other conditioning, LoRA/adapters, or runtime call topology. Qwen-Image-Edit-2511 is not covered by this profile.
 
+### Qwen-Image-Edit-2511 profiles
+
+The native Qwen-Image-Edit-2511 adapter is qualified for the pinned `ovedrive/Qwen-Image-Edit-2511-4bit` revision `ae6ddb7c6620c3a2e97e9ecccdd6cab8745c4806` single-reference `QwenImageEditPlusPipeline` route with 20 actual denoising steps and true classifier-free guidance. Conditional and unconditional forecast histories remain separate, and the qualified Edit route requires exactly one reference latent per sample.
+
+The conservative selected6 profile remains the project profile for this route. The explicit schedule form below is equivalent to the historical qualified selected6 control:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=20,
+    forecast_step_indices=(6, 8, 10, 12, 14, 15),
+    window_size=2.0,
+    flex_window=0.25,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=20.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+A faster aggressive opt-in profile was independently qualified on the Edit route with nine explicit forecast steps:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=20,
+    forecast_step_indices=(6, 7, 9, 10, 12, 13, 15, 16, 18),
+    window_size=2.0,
+    flex_window=0.25,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=20.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+The aggressive profile was rechecked on an NVIDIA L4 with the pinned all-resident NF4/BF16 representation over square, portrait, and wide single-reference edits. It measured about 1.79x-1.80x end-to-end speedup versus full compute in that environment, compared with about 1.42x for selected6. These measurements are environment-specific and are not portable speed or fidelity guarantees.
+
+> [!WARNING]
+> The aggressive Qwen-Image-Edit-2511 profile is an opt-in profile for the exact qualified single-reference EditPlus route above; it does not replace selected6 as the conservative project profile. Revalidate when changing checkpoint or revision, number of reference images, pipeline semantics, scheduler or denoising-step count, true-CFG settings, precision/quantization, accelerator/backend or offload policy, attention kwargs, ControlNet or other conditioning, LoRA/adapters, or runtime call topology. The equal pair9 positions independently observed for Qwen-Image-2512 do not make the two task routes interchangeable.
+
 ### Neta Yume profiles
 
 The native Neta Yume adapter is qualified for the pinned `duongve/NetaYume-Lumina-Image-2.0-Diffusers-v40` standard CFG route with 50 denoising steps. Positive and negative CFG forecast histories remain separate.
