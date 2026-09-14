@@ -242,6 +242,52 @@ The opt-in profile was rechecked with two seeds on an L4/NF4 representation over
 > [!WARNING]
 > The opt-in Wan profile is qualified only for the current 1.3B text-only T2V route. Revalidate when changing checkpoint or model size, I2V/VACE/image conditioning, scheduler or timestep semantics, guidance topology, precision/quantization, accelerator/backend, attention kwargs, LoRA/adapters, or denoising-step count. Wan 14B and Wan2.2 are not covered by this profile.
 
+
+### Neta Yume profiles
+
+The native Neta Yume adapter is qualified for the pinned `duongve/NetaYume-Lumina-Image-2.0-Diffusers-v40` standard CFG route with 50 denoising steps. Positive and negative CFG forecast histories remain separate.
+
+The conservative six-forecast profile remains the default:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=50,
+    forecast_step_indices=(15, 20, 23, 25, 27, 36),
+    window_size=3.0,
+    flex_window=0.0,
+    degree=2,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=50.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+A faster opt-in profile was qualified by spreading nine forecast steps across the middle trajectory:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=50,
+    forecast_step_indices=(15, 18, 20, 22, 24, 26, 28, 30, 36),
+    window_size=3.0,
+    flex_window=0.0,
+    degree=2,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=50.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+The opt-in profile was checked on an NVIDIA L4 in BF16 at the project-qualified creator route (`width=1536`, `height=1024`, 50 steps, CFG 4, `cfg_trunc_ratio=6`, `cfg_normalization=False`) over three prompt/seed cases. It averaged about 1.19x end-to-end speedup versus full compute in that environment, compared with about 1.12x for the conservative profile. These measurements are environment-specific and are not portable speed or fidelity guarantees.
+
+> [!WARNING]
+> The Neta Yume profiles are qualified only for the pinned standard route above. Revalidate when changing checkpoint or Lumina variant, image geometry/orientation, scheduler semantics, denoising-step count, CFG settings, precision, accelerator/backend, batch size, attention kwargs, LoRA/adapters, or conditioning topology. The upstream model card's portrait example uses the opposite image orientation from the project-qualified landscape route.
+
 ### Anima family profiles
 
 The native Cosmos adapter is qualified for the standard Anima text-to-image route when the runtime callback reports a stable sequential CFG label (`cond` or `uncond`) and condition count. The callback should expose the current logical denoising step and keep conditional and unconditional forecast histories separate.

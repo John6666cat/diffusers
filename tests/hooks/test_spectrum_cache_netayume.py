@@ -6,7 +6,8 @@ from diffusers.hooks.spectrum_cache import SpectrumCacheConfig, SpectrumNetaYume
 from diffusers.models.transformers.transformer_lumina2 import Lumina2Transformer2DModel
 
 
-FORECAST_STEPS = (15, 20, 23, 25, 27, 36)
+CONTROL_FORECAST_STEPS = (15, 20, 23, 25, 27, 36)
+AGGRESSIVE_FORECAST_STEPS = (15, 18, 20, 22, 24, 26, 28, 30, 36)
 CACHE_KWARGS = dict(
     num_inference_steps=50,
     warmup_steps=0,
@@ -18,7 +19,7 @@ CACHE_KWARGS = dict(
     history_limit=8,
     coordinate_max=50.0,
     tail_actual_steps=0,
-    forecast_step_indices=FORECAST_STEPS,
+    forecast_step_indices=CONTROL_FORECAST_STEPS,
 )
 
 
@@ -70,14 +71,17 @@ def test_netayume_lumina2_exposes_cache_mixin_api():
         assert hasattr(Lumina2Transformer2DModel, name)
 
 
-def test_netayume_dual_lane_schedule_and_shapes():
-    state = SpectrumNetaYumeState(SpectrumCacheConfig(**CACHE_KWARGS))
+@pytest.mark.parametrize("forecast_steps", [CONTROL_FORECAST_STEPS, AGGRESSIVE_FORECAST_STEPS])
+def test_netayume_dual_lane_schedule_and_shapes(forecast_steps):
+    kwargs = dict(CACHE_KWARGS)
+    kwargs["forecast_step_indices"] = forecast_steps
+    state = SpectrumNetaYumeState(SpectrumCacheConfig(**kwargs))
     pos_id = ("positive", 256)
     neg_id = ("negative", 1)
 
     for step in range(50):
         state.prepare_call(pos_id)
-        if step in FORECAST_STEPS:
+        if step in forecast_steps:
             assert not state.should_compute
             predicted = state.predict()
             assert tuple(predicted.shape) == (1, 8, 6)
@@ -88,7 +92,7 @@ def test_netayume_dual_lane_schedule_and_shapes():
         state.finish_call()
 
         state.prepare_call(neg_id)
-        if step in FORECAST_STEPS:
+        if step in forecast_steps:
             assert not state.should_compute
             predicted = state.predict()
             assert tuple(predicted.shape) == (1, 5, 6)
@@ -100,16 +104,21 @@ def test_netayume_dual_lane_schedule_and_shapes():
 
     summary = state.summary()
     assert summary["guard_latched"] is False
-    assert summary["forecast_steps"] == list(FORECAST_STEPS)
-    assert summary["prediction_call_count"] == 12
-    assert summary["full_call_count"] == 88
-    assert summary["lane_prediction_call_count"] == {"positive": 6, "negative": 6}
+    assert summary["forecast_steps"] == list(forecast_steps)
+    assert summary["prediction_call_count"] == 2 * len(forecast_steps)
+    assert summary["full_call_count"] == 100 - 2 * len(forecast_steps)
+    assert summary["lane_prediction_call_count"] == {
+        "positive": len(forecast_steps),
+        "negative": len(forecast_steps),
+    }
 
 
-def test_netayume_exact_profile_registers_on_tiny_topology():
+@pytest.mark.parametrize("forecast_steps", [CONTROL_FORECAST_STEPS, AGGRESSIVE_FORECAST_STEPS])
+def test_netayume_exact_profile_registers_on_tiny_topology(forecast_steps):
     model = _tiny_lumina2()
-    config = SpectrumCacheConfig(**CACHE_KWARGS)
-    model.enable_cache(config)
+    kwargs = dict(CACHE_KWARGS)
+    kwargs["forecast_step_indices"] = forecast_steps
+    model.enable_cache(SpectrumCacheConfig(**kwargs))
     assert model.is_cache_enabled
     model.disable_cache()
     assert not model.is_cache_enabled
@@ -118,6 +127,6 @@ def test_netayume_exact_profile_registers_on_tiny_topology():
 def test_netayume_rejects_unqualified_profile():
     model = _tiny_lumina2()
     kwargs = dict(CACHE_KWARGS)
-    kwargs["forecast_step_indices"] = (15,)
-    with pytest.raises(ValueError, match="qualified only for the exact 50-step"):
+    kwargs["forecast_step_indices"] = (15, 18, 20, 21, 23, 24, 26, 27, 29, 36)
+    with pytest.raises(ValueError, match="qualified Neta Yume schedules"):
         model.enable_cache(SpectrumCacheConfig(**kwargs))
