@@ -200,6 +200,48 @@ config = SpectrumCacheConfig(
 > The aggressive profile is experimental and is not the default. It trades additional approximation for speed and was only validated on the current Krea 2 Raw L4/NF4 standard text-to-image representation. Revalidate output quality and fail-closed behavior before using it with a different checkpoint, precision or quantization mode, accelerator or backend, conditioning route, scheduler, or step/guidance settings.
 
 
+
+### Wan2.1 T2V 1.3B profiles
+
+The native Wan2.1 adapter is qualified for the text-only `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` route with 50 denoising steps and classifier-free guidance. Conditional and unconditional forecast histories remain separate.
+
+The conservative profile remains the default:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=50,
+    warmup_steps=10,
+    window_size=2.0,
+    flex_window=0.0,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=100,
+    coordinate_max=50.0,
+    tail_actual_steps=10,
+)
+```
+
+A faster opt-in profile was qualified by forecasting 19 explicit middle-trajectory steps while keeping step 10 and the final 10 steps at full compute:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=50,
+    forecast_step_indices=(11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38),
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=100,
+    coordinate_max=50.0,
+    tail_actual_steps=10,
+)
+```
+
+The opt-in profile was rechecked with two seeds on an L4/NF4 representation over both the native 480x832 / 17-frame visual lane and the 192x320 / 81-frame temporal lane. It is not a portable speed or fidelity guarantee.
+
+> [!WARNING]
+> The opt-in Wan profile is qualified only for the current 1.3B text-only T2V route. Revalidate when changing checkpoint or model size, I2V/VACE/image conditioning, scheduler or timestep semantics, guidance topology, precision/quantization, accelerator/backend, attention kwargs, LoRA/adapters, or denoising-step count. Wan 14B and Wan2.2 are not covered by this profile.
+
 ### Anima family profiles
 
 The native Cosmos adapter is qualified for the standard Anima text-to-image route when the runtime callback reports a stable sequential CFG label (`cond` or `uncond`) and condition count. The callback should expose the current logical denoising step and keep conditional and unconditional forecast histories separate.
