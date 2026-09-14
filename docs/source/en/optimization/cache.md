@@ -243,6 +243,51 @@ The opt-in profile was rechecked with two seeds on an L4/NF4 representation over
 > The opt-in Wan profile is qualified only for the current 1.3B text-only T2V route. Revalidate when changing checkpoint or model size, I2V/VACE/image conditioning, scheduler or timestep semantics, guidance topology, precision/quantization, accelerator/backend, attention kwargs, LoRA/adapters, or denoising-step count. Wan 14B and Wan2.2 are not covered by this profile.
 
 
+### Qwen-Image-2512 profiles
+
+The native Qwen-Image-2512 adapter is qualified for the pinned `ovedrive/Qwen-Image-2512-4bit` revision `eeeeb8185634bbcaffeb9a46e4c8c3bf654f2c68` standard text-to-image route with 20 actual denoising steps and true classifier-free guidance. Conditional and unconditional forecast histories remain separate.
+
+The conservative selected6 profile remains the project default for this route:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=20,
+    forecast_step_indices=(6, 8, 10, 12, 14, 15),
+    window_size=2.0,
+    flex_window=0.25,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=20.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+A faster aggressive opt-in profile was qualified with nine explicit forecast steps:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=20,
+    forecast_step_indices=(6, 7, 9, 10, 12, 13, 15, 16, 18),
+    window_size=2.0,
+    flex_window=0.25,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=20.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+The aggressive profile was rechecked on an NVIDIA L4 with the pinned all-resident NF4/BF16 representation over square typography/product, portrait street, and landscape/interior cases. It measured about 1.76x-1.79x end-to-end speedup versus full compute in that environment, compared with about 1.38x-1.42x for selected6. These measurements are environment-specific and are not portable speed or fidelity guarantees.
+
+> [!WARNING]
+> The aggressive Qwen-Image-2512 profile is an opt-in profile for the exact qualified standard T2I route above; it does not replace selected6 as the conservative project default. Revalidate when changing checkpoint or revision, Qwen-Image variant, Edit/reference-image semantics, scheduler or denoising-step count, true-CFG settings, precision/quantization, accelerator/backend or offload policy, attention kwargs, ControlNet or other conditioning, LoRA/adapters, or runtime call topology. Qwen-Image-Edit-2511 is not covered by this profile.
+
 ### Neta Yume profiles
 
 The native Neta Yume adapter is qualified for the pinned `duongve/NetaYume-Lumina-Image-2.0-Diffusers-v40` standard CFG route with 50 denoising steps. Positive and negative CFG forecast histories remain separate.
