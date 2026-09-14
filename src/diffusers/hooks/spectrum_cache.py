@@ -2953,7 +2953,12 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     if tuple(unwrapped_module.config.axes_lens) != (300, 512, 512):
         raise ValueError("Neta Yume SPECTRUM requires axes_lens=(300,512,512).")
 
-    qualified_steps = (15, 20, 23, 25, 27, 36)
+    qualified_schedules = (
+        (15, 20, 23, 25, 27, 36),
+        (15, 18, 20, 22, 24, 26, 28, 30, 36),
+    )
+    observed_steps = tuple(config.forecast_step_indices or ())
+    qualified_steps = observed_steps if observed_steps in qualified_schedules else None
     profile_ok = (
         config.num_inference_steps == 50
         and tuple(config.forecast_step_indices or ()) == qualified_steps
@@ -2969,8 +2974,8 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     )
     if not profile_ok:
         raise ValueError(
-            "The current Neta Yume native candidate is qualified only for the exact 50-step d2/window3/blend0.5 "
-            "profile with forecast_step_indices=(15,20,23,25,27,36)."
+            "The current Neta Yume native adapter accepts only the qualified Neta Yume schedules for the exact "
+            "50-step d2/window3/blend0.5 profile."
         )
 
     blocks = list(unwrapped_module.layers)
