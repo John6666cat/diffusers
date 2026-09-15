@@ -3270,7 +3270,12 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
             f"Expected {expected_signature}, got {observed_signature}."
         )
 
-    qualified_steps = (20,)
+    qualified_schedules = (
+        (20,),
+        (17, 19, 21, 23),
+    )
+    observed_steps = tuple(config.forecast_step_indices or ())
+    qualified_steps = observed_steps if observed_steps in qualified_schedules else None
     profile_ok = (
         config.num_inference_steps == 30
         and tuple(config.forecast_step_indices or ()) == qualified_steps
@@ -3286,8 +3291,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     )
     if not profile_ok:
         raise ValueError(
-            "The current Pony V7 native candidate is qualified only for the exact 30-step "
-            "d2/window3/blend0.25 profile with forecast_step_indices=(20,)."
+            'The current Pony V7 native adapter accepts only the qualified Pony V7 schedules for the exact 30-step d2/window3/blend0.25 profile.'
         )
 
     joint_blocks = list(unwrapped_module.joint_transformer_blocks)
