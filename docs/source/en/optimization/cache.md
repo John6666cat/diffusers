@@ -333,6 +333,49 @@ The aggressive profile was rechecked on an NVIDIA L4 with the pinned all-residen
 > [!WARNING]
 > The aggressive Qwen-Image-Edit-2511 profile is an opt-in profile for the exact qualified single-reference EditPlus route above; it does not replace selected6 as the conservative project profile. Revalidate when changing checkpoint or revision, number of reference images, pipeline semantics, scheduler or denoising-step count, true-CFG settings, precision/quantization, accelerator/backend or offload policy, attention kwargs, ControlNet or other conditioning, LoRA/adapters, or runtime call topology. The equal pair9 positions independently observed for Qwen-Image-2512 do not make the two task routes interchangeable.
 
+### LTX-Video 2B profiles
+
+The native historical LTX-Video 2B adapter is qualified for the pinned `Lightricks/LTX-Video` revision `8984fa25007f376c1a299016d0957a37a2f797bb`, checkpoint `ltxv-2b-0.9.6-dev-04-25.safetensors`, standard `LTXPipeline` text-to-video route with 40 actual denoising steps, and the historical 28-block `LTXVideoTransformer3DModel` architecture. The qualified route uses real T5 conditioning and standard classifier-free guidance semantics.
+
+The conservative project profile is `w8_t8`:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=40,
+    window_size=2.0,
+    flex_window=0.0,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=100,
+    coordinate_max=50.0,
+    warmup_steps=8,
+    tail_actual_steps=8,
+)
+```
+
+A faster aggressive opt-in profile, `w8_t6`, was independently qualified by shortening only the final full-compute tail:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=40,
+    window_size=2.0,
+    flex_window=0.0,
+    degree=4,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=100,
+    coordinate_max=50.0,
+    warmup_steps=8,
+    tail_actual_steps=6,
+)
+```
+
+On the qualified NVIDIA L4 NF4/FP16 route, the aggressive profile averaged about 1.42x denoising speedup versus full compute across the three-case native regression. This measurement is environment-specific and is not a portable performance or fidelity guarantee.
+
+> [!WARNING]
+> The aggressive `w8_t6` profile is an opt-in profile for the exact qualified historical LTX-Video 2B standard T2V route above; it does not replace `w8_t8` as the conservative project profile. Revalidate when changing checkpoint or revision, distilled/non-distilled route, denoising-step count, scheduler/timestep behavior, CFG semantics, STG, image/video conditioning, attention kwargs or LoRA scaling, precision/quantization, accelerator/backend or offload policy, autograd/training, or transformer call topology.
+
 ### Neta Yume profiles
 
 The native Neta Yume adapter is qualified for the pinned `duongve/NetaYume-Lumina-Image-2.0-Diffusers-v40` standard CFG route with 50 denoising steps. Positive and negative CFG forecast histories remain separate.

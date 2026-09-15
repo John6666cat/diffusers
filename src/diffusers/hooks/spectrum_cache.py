@@ -3319,3 +3319,351 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     )
 
 # --- end Pony V7 / AuraFlow native SPECTRUM candidate -------------------------------------------
+
+# --- historical LTX-Video 2B native SPECTRUM candidate ---------------------------------------------
+
+class SpectrumLTXVideo2BState(BaseState):
+    """Context-local SPECTRUM state for the qualified historical LTX-Video 2B standard T2V route."""
+
+    def __init__(self, config: SpectrumCacheConfig):
+        self.config = config
+        self.schedule = SpectrumSchedule(config)
+        self.forecaster = SpectrumForecaster(config)
+        self.reset()
+
+    def reset(self) -> None:
+        self.schedule.reset()
+        self.forecaster.reset()
+        self.step_index = -1
+        self.should_compute = True
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.records: list[dict[str, Any]] = []
+        self.prediction_failures: list[dict[str, Any]] = []
+        self.real_block_executions = 0
+        self.bypassed_block_executions = 0
+        self.peak_history_bytes = 0
+
+    def latch(self, reason: str) -> None:
+        logical_step = max(int(self.step_index), 0)
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+        self.should_compute = True
+
+    def start_step(self) -> None:
+        self.step_index += 1
+        if self.step_index >= self.config.num_inference_steps:
+            self.latch(
+                f"logical step {self.step_index} outside configured inference-step range "
+                f"{self.config.num_inference_steps}"
+            )
+            return
+        if self.guard_latched:
+            self.should_compute = True
+            return
+        self.should_compute = bool(self.schedule.decide(self.step_index))
+
+    def record_real_features(self, feature: torch.Tensor) -> None:
+        self.forecaster.update(self.step_index, feature.detach())
+        self.peak_history_bytes = max(self.peak_history_bytes, self.forecaster.history_bytes())
+
+    def predict(self) -> torch.Tensor:
+        return self.forecaster.predict(self.step_index)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_failures": list(self.prediction_failures),
+            "prediction_call_count": sum(bool(r["predicted_body_used"]) for r in self.records),
+            "full_call_count": sum(not bool(r["predicted_body_used"]) for r in self.records),
+            "compute_steps": [int(r["logical_step"]) for r in self.records if not bool(r["predicted_body_used"])],
+            "forecast_steps": [int(r["logical_step"]) for r in self.records if bool(r["predicted_body_used"])],
+            "real_block_executions": self.real_block_executions,
+            "bypassed_block_executions": self.bypassed_block_executions,
+            "total_block_slots": self.real_block_executions + self.bypassed_block_executions,
+            "peak_history_bytes": self.peak_history_bytes,
+            "signature": self.signature,
+            "records": list(self.records),
+        }
+
+
+class SpectrumLTXVideo2BDenoiserHook(ModelHook):
+    """Fail-closed root adapter for the qualified historical LTX-Video 2B standard T2V route."""
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+        self._argument_indices: dict[str, int] = {}
+
+    def initialize_hook(self, module: torch.nn.Module):
+        parameters = list(inspect.signature(unwrap_module(module).__class__.forward).parameters)[1:]
+        names = (
+            "hidden_states",
+            "encoder_hidden_states",
+            "timestep",
+            "encoder_attention_mask",
+            "num_frames",
+            "height",
+            "width",
+            "rope_interpolation_scale",
+            "video_coords",
+            "attention_kwargs",
+            "return_dict",
+        )
+        self._argument_indices = {name: parameters.index(name) for name in names if name in parameters}
+        return module
+
+    def _get_argument(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        if name in kwargs:
+            return kwargs[name]
+        index = self._argument_indices.get(name)
+        if index is not None and index < len(args):
+            return args[index]
+        return None
+
+    @staticmethod
+    def _structure_signature(value: Any) -> Any:
+        if torch.is_tensor(value):
+            return _spectrum_tensor_signature(value)
+        if isinstance(value, dict):
+            return tuple(
+                (str(key), SpectrumLTXVideo2BDenoiserHook._structure_signature(item))
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(SpectrumLTXVideo2BDenoiserHook._structure_signature(item) for item in value)
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        return type(value).__name__
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTXVideo2BState = self.state_manager.get_state()
+
+        hidden_states = self._get_argument("hidden_states", args, kwargs)
+        encoder_hidden_states = self._get_argument("encoder_hidden_states", args, kwargs)
+        timestep = self._get_argument("timestep", args, kwargs)
+        encoder_attention_mask = self._get_argument("encoder_attention_mask", args, kwargs)
+        num_frames = self._get_argument("num_frames", args, kwargs)
+        height = self._get_argument("height", args, kwargs)
+        width = self._get_argument("width", args, kwargs)
+        rope_interpolation_scale = self._get_argument("rope_interpolation_scale", args, kwargs)
+        video_coords = self._get_argument("video_coords", args, kwargs)
+        attention_kwargs = self._get_argument("attention_kwargs", args, kwargs)
+
+        signature = {
+            "hidden_states": self._structure_signature(hidden_states),
+            "encoder_hidden_states": self._structure_signature(encoder_hidden_states),
+            "timestep": self._structure_signature(timestep),
+            "encoder_attention_mask": self._structure_signature(encoder_attention_mask),
+            "num_frames": self._structure_signature(num_frames),
+            "height": self._structure_signature(height),
+            "width": self._structure_signature(width),
+            "rope_interpolation_scale": self._structure_signature(rope_interpolation_scale),
+            "video_coords": self._structure_signature(video_coords),
+            "attention_kwargs": self._structure_signature(attention_kwargs),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local LTX-Video 2B input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for LTX-Video 2B SPECTRUM")
+        if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+            state.latch("LTX-Video 2B hidden_states must be rank 3")
+        if not torch.is_tensor(encoder_hidden_states) or encoder_hidden_states.ndim != 3:
+            state.latch("LTX-Video 2B encoder_hidden_states must be rank 3")
+        if not torch.is_tensor(timestep) or timestep.ndim != 1:
+            state.latch("per-token or non-1D LTX-Video timestep routes are not qualified")
+        elif torch.is_tensor(hidden_states) and timestep.shape[0] != hidden_states.shape[0]:
+            state.latch("LTX-Video 2B timestep batch contract changed")
+        if encoder_attention_mask is not None and (
+            not torch.is_tensor(encoder_attention_mask) or encoder_attention_mask.ndim != 2
+        ):
+            state.latch("LTX-Video 2B encoder attention mask contract changed")
+        if video_coords is not None:
+            state.latch("precomputed video_coords / conditioning routes are not qualified")
+        if attention_kwargs:
+            state.latch("non-empty attention kwargs / LoRA route is not qualified")
+        if not all(isinstance(value, int) and value > 0 for value in (num_frames, height, width)):
+            state.latch("standard LTX-Video latent geometry arguments are required")
+
+        state.start_step()
+        reason_before = state.guard_reasons[-1]["reason"] if state.guard_reasons else None
+        output = self.fn_ref.original_forward(*args, **kwargs)
+
+        predicted = not bool(state.should_compute) and not bool(state.guard_latched)
+        fallback_reason = None
+        if state.guard_latched:
+            fallback_reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else reason_before
+        state.records.append(
+            {
+                "logical_step": int(state.step_index),
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class _SpectrumLTXVideo2BBlockHookBase(ModelHook):
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    @staticmethod
+    def _hidden(args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor | None:
+        if "hidden_states" in kwargs:
+            return kwargs["hidden_states"]
+        if args:
+            return args[0]
+        return None
+
+
+class SpectrumLTXVideo2BHeadBlockHook(_SpectrumLTXVideo2BBlockHookBase):
+    """Predict the final block-stack feature at forecast steps and bypass the first heavy block."""
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTXVideo2BState = self.state_manager.get_state()
+        if state.guard_latched or state.should_compute:
+            state.real_block_executions += 1
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        hidden_states = self._hidden(args, kwargs)
+        try:
+            if not torch.is_tensor(hidden_states):
+                raise TypeError("missing LTX-Video hidden_states at forecast step")
+            predicted = state.predict()
+            if predicted.shape != hidden_states.shape:
+                raise ValueError(
+                    f"predicted feature shape {tuple(predicted.shape)} != input shape {tuple(hidden_states.shape)}"
+                )
+            if predicted.device != hidden_states.device or predicted.dtype != hidden_states.dtype:
+                raise ValueError(
+                    f"predicted feature placement {predicted.device}/{predicted.dtype} != "
+                    f"input {hidden_states.device}/{hidden_states.dtype}"
+                )
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite predicted LTX-Video body feature")
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+            state.prediction_failures.append({"step": int(state.step_index), "error": reason})
+            state.latch("forecast failure; sticky fail-closed")
+            state.real_block_executions += 1
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        state.bypassed_block_executions += 1
+        return predicted
+
+
+class SpectrumLTXVideo2BBlockHook(_SpectrumLTXVideo2BBlockHookBase):
+    """Bypass middle/tail heavy blocks on forecast steps and record real tail features."""
+
+    def __init__(self, state_manager: StateManager, is_tail: bool = False):
+        super().__init__(state_manager)
+        self.is_tail = is_tail
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTXVideo2BState = self.state_manager.get_state()
+        hidden_states = self._hidden(args, kwargs)
+
+        if state.guard_latched or state.should_compute:
+            state.real_block_executions += 1
+            output = self.fn_ref.original_forward(*args, **kwargs)
+            if self.is_tail and not state.guard_latched:
+                if not torch.is_tensor(output):
+                    state.latch("LTX-Video 2B tail block no longer returns a tensor")
+                else:
+                    state.record_real_features(output)
+            return output
+
+        if not torch.is_tensor(hidden_states):
+            state.latch("missing LTX-Video hidden_states while bypassing a heavy block")
+            state.real_block_executions += 1
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        state.bypassed_block_executions += 1
+        return hidden_states
+
+
+_apply_spectrum_cache_before_ltxvideo2b = apply_spectrum_cache
+
+
+def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
+    """Apply SPECTRUM, including the qualified historical LTX-Video 2B standard T2V adapter."""
+
+    from ..models.transformers.transformer_ltx import LTXVideoTransformer3DModel
+
+    unwrapped_module = unwrap_module(module)
+    if not isinstance(unwrapped_module, LTXVideoTransformer3DModel):
+        return _apply_spectrum_cache_before_ltxvideo2b(module, config)
+
+    expected_signature = {
+        "in_channels": 128,
+        "out_channels": 128,
+        "patch_size": 1,
+        "patch_size_t": 1,
+        "num_attention_heads": 32,
+        "attention_head_dim": 64,
+        "cross_attention_dim": 2048,
+        "num_layers": 28,
+        "activation_fn": "gelu-approximate",
+        "qk_norm": "rms_norm_across_heads",
+        "norm_elementwise_affine": False,
+        "norm_eps": 1e-6,
+        "caption_channels": 4096,
+        "attention_bias": True,
+        "attention_out_bias": True,
+    }
+    observed_signature = {key: getattr(unwrapped_module.config, key) for key in expected_signature}
+    if observed_signature != expected_signature:
+        raise ValueError(
+            "The current SPECTRUM LTX-Video adapter is qualified only for the historical 2B "
+            f"28-block transformer architecture. Expected {expected_signature}, got {observed_signature}."
+        )
+
+    blocks = list(unwrapped_module.transformer_blocks)
+    if len(blocks) != 28:
+        raise ValueError("SPECTRUM LTX-Video 2B support requires exactly 28 transformer blocks.")
+
+    state_manager = StateManager(SpectrumLTXVideo2BState, init_args=(config,))
+
+    root_registry = HookRegistry.check_if_exists_or_initialize(module)
+    root_registry.register_hook(SpectrumLTXVideo2BDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+    head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+    head_registry.register_hook(SpectrumLTXVideo2BHeadBlockHook(state_manager), _SPECTRUM_HEAD_BLOCK_HOOK)
+
+    for block in blocks[1:-1]:
+        registry = HookRegistry.check_if_exists_or_initialize(block)
+        registry.register_hook(SpectrumLTXVideo2BBlockHook(state_manager), _SPECTRUM_BLOCK_HOOK)
+
+    tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+    tail_registry.register_hook(
+        SpectrumLTXVideo2BBlockHook(state_manager, is_tail=True),
+        _SPECTRUM_BLOCK_HOOK,
+    )
+
+    logger.debug(
+        "Applied SPECTRUM cache to qualified historical LTX-Video 2B transformer with %d blocks and %d expected steps.",
+        len(blocks),
+        config.num_inference_steps,
+    )
+
+# --- end historical LTX-Video 2B native SPECTRUM candidate -----------------------------------------
