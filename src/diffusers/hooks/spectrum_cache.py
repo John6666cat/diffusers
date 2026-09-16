@@ -3671,3 +3671,426 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     )
 
 # --- end historical LTX-Video 2B native SPECTRUM candidate -----------------------------------------
+
+# --- LTX-2.3 Full native SPECTRUM candidate --------------------------------------------------------
+
+_SPECTRUM_LTX2_FULL_STG_PREFIX_END_EXCLUSIVE = 28
+_SPECTRUM_LTX2_FULL_CONTEXTS = (
+    "pred_cond",
+    "pred_uncond",
+    "pred_cond_stg",
+    "pred_cond_modality",
+)
+_SPECTRUM_LTX2_FULL_BALANCED_FORECAST_STEPS = (13, 15, 17, 19, 21, 23, 25, 27, 29)
+
+
+class SpectrumLTX2FullPrefixStore:
+    """Exact cond post-block-27 activations for the immediately following real STG pass."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.step_index: int | None = None
+        self.video: torch.Tensor | None = None
+        self.audio: torch.Tensor | None = None
+        self.store_count = 0
+        self.consume_count = 0
+
+    def store(self, step_index: int, video: torch.Tensor, audio: torch.Tensor) -> None:
+        self.step_index = int(step_index)
+        self.video = video.detach().clone()
+        self.audio = audio.detach().clone()
+        self.store_count += 1
+
+    def take(self, step_index: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.step_index != int(step_index) or self.video is None or self.audio is None:
+            return None
+        out = (self.video, self.audio)
+        self.step_index = None
+        self.video = None
+        self.audio = None
+        self.consume_count += 1
+        return out
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "pending_step": self.step_index,
+            "store_count": self.store_count,
+            "consume_count": self.consume_count,
+        }
+
+
+class SpectrumLTX2FullState(SpectrumLTX2State):
+    """One context-local Full/SFT SPECTRUM history plus exact STG-prefix accounting."""
+
+    def reset(self) -> None:
+        super().reset()
+        self.prefix_reuse_active = False
+        self.prefix_reused_steps: list[int] = []
+        self.prefix_reuse_misses: list[int] = []
+        self.prefix_reused_block_executions = 0
+
+    def summary(self) -> dict[str, Any]:
+        out = super().summary()
+        out.update(
+            {
+                "prefix_reused_steps": list(self.prefix_reused_steps),
+                "prefix_reuse_misses": list(self.prefix_reuse_misses),
+                "prefix_reused_block_executions": self.prefix_reused_block_executions,
+                "total_block_slots": (
+                    self.real_block_executions
+                    + self.bypassed_block_executions
+                    + self.prefix_reused_block_executions
+                ),
+            }
+        )
+        return out
+
+
+class SpectrumLTX2FullDenoiserHook(SpectrumLTX2DenoiserHook):
+    """Fail-closed root adapter for the qualified four-pass LTX-2.3 Full route."""
+
+    def __init__(self, state_manager: StateManager, prefix_store: SpectrumLTX2FullPrefixStore):
+        super().__init__(state_manager)
+        self.prefix_store = prefix_store
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTX2FullState = self.state_manager.get_state()
+        context = self.state_manager._current_context
+
+        hidden_states = self._get_argument("hidden_states", args, kwargs)
+        audio_hidden_states = self._get_argument("audio_hidden_states", args, kwargs)
+        encoder_hidden_states = self._get_argument("encoder_hidden_states", args, kwargs)
+        audio_encoder_hidden_states = self._get_argument("audio_encoder_hidden_states", args, kwargs)
+        video_coords = self._get_argument("video_coords", args, kwargs)
+        audio_coords = self._get_argument("audio_coords", args, kwargs)
+
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "audio_hidden_states": _spectrum_tensor_signature(audio_hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "audio_encoder_hidden_states": _spectrum_tensor_signature(audio_encoder_hidden_states),
+            "video_coords": _spectrum_tensor_signature(video_coords),
+            "audio_coords": _spectrum_tensor_signature(audio_coords),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local LTX-2 Full input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for LTX-2.3 Full SPECTRUM")
+        if context not in _SPECTRUM_LTX2_FULL_CONTEXTS:
+            state.latch(f"unsupported LTX-2.3 Full cache context {context!r}")
+        if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+            state.latch("LTX-2 Full video hidden_states must be rank 3")
+        if not torch.is_tensor(audio_hidden_states) or audio_hidden_states.ndim != 3:
+            state.latch("LTX-2 Full audio_hidden_states must be rank 3")
+        if not torch.is_tensor(encoder_hidden_states) or encoder_hidden_states.ndim != 3:
+            state.latch("LTX-2 Full video encoder_hidden_states must be rank 3")
+        if not torch.is_tensor(audio_encoder_hidden_states) or audio_encoder_hidden_states.ndim != 3:
+            state.latch("LTX-2 Full audio encoder_hidden_states must be rank 3")
+
+        stg_blocks = self._get_argument("spatio_temporal_guidance_blocks", args, kwargs)
+        actual_stg = tuple(stg_blocks or ())
+        isolate = bool(self._get_argument("isolate_modalities", args, kwargs))
+        expected_flags = {
+            "pred_cond": ((), False),
+            "pred_uncond": ((), False),
+            "pred_cond_stg": ((28,), False),
+            "pred_cond_modality": ((), True),
+        }
+        if context in expected_flags:
+            expected_stg, expected_isolate = expected_flags[context]
+            if actual_stg != expected_stg:
+                state.latch(
+                    f"{context} STG block contract changed: expected {expected_stg}, got {actual_stg}"
+                )
+            if isolate != expected_isolate:
+                state.latch(
+                    f"{context} modality-isolation contract changed: expected {expected_isolate}, got {isolate}"
+                )
+
+        if self._get_argument("perturbation_mask", args, kwargs) is not None:
+            state.latch("perturbation-mask route is not qualified for LTX-2.3 Full")
+        if not bool(self._get_argument("use_cross_timestep", args, kwargs)):
+            state.latch("legacy non-cross-timestep LTX-2.3 Full route is not qualified")
+        if self._get_argument("attention_kwargs", args, kwargs):
+            state.latch("non-empty attention kwargs / LoRA route is not qualified for LTX-2.3 Full")
+        if self._get_argument("video_self_attention_mask", args, kwargs) is not None:
+            state.latch("video self-attention mask / IC-LoRA route is not qualified for LTX-2.3 Full")
+        if self._get_argument("video_keyframes_mask", args, kwargs) is not None:
+            state.latch("keyframe-token route is not qualified for LTX-2.3 Full")
+
+        if not torch.is_tensor(video_coords) or video_coords.ndim != 4:
+            state.latch("standard modular LTX-2 Full video_coords tensor is required")
+        elif (
+            video_coords.shape[0] != hidden_states.shape[0]
+            or video_coords.shape[1] != 3
+            or video_coords.shape[2] != hidden_states.shape[1]
+            or video_coords.shape[3] != 2
+        ):
+            state.latch("standard modular LTX-2 Full video_coords shape contract changed")
+
+        if not torch.is_tensor(audio_coords) or audio_coords.ndim != 4:
+            state.latch("standard modular LTX-2 Full audio_coords tensor is required")
+        elif (
+            audio_coords.shape[0] != audio_hidden_states.shape[0]
+            or audio_coords.shape[1] != 1
+            or audio_coords.shape[2] != audio_hidden_states.shape[1]
+            or audio_coords.shape[3] != 2
+        ):
+            state.latch("standard modular LTX-2 Full audio_coords shape contract changed")
+
+        state.bypass = state.guard_latched
+        reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else None
+        try:
+            output = self.fn_ref.original_forward(*args, **kwargs)
+        finally:
+            state.bypass = False
+
+        if state.guard_latched:
+            state.records.append(
+                {
+                    "logical_step": max(int(state.step_index), 0),
+                    "scheduled_full_compute": True,
+                    "predicted_body_used": False,
+                    "guard_latched": True,
+                    "fallback_reason": reason,
+                }
+            )
+        else:
+            state.records.append(
+                {
+                    "logical_step": int(state.step_index),
+                    "scheduled_full_compute": bool(state.should_compute),
+                    "predicted_body_used": not bool(state.should_compute),
+                    "guard_latched": False,
+                    "fallback_reason": None,
+                }
+            )
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.prefix_store.reset()
+        self.state_manager.reset()
+        return module
+
+
+class _SpectrumLTX2FullBlockHookBase(_SpectrumLTX2BlockHookBase):
+    def __init__(
+        self,
+        state_manager: StateManager,
+        prefix_store: SpectrumLTX2FullPrefixStore,
+        block_index: int,
+    ):
+        super().__init__(state_manager)
+        self.prefix_store = prefix_store
+        self.block_index = int(block_index)
+
+    def _context(self) -> str | None:
+        return self.state_manager._current_context
+
+
+class SpectrumLTX2FullHeadBlockHook(_SpectrumLTX2FullBlockHookBase):
+    """Advance Full schedule; inject a forecast or the exact cond prefix for a real STG pass."""
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTX2FullState = self.state_manager.get_state()
+        if state.bypass:
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        hidden_states, audio_hidden_states = self._inputs(args, kwargs)
+        state.start_step()
+        state.prefix_reuse_active = False
+
+        if not state.should_compute:
+            predicted_video, predicted_audio = state.predict()
+            predicted_video = predicted_video.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            predicted_audio = predicted_audio.to(device=audio_hidden_states.device, dtype=audio_hidden_states.dtype)
+            if predicted_video.shape != hidden_states.shape:
+                raise ValueError(
+                    f"SPECTRUM LTX-2 Full predicted video feature shape {predicted_video.shape} "
+                    f"does not match {hidden_states.shape}."
+                )
+            if predicted_audio.shape != audio_hidden_states.shape:
+                raise ValueError(
+                    f"SPECTRUM LTX-2 Full predicted audio feature shape {predicted_audio.shape} "
+                    f"does not match {audio_hidden_states.shape}."
+                )
+            state.bypassed_block_executions += 1
+            return predicted_video, predicted_audio
+
+        if self._context() == "pred_cond_stg":
+            prefix = self.prefix_store.take(state.step_index)
+            if prefix is not None:
+                prefix_video, prefix_audio = prefix
+                prefix_video = prefix_video.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                prefix_audio = prefix_audio.to(device=audio_hidden_states.device, dtype=audio_hidden_states.dtype)
+                if prefix_video.shape == hidden_states.shape and prefix_audio.shape == audio_hidden_states.shape:
+                    state.prefix_reuse_active = True
+                    state.prefix_reused_steps.append(int(state.step_index))
+                    state.prefix_reused_block_executions += 1
+                    return prefix_video, prefix_audio
+            state.prefix_reuse_misses.append(int(state.step_index))
+
+        state.real_block_executions += 1
+        return self.fn_ref.original_forward(*args, **kwargs)
+
+
+class SpectrumLTX2FullBlockHook(_SpectrumLTX2FullBlockHookBase):
+    """Skip forecasts; reuse exact STG prefix through block 27; record real tail features."""
+
+    def __init__(
+        self,
+        state_manager: StateManager,
+        prefix_store: SpectrumLTX2FullPrefixStore,
+        block_index: int,
+        is_tail: bool = False,
+    ):
+        super().__init__(state_manager, prefix_store, block_index)
+        self.is_tail = is_tail
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumLTX2FullState = self.state_manager.get_state()
+        context = self._context()
+
+        if state.bypass:
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        if not state.should_compute:
+            hidden_states, audio_hidden_states = self._inputs(args, kwargs)
+            state.bypassed_block_executions += 1
+            return hidden_states, audio_hidden_states
+
+        if (
+            context == "pred_cond_stg"
+            and state.prefix_reuse_active
+            and self.block_index < _SPECTRUM_LTX2_FULL_STG_PREFIX_END_EXCLUSIVE
+        ):
+            hidden_states, audio_hidden_states = self._inputs(args, kwargs)
+            state.prefix_reused_block_executions += 1
+            return hidden_states, audio_hidden_states
+
+        state.real_block_executions += 1
+        output = self.fn_ref.original_forward(*args, **kwargs)
+
+        if (
+            context == "pred_cond"
+            and self.block_index == _SPECTRUM_LTX2_FULL_STG_PREFIX_END_EXCLUSIVE - 1
+        ):
+            if not isinstance(output, tuple) or len(output) < 2:
+                raise RuntimeError("LTX-2 Full block 27 no longer returns paired video/audio states.")
+            self.prefix_store.store(state.step_index, output[0], output[1])
+
+        if self.is_tail:
+            if not isinstance(output, tuple) or len(output) < 2:
+                raise RuntimeError("LTX-2 Full transformer tail no longer returns paired video/audio states.")
+            state.record_real_features(output[0], output[1])
+
+        return output
+
+
+_apply_spectrum_cache_before_ltx2_full = apply_spectrum_cache
+
+
+def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
+    """Apply SPECTRUM, adding the qualified 30-step LTX-2.3 Full four-pass route."""
+
+    from ..models.transformers.transformer_ltx2 import LTX2VideoTransformer3DModel
+
+    unwrapped_module = unwrap_module(module)
+    if not isinstance(unwrapped_module, LTX2VideoTransformer3DModel) or config.num_inference_steps != 30:
+        return _apply_spectrum_cache_before_ltx2_full(module, config)
+
+    if config.forecast_step_indices is None:
+        raise ValueError("LTX-2.3 Full SPECTRUM currently requires explicit forecast_step_indices.")
+
+    schedule = tuple(config.forecast_step_indices)
+    allowed_schedules = {(), _SPECTRUM_LTX2_FULL_BALANCED_FORECAST_STEPS}
+    profile_ok = (
+        schedule in allowed_schedules
+        and float(config.window_size) == 3.0
+        and int(config.degree) == 2
+        and float(config.ridge_lambda) == 0.1
+        and float(config.blend_w) == 0.5
+        and int(config.history_limit) == 8
+        and float(config.coordinate_max) == 8.0
+        and int(config.warmup_steps) == 0
+        and float(config.flex_window) == 0.0
+        and int(config.tail_actual_steps) == 0
+    )
+    if not profile_ok:
+        raise ValueError(
+            "The current LTX-2.3 Full native candidate is qualified only for the 30-step "
+            "d2/window3/blend0.5/ridge0.1/c8 profile with forecast_step_indices=() "
+            "or (13,15,17,19,21,23,25,27,29)."
+        )
+
+    expected_signature = {
+        "in_channels": 128,
+        "out_channels": 128,
+        "num_layers": 48,
+        "num_attention_heads": 32,
+        "attention_head_dim": 128,
+        "cross_attention_dim": 4096,
+        "audio_in_channels": 128,
+        "audio_out_channels": 128,
+        "audio_num_attention_heads": 32,
+        "audio_attention_head_dim": 64,
+        "audio_cross_attention_dim": 2048,
+        "caption_channels": 3840,
+        "cross_attn_mod": True,
+        "audio_cross_attn_mod": True,
+        "gated_attn": True,
+        "audio_gated_attn": True,
+        "perturbed_attn": True,
+        "rope_type": "split",
+        "use_prompt_embeddings": False,
+    }
+    observed_signature = {key: getattr(unwrapped_module.config, key) for key in expected_signature}
+    if observed_signature != expected_signature:
+        raise ValueError(
+            "The current SPECTRUM LTX-2.3 Full adapter is qualified only for the pinned audiovisual "
+            f"transformer architecture. Expected {expected_signature}, got {observed_signature}."
+        )
+
+    blocks = list(unwrapped_module.transformer_blocks)
+    if len(blocks) != 48:
+        raise ValueError("SPECTRUM LTX-2.3 Full support requires exactly 48 audiovisual transformer blocks.")
+
+    state_manager = StateManager(SpectrumLTX2FullState, init_args=(config,))
+    prefix_store = SpectrumLTX2FullPrefixStore()
+
+    root_registry = HookRegistry.check_if_exists_or_initialize(module)
+    root_registry.register_hook(
+        SpectrumLTX2FullDenoiserHook(state_manager, prefix_store),
+        _SPECTRUM_DENOISER_HOOK,
+    )
+    head_registry = HookRegistry.check_if_exists_or_initialize(blocks[0])
+    head_registry.register_hook(
+        SpectrumLTX2FullHeadBlockHook(state_manager, prefix_store, 0),
+        _SPECTRUM_HEAD_BLOCK_HOOK,
+    )
+    for index, block in enumerate(blocks[1:-1], start=1):
+        registry = HookRegistry.check_if_exists_or_initialize(block)
+        registry.register_hook(
+            SpectrumLTX2FullBlockHook(state_manager, prefix_store, index),
+            _SPECTRUM_BLOCK_HOOK,
+        )
+    tail_registry = HookRegistry.check_if_exists_or_initialize(blocks[-1])
+    tail_registry.register_hook(
+        SpectrumLTX2FullBlockHook(state_manager, prefix_store, len(blocks) - 1, is_tail=True),
+        _SPECTRUM_BLOCK_HOOK,
+    )
+
+    logger.debug(
+        "Applied SPECTRUM cache to qualified LTX-2.3 Full transformer with %d blocks, %d steps, "
+        "and exact STG prefix reuse through block %d.",
+        len(blocks),
+        config.num_inference_steps,
+        _SPECTRUM_LTX2_FULL_STG_PREFIX_END_EXCLUSIVE - 1,
+    )
+
+# --- end LTX-2.3 Full native SPECTRUM candidate ----------------------------------------------------
