@@ -34,6 +34,7 @@ _SPECTRUM_BLOCK_HOOK = "spectrum_cache_block"
 _SPECTRUM_UNET_FEATURE_HOOK = "spectrum_cache_unet_feature"
 _SPECTRUM_COSMOS_FEATURE_HOOK = "spectrum_cache_cosmos_feature"
 _SPECTRUM_FLUX2_FEATURE_HOOK = "spectrum_cache_flux2_feature"
+_SPECTRUM_CHROMA_FEATURE_HOOK = "spectrum_cache_chroma_feature"
 _FLUX_BLOCK_GROUPS = ("transformer_blocks", "single_transformer_blocks")
 _CONTROL_ARGUMENTS = ("controlnet_block_samples", "controlnet_single_block_samples")
 _UNET_RESIDUAL_ARGUMENTS = (
@@ -4094,3 +4095,362 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     )
 
 # --- end LTX-2.3 Full native SPECTRUM candidate ----------------------------------------------------
+
+
+# --- Chroma1-HD native SPECTRUM candidate ---------------------------------------------------------
+
+
+class SpectrumChromaState(BaseState):
+    """Dual-lane state for the qualified Chroma1-HD external-CFG route."""
+
+    def __init__(self, config: SpectrumCacheConfig):
+        self.config = config
+        self.schedule = SpectrumSchedule(config)
+        self.reset()
+
+    def reset(self) -> None:
+        self.schedule.reset()
+        self.forecasters = {
+            "positive": SpectrumForecaster(self.config),
+            "negative": SpectrumForecaster(self.config),
+        }
+        self.call_index = -1
+        self.step_index = -1
+        self.current_lane: str | None = None
+        self.should_compute = True
+        self.record_real_feature_enabled = False
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.lane_identities: dict[str, Any] = {}
+        self.decisions: dict[int, bool] = {}
+        self.compute_steps: list[int] = []
+        self.forecast_steps: list[int] = []
+        self.records: list[dict[str, Any]] = []
+        self.predict_failures: list[dict[str, Any]] = []
+        self.peak_history_bytes = 0
+
+    def latch(self, reason: str) -> None:
+        logical_step = max(int(self.step_index), 0)
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def prepare_call(self, conditioning_identity: Any, signature: dict[str, Any]) -> None:
+        self.call_index += 1
+        self.step_index = self.call_index // 2
+        self.current_lane = "positive" if self.call_index % 2 == 0 else "negative"
+
+        if self.step_index >= self.config.num_inference_steps:
+            self.latch(
+                f"logical step {self.step_index} outside configured inference-step range "
+                f"{self.config.num_inference_steps}"
+            )
+
+        if self.signature is None:
+            self.signature = signature
+        elif self.signature != signature:
+            self.latch("context-local structural input signature changed")
+
+        previous = self.lane_identities.get(self.current_lane)
+        if previous is None:
+            self.lane_identities[self.current_lane] = conditioning_identity
+        elif previous != conditioning_identity:
+            self.latch(f"{self.current_lane} conditioning identity changed")
+
+        if (
+            len(self.lane_identities) == 2
+            and self.lane_identities["positive"] == self.lane_identities["negative"]
+        ):
+            self.latch("Chroma external CFG positive/negative conditioning identities are not distinct")
+
+        if self.guard_latched:
+            self.should_compute = True
+            return
+
+        if self.current_lane == "positive":
+            decision = bool(self.schedule.decide(self.step_index))
+            self.decisions[self.step_index] = decision
+            target = self.compute_steps if decision else self.forecast_steps
+            target.append(self.step_index)
+        else:
+            if self.step_index not in self.decisions:
+                self.latch("Chroma negative CFG lane arrived before its positive lane")
+                self.should_compute = True
+                return
+            decision = self.decisions[self.step_index]
+        self.should_compute = decision
+
+    def _forecaster(self) -> SpectrumForecaster:
+        if self.current_lane is None:
+            raise RuntimeError("SPECTRUM Chroma has no active CFG lane.")
+        return self.forecasters[self.current_lane]
+
+    def record_real_feature(self, feature: torch.Tensor) -> None:
+        # Preserve the exact research route: BF16 boundary feature -> FP32 CPU history.
+        cpu_feature = feature.detach().to(device="cpu", dtype=torch.float32)
+        self._forecaster().update(self.step_index, cpu_feature)
+        total = sum(forecaster.history_bytes() for forecaster in self.forecasters.values())
+        self.peak_history_bytes = max(self.peak_history_bytes, total)
+
+    def can_predict(self) -> bool:
+        return bool(self._forecaster().features)
+
+    def predict(self) -> torch.Tensor:
+        return self._forecaster().predict(self.step_index)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
+            "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
+            "lane_prediction_call_count": {
+                lane: sum(
+                    record["predicted_body_used"] and record.get("lane") == lane for record in self.records
+                )
+                for lane in ("positive", "negative")
+            },
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "predict_failures": list(self.predict_failures),
+            "peak_history_bytes": self.peak_history_bytes,
+            "records": list(self.records),
+        }
+
+
+class SpectrumChromaDenoiserHook(ModelHook):
+    """Root adapter for the qualified Chroma1-HD 40-step external-CFG T2I route."""
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def _record(self, state: SpectrumChromaState, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": int(state.step_index),
+                "lane": state.current_lane,
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        timestep: torch.Tensor | None = None,
+        img_ids: torch.Tensor | None = None,
+        txt_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        joint_attention_kwargs: dict[str, Any] | None = None,
+        controlnet_block_samples=None,
+        controlnet_single_block_samples=None,
+        return_dict: bool = True,
+        controlnet_blocks_repeat: bool = False,
+    ):
+        from ..models.modeling_outputs import Transformer2DModelOutput
+
+        state: SpectrumChromaState = self.state_manager.get_state()
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "timestep": _spectrum_tensor_signature(timestep),
+            "img_ids": _spectrum_tensor_signature(img_ids),
+            "txt_ids": _spectrum_tensor_signature(txt_ids),
+            "attention_mask": _spectrum_tensor_signature(attention_mask),
+        }
+        state.prepare_call(_spectrum_tensor_identity(encoder_hidden_states), signature)
+
+        if module.training or torch.is_grad_enabled():
+            state.latch("autograd/training is not qualified for Chroma1-HD SPECTRUM")
+        if not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
+            state.latch("Chroma hidden_states must be a rank-3 tensor")
+        if not torch.is_tensor(encoder_hidden_states) or encoder_hidden_states.ndim != 3:
+            state.latch("Chroma encoder_hidden_states must be a rank-3 tensor")
+        if timestep is None or not torch.is_tensor(timestep) or timestep.ndim != 1:
+            state.latch("Chroma timestep must be a rank-1 tensor")
+        if img_ids is None or not torch.is_tensor(img_ids) or img_ids.ndim != 2 or img_ids.shape[-1] != 3:
+            state.latch("Chroma img_ids must have shape (image_sequence_length, 3)")
+        if txt_ids is None or not torch.is_tensor(txt_ids) or txt_ids.ndim != 2 or txt_ids.shape[-1] != 3:
+            state.latch("Chroma txt_ids must have shape (text_sequence_length, 3)")
+        if attention_mask is None or not torch.is_tensor(attention_mask) or attention_mask.dtype != torch.bool:
+            state.latch("qualified Chroma1-HD SPECTRUM requires the corrected boolean attention mask")
+        elif attention_mask.ndim != 2:
+            state.latch("Chroma attention_mask must be rank 2")
+        if controlnet_block_samples is not None or controlnet_single_block_samples is not None:
+            state.latch("ControlNet Chroma route is not qualified")
+        if controlnet_blocks_repeat:
+            state.latch("ControlNet-repeat Chroma route is not qualified")
+        if isinstance(joint_attention_kwargs, dict) and joint_attention_kwargs:
+            state.latch("non-empty joint_attention_kwargs / IP-Adapter / LoRA route is not qualified")
+
+        call_kwargs = {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+            "timestep": timestep,
+            "img_ids": img_ids,
+            "txt_ids": txt_ids,
+            "attention_mask": attention_mask,
+            "joint_attention_kwargs": joint_attention_kwargs,
+            "controlnet_block_samples": controlnet_block_samples,
+            "controlnet_single_block_samples": controlnet_single_block_samples,
+            "return_dict": return_dict,
+            "controlnet_blocks_repeat": controlnet_blocks_repeat,
+        }
+
+        if state.guard_latched:
+            state.should_compute = True
+
+        if state.should_compute or not state.can_predict():
+            state.record_real_feature_enabled = not state.guard_latched
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.record_real_feature_enabled = False
+            self._record(state, predicted=False)
+            return output
+
+        try:
+            predicted = state.predict()
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite predicted Chroma1-HD body feature")
+            predicted = predicted.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+            tail_timestep = timestep.to(hidden_states.dtype) * 1000
+            input_vec = module.time_text_embed(tail_timestep)
+            pooled_temb = module.distilled_guidance_layer(input_vec)
+            temb = pooled_temb[:, -2:]
+            output = module.proj_out(module.norm_out(predicted, temb))
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+            state.predict_failures.append({"step": state.step_index, "lane": state.current_lane, "error": reason})
+            state.latch("forecast failure; sticky fail-closed")
+            state.record_real_feature_enabled = False
+            result = self.fn_ref.original_forward(**call_kwargs)
+            self._record(state, predicted=False, fallback_reason=reason)
+            return result
+
+        self._record(state, predicted=True)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumChromaFeatureHook(ModelHook):
+    """Record the post-single-block Chroma image feature immediately before ``norm_out``."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def pre_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumChromaState = self.state_manager.get_state()
+        if not state.record_real_feature_enabled:
+            return args, kwargs
+
+        feature = args[0] if args else kwargs.get("hidden_states")
+        if not torch.is_tensor(feature):
+            raise RuntimeError("SPECTRUM Chroma feature hook could not locate norm_out input.")
+        state.record_real_feature(feature)
+        return args, kwargs
+
+
+_apply_spectrum_cache_before_chroma = apply_spectrum_cache
+
+
+def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
+    """Apply SPECTRUM, including the qualified Chroma1-HD 40-step external-CFG T2I profiles."""
+
+    from ..models.transformers.transformer_chroma import ChromaTransformer2DModel
+
+    unwrapped_module = unwrap_module(module)
+    if not isinstance(unwrapped_module, ChromaTransformer2DModel):
+        return _apply_spectrum_cache_before_chroma(module, config)
+
+    expected_signature = {
+        "patch_size": 1,
+        "in_channels": 64,
+        "out_channels": None,
+        "num_layers": 19,
+        "num_single_layers": 38,
+        "attention_head_dim": 128,
+        "num_attention_heads": 24,
+        "joint_attention_dim": 4096,
+        "axes_dims_rope": (16, 56, 56),
+        "approximator_num_channels": 64,
+        "approximator_hidden_dim": 5120,
+        "approximator_layers": 5,
+    }
+    observed_signature = {
+        key: tuple(getattr(unwrapped_module.config, key)) if key == "axes_dims_rope" else getattr(unwrapped_module.config, key)
+        for key in expected_signature
+    }
+    if observed_signature != expected_signature:
+        raise ValueError(
+            "The current SPECTRUM Chroma adapter is qualified only for the pinned Chroma1-HD transformer "
+            f"architecture. Expected {expected_signature}, got {observed_signature}."
+        )
+
+    schedules = {
+        (13, 17, 21, 25, 29, 33): 40.0,
+        (7, 10, 13, 16, 19, 22, 25, 28, 31, 34): 50.0,
+        (7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 28, 31): 50.0,
+    }
+    observed_steps = tuple(config.forecast_step_indices or ())
+    expected_coordinate_max = schedules.get(observed_steps)
+    profile_ok = (
+        config.forecast_step_indices is not None
+        and expected_coordinate_max is not None
+        and config.num_inference_steps == 40
+        and int(config.warmup_steps) == 7
+        and float(config.window_size) == 2.0
+        and float(config.flex_window) == 0.75
+        and int(config.degree) == 4
+        and float(config.ridge_lambda) == 0.1
+        and float(config.blend_w) == 0.5
+        and int(config.history_limit) == 100
+        and float(config.coordinate_max) == expected_coordinate_max
+        and int(config.tail_actual_steps) == 5
+    )
+    if not profile_ok:
+        raise ValueError(
+            "The current Chroma1-HD native adapter accepts only the qualified 40-step external-CFG profiles: "
+            "late6=(13,17,21,25,29,33) with coordinate_max=40, "
+            "spread10=(7,10,13,16,19,22,25,28,31,34) with coordinate_max=50, or "
+            "dense12=(7,9,11,13,15,17,19,21,23,25,28,31) with coordinate_max=50; "
+            "all use warmup=7/window=2/flex=0.75/d4/ridge=0.1/blend=0.5/history=100/tail=5."
+        )
+
+    if getattr(unwrapped_module, "norm_out", None) is None or getattr(unwrapped_module, "proj_out", None) is None:
+        raise ValueError("SPECTRUM Chroma1-HD support requires norm_out and proj_out.")
+
+    state_manager = StateManager(SpectrumChromaState, init_args=(config,))
+    root_registry = HookRegistry.check_if_exists_or_initialize(module)
+    root_registry.register_hook(SpectrumChromaDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+    feature_registry = HookRegistry.check_if_exists_or_initialize(unwrapped_module.norm_out)
+    feature_registry.register_hook(SpectrumChromaFeatureHook(state_manager), _SPECTRUM_CHROMA_FEATURE_HOOK)
+
+    logger.debug(
+        "Applied SPECTRUM cache to qualified Chroma1-HD 40-step external-CFG transformer with forecast steps %s.",
+        observed_steps,
+    )
+
+
+# --- end Chroma1-HD native SPECTRUM candidate -----------------------------------------------------
