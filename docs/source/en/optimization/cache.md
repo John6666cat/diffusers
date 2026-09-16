@@ -333,6 +333,78 @@ The aggressive profile was rechecked on an NVIDIA L4 with the pinned all-residen
 > [!WARNING]
 > The aggressive Qwen-Image-Edit-2511 profile is an opt-in profile for the exact qualified single-reference EditPlus route above; it does not replace selected6 as the conservative project profile. Revalidate when changing checkpoint or revision, number of reference images, pipeline semantics, scheduler or denoising-step count, true-CFG settings, precision/quantization, accelerator/backend or offload policy, attention kwargs, ControlNet or other conditioning, LoRA/adapters, or runtime call topology. The equal pair9 positions independently observed for Qwen-Image-2512 do not make the two task routes interchangeable.
 
+### LTX-2.3 Distilled profiles
+
+The native LTX-2.3 adapter is qualified for the pinned `OzzyGT/LTX-2.3-Distilled-bnb-nf4` revision `0b921790a5ad18a3c493e64b162dae5ce2834fa9` eight-step distilled route. The qualified route uses one transformer forward per logical step, paired video/audio forecasting, CFG 1, and STG 0.
+
+The conservative project profile forecasts only step 3:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=8,
+    forecast_step_indices=(3,),
+    window_size=3.0,
+    flex_window=0.0,
+    degree=2,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=8.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+A faster aggressive opt-in profile was independently qualified by forecasting steps 3 and 6:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=8,
+    forecast_step_indices=(3, 6),
+    window_size=3.0,
+    flex_window=0.0,
+    degree=2,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=8.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+The `[3, 6]` profile averaged about 1.31x denoising speedup in the paired three-case L4/NF4 research gate, and the current native adapter reproduced the selected research outputs exactly. This measurement is environment-specific and is not a portable performance or fidelity guarantee.
+
+> [!WARNING]
+> The `[3, 6]` profile is an aggressive opt-in for the exact qualified eight-step Distilled route above; it does not replace `[3]` as the conservative project profile. Revalidate when changing checkpoint or revision, distilled schedule, denoising-step count, guidance topology, STG, image/video conditioning, attention kwargs or LoRA scaling, precision/quantization, accelerator/backend or offload policy, autograd/training, or transformer call topology. Do not transfer this schedule to LTX-2.3 Full.
+
+### LTX-2.3 Full profile
+
+LTX-2.3 Full is a separate 30-step four-pass route and must not share Distilled forecast history. The qualified native wrapper keeps `cond`, `uncond`, `STG`, and modality guidance histories separate. For real STG passes with `spatio_temporal_guidance_blocks=[28]`, it also reuses the exact conditional activation through block 27 and resumes real STG computation at block 28.
+
+The selected balanced profile, `start13_odd9_prefix36`, is:
+
+```python
+config = SpectrumCacheConfig(
+    num_inference_steps=30,
+    forecast_step_indices=(13, 15, 17, 19, 21, 23, 25, 27, 29),
+    window_size=3.0,
+    flex_window=0.0,
+    degree=2,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=8,
+    coordinate_max=8.0,
+    warmup_steps=0,
+    tail_actual_steps=0,
+)
+```
+
+The profile was qualified on the pinned `OzzyGT/LTX-2.3-bnb-nf4` revision `2b3f48b7af06a57841ea3aedd53ef790134b893f` standard modular Full route with 30 denoising steps and four guidance forwards per logical step. The fresh-clone promotion gate averaged about 1.65x denoising speedup across tram, drummer, and beach-dog cases while reproducing the accepted research latent hashes exactly. Exact STG prefix-only reuse was also bit-identical to the no-cache baseline on all three cases.
+
+> [!WARNING]
+> `start13_odd9_prefix36` is qualified only for the exact Full route above, including four-pass cond/uncond/STG/modality guidance and STG block 28. Revalidate when changing checkpoint or revision, guidance scales or pass topology, `spatio_temporal_guidance_blocks`, scheduler or denoising-step count, perturbation masks, IC/reference or keyframe conditioning, attention kwargs or LoRA scaling, precision/quantization, accelerator/backend or offload policy, autograd/training, or transformer call topology.
+
 ### LTX-Video 2B profiles
 
 The native historical LTX-Video 2B adapter is qualified for the pinned `Lightricks/LTX-Video` revision `8984fa25007f376c1a299016d0957a37a2f797bb`, checkpoint `ltxv-2b-0.9.6-dev-04-25.safetensors`, standard `LTXPipeline` text-to-video route with 40 actual denoising steps, and the historical 28-block `LTXVideoTransformer3DModel` architecture. The qualified route uses real T5 conditioning and standard classifier-free guidance semantics.
