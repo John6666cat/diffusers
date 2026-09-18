@@ -65,3 +65,56 @@ Long-temporal checks retained 121 frames and 50 steps while reducing only spatia
 
 > [!WARNING]
 > These are fork-specific research profiles, not portable defaults. They were qualified with the fixed ratio curve above, the pinned HunyuanVideo 1.5 checkpoint, sequential CFG, the project NF4/BF16 representation, and the tested scheduler/step count. The generic sequential-CFG calibration guidance above recommends the first conditional array in most cases; changing this Hunyuan profile's qualified ratio policy, checkpoint, scheduler, guidance topology, precision/quantization, attention backend, adapters, or denoising-step count requires requalification. A full 480x848 / 121-frame Cartesian confirmation was not required for this research closure.
+
+## Wan2.1 T2V 1.3B MagCache profiles
+
+The project bounded-reopened native MagCache for the pinned `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` revision `0fad780a534b6463e45facd96134c9f345acfa5b`. Wan already exposes separate `cache_context("cond")` and `cache_context("uncond")` scopes, and the qualified MagCache run followed the sequential-CFG guidance above by using the first, conditional calibration array.
+
+The 81-frame confirmation used this 50-step conditional ratio curve:
+
+```python
+WAN21_13B_MAG_RATIOS_50 = [
+    1.0, 1.0139240026474, 0.971612274646759, 0.9779471158981323,
+    0.9794172048568726, 0.9805305600166321, 0.9810647964477539, 0.9807896614074707,
+    0.9818068146705627, 0.9816883206367493, 0.9814188480377197, 0.9810559749603271,
+    0.9810541272163391, 0.9809654951095581, 0.9807681441307068, 0.9801260232925415,
+    0.9799965620040894, 0.9798394441604614, 0.9791591167449951, 0.9793544411659241,
+    0.9786234498023987, 0.9782900810241699, 0.9781445860862732, 0.977333128452301,
+    0.9771683812141418, 0.9765759110450745, 0.9764811396598816, 0.9759577512741089,
+    0.975703775882721, 0.9746671319007874, 0.9751186966896057, 0.974176824092865,
+    0.9734554290771484, 0.9737706184387207, 0.9727852940559387, 0.9723516702651978,
+    0.9719029068946838, 0.9718255996704102, 0.9710003733634949, 0.9708519577980042,
+    0.970937192440033, 0.9704956412315369, 0.9707760214805603, 0.9708070755004883,
+    0.9708809852600098, 0.9727936387062073, 0.9743280410766602, 0.9847269058227539,
+    1.0319546461105347, 1.1225619316101074,
+]
+```
+
+The balanced project profile is:
+
+```python
+mag_balanced = MagCacheConfig(
+    threshold=0.12,
+    max_skip_steps=4,
+    retention_ratio=0.30,
+    num_inference_steps=50,
+    mag_ratios=WAN21_13B_MAG_RATIOS_50,
+)
+```
+
+A faster source-style opt-in is:
+
+```python
+mag_source_style = MagCacheConfig(
+    threshold=0.12,
+    max_skip_steps=4,
+    retention_ratio=0.20,
+    num_inference_steps=50,
+    mag_ratios=WAN21_13B_MAG_RATIOS_50,
+)
+```
+
+In the final same-run 192x320 / 81-frame / 50-step L4/NF4 confirmation, the existing SPECTRUM `mid19_keep10` control measured 1.465x speedup with cosine 0.998827 and normalized RMSE 0.0484. `mag_balanced` measured 1.785x with cosine 0.999234 and normalized RMSE 0.0396, strictly dominating that control on the measured speed and latent-quality metrics. `mag_source_style` measured 2.017x with cosine 0.998258 and normalized RMSE 0.0592, retaining a faster Pareto point.
+
+> [!WARNING]
+> These measurements are environment- and route-specific. The profiles are qualified only for the pinned Wan2.1 1.3B text-only T2V route, 50-step sequential CFG, corrected zero-tail conditioning contract, and the tested NF4/FP16-compute representation. Recalibrate and revalidate for Wan 14B, Wan2.2, I2V/VACE or image conditioning, a different scheduler or step count, LoRA/adapters, attention kwargs, precision/quantization, or a changed guidance topology.
