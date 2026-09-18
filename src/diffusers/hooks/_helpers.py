@@ -181,6 +181,7 @@ def _register_transformer_blocks_metadata():
         HunyuanVideoTokenReplaceTransformerBlock,
         HunyuanVideoTransformerBlock,
     )
+    from ..models.transformers.transformer_hunyuan_video15 import HunyuanVideo15TransformerBlock
     from ..models.transformers.transformer_hunyuanimage import (
         HunyuanImageSingleTransformerBlock,
         HunyuanImageTransformerBlock,
@@ -271,6 +272,17 @@ def _register_transformer_blocks_metadata():
     )
     TransformerBlockRegistry.register(
         model_class=HunyuanVideoTokenReplaceSingleTransformerBlock,
+        metadata=TransformerBlockMetadata(
+            return_hidden_states_index=0,
+            return_encoder_hidden_states_index=1,
+        ),
+    )
+
+    # HunyuanVideo 1.5
+    # Compatibility seam for native block caches. Drop this registration when
+    # the rebased upstream registry provides an equivalent entry.
+    TransformerBlockRegistry.register(
+        model_class=HunyuanVideo15TransformerBlock,
         metadata=TransformerBlockMetadata(
             return_hidden_states_index=0,
             return_encoder_hidden_states_index=1,
