@@ -15,6 +15,8 @@ Caching accelerates inference by storing and reusing intermediate outputs of dif
 
 This guide shows you how to use the caching methods supported in Diffusers.
 
+Fork-specific qualification evidence for cache profiles is tracked separately in [Fork-qualified cache profiles](qualified_cache_profiles).
+
 ## Pyramid Attention Broadcast
 
 [Pyramid Attention Broadcast (PAB)](https://huggingface.co/papers/2408.12588) is based on the observation that attention outputs aren't that different between successive timesteps of the generation process. The attention differences are smallest in the cross attention layers and are generally cached over a longer timestep range. This is followed by temporal attention and spatial attention layers.

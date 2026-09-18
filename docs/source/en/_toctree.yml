@@ -65,6 +65,8 @@
     title: Accelerate inference
   - local: optimization/cache
     title: Caching
+  - local: optimization/qualified_cache_profiles
+    title: Fork-qualified cache profiles
   - local: optimization/attention_backends
     title: Attention backends
   - local: optimization/memory
