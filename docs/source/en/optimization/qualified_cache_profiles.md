@@ -118,3 +118,68 @@ In the final same-run 192x320 / 81-frame / 50-step L4/NF4 confirmation, the exis
 
 > [!WARNING]
 > These measurements are environment- and route-specific. The profiles are qualified only for the pinned Wan2.1 1.3B text-only T2V route, 50-step sequential CFG, corrected zero-tail conditioning contract, and the tested NF4/FP16-compute representation. Recalibrate and revalidate for Wan 14B, Wan2.2, I2V/VACE or image conditioning, a different scheduler or step count, LoRA/adapters, attention kwargs, precision/quantization, or a changed guidance topology.
+
+## Z-Image Base SPECTRUM + FirstBlockCache conservative profile
+
+The project qualified a conservative nested-cache profile for the pinned
+`Tongyi-MAI/Z-Image` revision `aa9e0836a9ca3bd891d531de8bdc682140edf325`
+using the serialized private NF4 runtime
+`John6666/_spectrum_test_model@0458754d0a978a92cccf83c1f23576cda693e307`.
+
+This route uses 28 denoising steps, CFG 4.0, the project NF4/BF16 representation,
+and the pinned Z-Image Base scheduler contract. The cache composition order is
+FirstBlockCache inner, SPECTRUM outer.
+
+The qualified SPECTRUM control is:
+
+```python
+zimage_base_aggressive8 = SpectrumCacheConfig(
+    num_inference_steps=28,
+    warmup_steps=9,
+    window_size=2.0,
+    flex_window=0.0,
+    degree=3,
+    ridge_lambda=0.1,
+    blend_w=0.5,
+    history_limit=28,
+    coordinate_max=28.0,
+    tail_actual_steps=4,
+    forecast_step_indices=[9, 11, 13, 15, 17, 19, 21, 23],
+)
+```
+
+The retained conservative inner-cache profile is:
+
+```python
+zimage_base_fbc_conservative = FirstBlockCacheConfig(
+    threshold=0.07861335986428125,
+)
+```
+
+Across the four-case broad qualification suite (wide spatial composition, square
+bilingual typography, portrait/person, and landscape/interior), the fixed FBC
+threshold skipped logical step 7 on every case. SPECTRUM aggressive8 averaged
+1.347x denoiser speedup versus full compute. Adding the conservative inner FBC
+profile averaged 1.409x versus full compute and 1.046x incremental speed versus
+SPECTRUM alone, with an observed incremental range of 1.044x to 1.050x.
+
+The conservative profile's mean latent cosine versus full compute was 0.98209.
+Relative to the SPECTRUM control, the mean cosine delta was -0.00263 and the
+worst observed delta was -0.00599. Mean decoded-image PSNR versus full compute
+was 25.57 dB; the mean PSNR delta versus SPECTRUM was -0.72 dB and the worst
+observed delta was -1.14 dB.
+
+Forced-full FBC + SPECTRUM was latent-byte-exact to SPECTRUM alone in both the
+initial composition screen and the later portrait broad-qualification check.
+
+A more aggressive threshold of `0.09765634765725` is intentionally **not**
+retained as a qualified profile. Although it averaged about 1.097x incremental
+speed over SPECTRUM, its skip pattern changed across content types and the
+landscape/interior case regressed by about 0.0279 latent cosine and 4.02 dB
+decoded PSNR relative to the SPECTRUM control.
+
+> [!WARNING]
+> This is a fork-specific research profile, not a portable default. Requalify if
+> the Z-Image checkpoint, scheduler, denoising-step count, CFG/guidance topology,
+> precision or quantization, attention backend, adapters, SPECTRUM schedule, FBC
+> implementation, or cache-context semantics change.
