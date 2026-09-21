@@ -260,7 +260,7 @@ class ChromaImg2ImgPipeline(
 
         seq_lengths = tokenizer_mask_device.sum(dim=1)
         mask_indices = torch.arange(tokenizer_mask_device.size(1), device=device).unsqueeze(0).expand(batch_size, -1)
-        attention_mask = (mask_indices <= seq_lengths.unsqueeze(1)).to(dtype=dtype, device=device)
+        attention_mask = mask_indices <= seq_lengths.unsqueeze(1)
 
         _, seq_len, _ = prompt_embeds.shape
 
@@ -610,12 +610,13 @@ class ChromaImg2ImgPipeline(
         if attention_mask is None:
             return attention_mask
 
-        # Extend the prompt attention mask to account for image tokens in the final sequence
+        # Extend the prompt attention mask to account for image tokens in the final sequence.
+        # Chroma masks must stay boolean so SDPA interprets False entries as masked tokens.
+        attention_mask = attention_mask.to(dtype=torch.bool)
         attention_mask = torch.cat(
-            [attention_mask, torch.ones(batch_size, sequence_length, device=attention_mask.device)],
+            [attention_mask, torch.ones(batch_size, sequence_length, device=attention_mask.device, dtype=torch.bool)],
             dim=1,
         )
-        attention_mask = attention_mask.to(dtype)
 
         return attention_mask
 

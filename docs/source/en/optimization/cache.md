@@ -150,6 +150,28 @@ config = TaylorSeerCacheConfig(
 pipe.transformer.enable_cache(config)
 ```
 
+## SPECTRUM
+
+SPECTRUM forecasts a qualified late denoiser feature from context-local full-compute history and skips the
+model-specific expensive body on selected denoising steps.
+
+```python
+from diffusers import SpectrumCacheConfig
+
+config = SpectrumCacheConfig(
+    num_inference_steps=50,
+    forecast_step_indices=(24, 26, 28, 30, 32, 34, 36, 38, 40, 42),
+    degree=1,
+    ridge_lambda=0.1,
+    blend_w=0.0,
+    tail_actual_steps=6,
+)
+pipe.transformer.enable_cache(config)
+```
+
+SPECTRUM history is partitioned by [`~CacheMixin.cache_context`]. Profiles are route-specific. Fork-qualified
+measurements are tracked separately in [Fork-qualified cache profiles](qualified_cache_profiles).
+
 ## MagCache
 
 [MagCache](https://github.com/Zehong-Ma/MagCache) accelerates inference by skipping transformer blocks based on the magnitude of the residual update. It observes that the magnitude of updates (Output - Input) decays predictably over the diffusion process. By accumulating an "error budget" based on pre-computed magnitude ratios, it dynamically decides when to skip computation and reuse the previous residual.

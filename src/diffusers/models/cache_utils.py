@@ -75,6 +75,7 @@ class CacheMixin:
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             SeaCacheConfig,
+            SpectrumCacheConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
             apply_faster_cache,
@@ -82,6 +83,7 @@ class CacheMixin:
             apply_mag_cache,
             apply_pyramid_attention_broadcast,
             apply_sea_cache,
+            apply_spectrum_cache,
             apply_taylorseer_cache,
             apply_text_kv_cache,
         )
@@ -103,6 +105,8 @@ class CacheMixin:
             apply_pyramid_attention_broadcast(self, config)
         elif isinstance(config, SeaCacheConfig):
             apply_sea_cache(self, config)
+        elif isinstance(config, SpectrumCacheConfig):
+            apply_spectrum_cache(self, config)
         elif isinstance(config, TaylorSeerCacheConfig):
             apply_taylorseer_cache(self, config)
         else:
@@ -123,6 +127,7 @@ class CacheMixin:
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             SeaCacheConfig,
+            SpectrumCacheConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
         )
@@ -135,6 +140,15 @@ class CacheMixin:
             _SEA_CACHE_LEADER_BLOCK_HOOK,
             _SEA_CACHE_POST_NORM_HOOK,
             _SEA_CACHE_ROOT_HOOK,
+        )
+        from ..hooks.spectrum_cache import (
+            _SPECTRUM_BLOCK_HOOK,
+            _SPECTRUM_CHROMA_FEATURE_HOOK,
+            _SPECTRUM_COSMOS_FEATURE_HOOK,
+            _SPECTRUM_FLUX2_FEATURE_HOOK,
+            _SPECTRUM_DENOISER_HOOK,
+            _SPECTRUM_HEAD_BLOCK_HOOK,
+            _SPECTRUM_UNET_FEATURE_HOOK,
         )
         from ..hooks.taylorseer_cache import _TAYLORSEER_CACHE_HOOK
         from ..hooks.text_kv_cache import _TEXT_KV_CACHE_BLOCK_HOOK, _TEXT_KV_CACHE_TRANSFORMER_HOOK
@@ -163,6 +177,14 @@ class CacheMixin:
             registry.remove_hook(_SEA_CACHE_BLOCK_HOOK, recurse=True)
             registry.remove_hook(_SEA_CACHE_LEADER_BLOCK_HOOK, recurse=True)
             registry.remove_hook(_SEA_CACHE_ROOT_HOOK, recurse=True)
+        elif isinstance(self._cache_config, SpectrumCacheConfig):
+            registry.remove_hook(_SPECTRUM_DENOISER_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_HEAD_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_UNET_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_CHROMA_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_COSMOS_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_FLUX2_FEATURE_HOOK, recurse=True)
         elif isinstance(self._cache_config, TaylorSeerCacheConfig):
             registry.remove_hook(_TAYLORSEER_CACHE_HOOK, recurse=True)
         else:

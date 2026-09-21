@@ -183,11 +183,13 @@ def _register_transformer_blocks_metadata():
         HunyuanVideoTokenReplaceTransformerBlock,
         HunyuanVideoTransformerBlock,
     )
+    from ..models.transformers.transformer_hunyuan_video15 import HunyuanVideo15TransformerBlock
     from ..models.transformers.transformer_hunyuanimage import (
         HunyuanImageSingleTransformerBlock,
         HunyuanImageTransformerBlock,
     )
     from ..models.transformers.transformer_kandinsky import Kandinsky5TransformerDecoderBlock
+    from ..models.transformers.transformer_krea2 import Krea2TransformerBlock
     from ..models.transformers.transformer_ltx import LTXVideoTransformerBlock
     from ..models.transformers.transformer_mochi import MochiTransformerBlock
     from ..models.transformers.transformer_motif_video import (
@@ -289,6 +291,24 @@ def _register_transformer_blocks_metadata():
         ),
     )
 
+    # HunyuanVideo 1.5
+    TransformerBlockRegistry.register(
+        model_class=HunyuanVideo15TransformerBlock,
+        metadata=TransformerBlockMetadata(
+            return_hidden_states_index=0,
+            return_encoder_hidden_states_index=1,
+        ),
+    )
+
+    # Krea2
+    TransformerBlockRegistry.register(
+        model_class=Krea2TransformerBlock,
+        metadata=TransformerBlockMetadata(
+            return_hidden_states_index=0,
+            return_encoder_hidden_states_index=None,
+        ),
+    )
+
     # LTXVideo
     TransformerBlockRegistry.register(
         model_class=LTXVideoTransformerBlock,
@@ -363,6 +383,7 @@ def _register_transformer_blocks_metadata():
         metadata=TransformerBlockMetadata(
             return_hidden_states_index=0,
             return_encoder_hidden_states_index=None,
+            hidden_states_argument_name="x",
         ),
     )
 
