@@ -90,10 +90,10 @@ class SpectrumCacheConfig:
             The default remains fail-closed. Mixed special conditioning paths remain fail-closed even when their
             individual opt-ins are enabled. Autograd and non-default PEFT scale also remain fail-closed.
         cosmos_runtime_state_callback (`Callable`, *optional*):
-            Runtime-state callback required for the experimental Anima / `CosmosTransformer3DModel` adapter. It must
+            Legacy runtime-state fallback for the Anima / `CosmosTransformer3DModel` adapter when the pipeline does
+            not provide a complete native `CacheContext`. Native contexts are preferred. The legacy callback must
             return a mapping containing `step`, `num_inference_steps`, `num_conditions`, and `label` (`"cond"` or
-            `"uncond"`). It may also return `dynamic_conditioning=True` to force sticky fail-closed behavior for the
-            full trajectory. The callback is intentionally explicit because the model does not own guider state.
+            `"uncond"`), and may return `dynamic_conditioning=True` for sticky fail-closed behavior.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -709,6 +709,18 @@ class SpectrumCosmosState(BaseState):
             "peak_history_bytes": self.peak_history_bytes,
             "records": list(self.records),
         }
+
+
+class SpectrumCosmosStateManager(StateManager):
+    """Context-partitioned Cosmos state with a legacy no-context fallback bucket."""
+
+    _LEGACY_KEY = "__legacy_cosmos__"
+
+    def get_state(self):
+        name = self._context.name if self._context is not None else self._LEGACY_KEY
+        if name not in self._state_cache:
+            self._state_cache[name] = self._state_cls(*self._init_args, **self._init_kwargs)
+        return self._state_cache[name]
 
 
 class SpectrumDenoiserHook(ModelHook):
@@ -1450,8 +1462,8 @@ class SpectrumCosmosDenoiserHook(ModelHook):
 
     Full-compute steps execute the model's original forward. Forecast steps reproduce only the source-faithful
     pre-block preparation and `norm_out -> proj_out -> unpatchify` tail around a predicted post-block feature.
-    Guider ownership is supplied explicitly by `cosmos_runtime_state_callback`; unsupported or changing conditions
-    latch sticky fail-closed behavior.
+    Guider ownership is read from native `CacheContext` when available, with the legacy runtime callback retained
+    as a fallback. Unsupported or changing legacy conditions latch sticky fail-closed behavior.
     """
 
     _is_stateful = True
@@ -1461,20 +1473,47 @@ class SpectrumCosmosDenoiserHook(ModelHook):
         self.state_manager = state_manager
 
     def _runtime_state(self, config: SpectrumCacheConfig) -> dict[str, Any]:
+        context = self.state_manager._context
+        if context is not None and context.step_index is not None and context.num_inference_steps is not None:
+            label = str(context.name)
+            if not label:
+                raise ValueError("Cosmos SPECTRUM native CacheContext name must be non-empty.")
+            return {
+                "step": int(context.step_index),
+                "num_inference_steps": int(context.num_inference_steps),
+                "num_conditions": 1,
+                "label": label,
+                "dynamic_conditioning": False,
+                "runtime_source": "cache_context",
+                "timestep": context.timestep,
+                "sigma": context.sigma,
+            }
+
         callback = config.cosmos_runtime_state_callback
         if callback is None:
-            raise RuntimeError("Cosmos SPECTRUM requires cosmos_runtime_state_callback.")
+            missing = []
+            if context is None or context.step_index is None:
+                missing.append("step_index")
+            if context is None or context.num_inference_steps is None:
+                missing.append("num_inference_steps")
+            raise ValueError(
+                "Cosmos SPECTRUM requires a complete native CacheContext "
+                f"(missing: {', '.join(missing)}) or cosmos_runtime_state_callback."
+            )
+
         runtime = callback()
         if not isinstance(runtime, Mapping):
             raise TypeError("cosmos_runtime_state_callback must return a mapping.")
         required = ("step", "num_inference_steps", "num_conditions", "label")
         missing = [name for name in required if name not in runtime]
         if missing:
-            raise ValueError(f"Cosmos runtime-state callback is missing required keys: {missing}")
+            raise ValueError(f"cosmos_runtime_state_callback is missing required keys: {missing}")
         label = str(runtime["label"])
         if label not in {"cond", "uncond"}:
-            raise ValueError(f"Cosmos runtime-state label must be 'cond' or 'uncond', got {label!r}.")
-        return dict(runtime)
+            raise ValueError(f"Legacy Cosmos runtime-state label must be 'cond' or 'uncond', got {label!r}.")
+        runtime = dict(runtime)
+        runtime["runtime_source"] = "legacy_callback"
+        return runtime
 
     def _record(self, state: SpectrumCosmosState, predicted: bool, fallback_reason: str | None = None) -> None:
         state.records.append(
@@ -2166,10 +2205,6 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         return
 
     if isinstance(unwrapped_module, CosmosTransformer3DModel):
-        if config.cosmos_runtime_state_callback is None:
-            raise ValueError(
-                "SPECTRUM Cosmos/Anima support requires cosmos_runtime_state_callback so guider ownership is explicit."
-            )
         if (
             unwrapped_module.config.use_crossattn_projection
             or unwrapped_module.config.img_context_dim_in
@@ -2180,7 +2215,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
                 "configuration without image-context projection or ControlNet block injection."
             )
 
-        state_manager = StateManager(SpectrumCosmosState, init_args=(config,))
+        state_manager = SpectrumCosmosStateManager(SpectrumCosmosState, init_args=(config,))
         root_registry = HookRegistry.check_if_exists_or_initialize(module)
         root_registry.register_hook(SpectrumCosmosDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
 
