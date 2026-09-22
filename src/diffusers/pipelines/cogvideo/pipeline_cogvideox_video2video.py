@@ -808,7 +808,17 @@ class CogVideoXVideoToVideoPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin)
                 timestep = t.expand(latent_model_input.shape[0])
 
                 # predict noise model_output
-                with self.transformer.cache_context("cond_uncond"):
+                alpha_prod_t = self.scheduler.alphas_cumprod[t.to(self.scheduler.alphas_cumprod.device)]
+                signal_scale = alpha_prod_t.sqrt()
+                noise_scale = (1 - alpha_prod_t).sqrt()
+                with self.transformer.cache_context(
+                    "cond_uncond",
+                    step_index=i,
+                    num_inference_steps=num_inference_steps,
+                    timestep=t,
+                    signal_scale=signal_scale,
+                    noise_scale=noise_scale,
+                ):
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=prompt_embeds,
