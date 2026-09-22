@@ -45,6 +45,8 @@ class CacheContext:
     num_inference_steps: int | None = None
     timestep: float | torch.Tensor | None = None
     sigma: float | None = None
+    signal_scale: float | torch.Tensor | None = None
+    noise_scale: float | torch.Tensor | None = None
 
 
 def _set_cache_context(module: torch.nn.Module, context: CacheContext | None) -> None:

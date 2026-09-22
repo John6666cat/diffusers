@@ -115,7 +115,8 @@ class SeaCacheConfig:
 @dataclass
 class _SeaCacheForwardMetadata:
     step_index: int
-    sigma: float
+    signal_scale: float
+    noise_scale: float
     num_inference_steps: int
     raw_vision: list[torch.Tensor] | None = None
 
@@ -123,7 +124,7 @@ class _SeaCacheForwardMetadata:
 class SeaCacheContextState(BaseState):
     def __init__(self):
         self.history: list[tuple[int, torch.Tensor | None, torch.Tensor]] = []
-        self.gate_key: tuple[int, float] | None = None
+        self.gate_key: tuple[int, float, float] | None = None
         self.gate_should_compute = True
         self.previous_indicator: list[torch.Tensor] | None = None
         self.accumulated_distance = 0.0
@@ -185,7 +186,7 @@ class SeaCacheSharedState:
         indicator: list[torch.Tensor] | None,
         config: SeaCacheConfig,
     ) -> bool:
-        gate_key = (metadata.step_index, metadata.sigma)
+        gate_key = (metadata.step_index, metadata.signal_scale, metadata.noise_scale)
         if state.gate_key == gate_key:
             return state.gate_should_compute
 
@@ -382,9 +383,48 @@ def _prepare_wan_t2v_raw_vision_metadata(
     return list(hidden_states.unbind(dim=0))
 
 
+def _resolve_sea_filter_coefficients(context) -> tuple[float, float]:
+    signal_scale = context.signal_scale
+    noise_scale = context.noise_scale
+
+    if (signal_scale is None) != (noise_scale is None):
+        raise ValueError("SeaCache requires both `signal_scale` and `noise_scale` when either is provided.")
+
+    if signal_scale is None:
+        sigma = context.sigma
+        if sigma is None:
+            raise ValueError("SeaCache requires scheduler coefficients or the legacy RF `sigma` metadata.")
+        if isinstance(sigma, torch.Tensor):
+            sigma = sigma.item()
+        sigma = float(sigma)
+        if not math.isfinite(sigma) or not 0.0 <= sigma <= 1.0:
+            raise ValueError("SeaCache legacy RF `sigma` must be finite and in [0, 1].")
+        sigma = max(1e-6, min(1.0 - 1e-6, sigma))
+        return 1.0 - sigma, sigma
+
+    if isinstance(signal_scale, torch.Tensor):
+        signal_scale = signal_scale.item()
+    if isinstance(noise_scale, torch.Tensor):
+        noise_scale = noise_scale.item()
+    signal_scale = float(signal_scale)
+    noise_scale = float(noise_scale)
+
+    if (
+        not math.isfinite(signal_scale)
+        or not math.isfinite(noise_scale)
+        or signal_scale < 0.0
+        or noise_scale < 0.0
+        or (signal_scale == 0.0 and noise_scale == 0.0)
+    ):
+        raise ValueError("SeaCache scheduler coefficients must be finite, non-negative, and not both zero.")
+
+    return signal_scale, noise_scale
+
+
 def _apply_sea_filter(
     hidden_states: torch.Tensor,
-    sigma: float,
+    signal_scale: float,
+    noise_scale: float,
     power_exp: float,
 ) -> torch.Tensor:
     hidden_states_dtype = hidden_states.dtype
@@ -392,9 +432,8 @@ def _apply_sea_filter(
     dimensions = (0, 1, 2)
     spectrum = torch.fft.fftn(hidden_states, dim=dimensions)
 
-    sigma = max(1e-6, min(1.0 - 1e-6, sigma))
-    signal_scale = 1.0 - sigma
-    noise_scale = sigma
+    signal_scale = max(1e-6, signal_scale)
+    noise_scale = max(1e-6, noise_scale)
     gain = None
     for axis in dimensions:
         frequencies = torch.fft.fftfreq(hidden_states.shape[axis], device=hidden_states.device, dtype=torch.float32)
@@ -421,7 +460,8 @@ def _build_indicator(
     return [
         _apply_sea_filter(
             latent.movedim(0, -1),
-            sigma=forward_metadata.sigma,
+            signal_scale=forward_metadata.signal_scale,
+            noise_scale=forward_metadata.noise_scale,
             power_exp=config.power_exp,
         ).detach()
         for latent in forward_metadata.raw_vision
@@ -545,40 +585,31 @@ class SeaCacheRootHook(ModelHook):
             )
             return args, kwargs
         step_index = context.step_index
-        sigma = context.sigma
         num_inference_steps = context.num_inference_steps
-        if step_index is None or sigma is None or num_inference_steps is None:
+        if step_index is None or num_inference_steps is None:
             self.shared_state.mark_fail_open(
-                "SeaCache is running in fail-open mode because the scheduler step, sigma, and step count are "
-                "required: pass them as `cache_context(name, step_index=..., sigma=..., num_inference_steps=...)`."
+                "SeaCache is running in fail-open mode because the scheduler step and step count are required: pass "
+                "them as `cache_context(name, step_index=..., num_inference_steps=..., ...)`."
             )
             return args, kwargs
 
         try:
             if isinstance(step_index, torch.Tensor):
                 step_index = step_index.item()
-            if isinstance(sigma, torch.Tensor):
-                sigma = sigma.item()
             if isinstance(num_inference_steps, torch.Tensor):
                 num_inference_steps = num_inference_steps.item()
             step_index = int(step_index)
-            sigma = float(sigma)
             num_inference_steps = int(num_inference_steps)
+            signal_scale, noise_scale = _resolve_sea_filter_coefficients(context)
         except (IndexError, TypeError, ValueError, RuntimeError) as error:
             self.shared_state.mark_fail_open(
                 f"SeaCache scheduler metadata is unavailable; running in fail-open mode: {error}"
             )
             return args, kwargs
 
-        if (
-            step_index < 0
-            or num_inference_steps <= 0
-            or step_index >= num_inference_steps
-            or not math.isfinite(sigma)
-            or not 0.0 <= sigma <= 1.0
-        ):
+        if step_index < 0 or num_inference_steps <= 0 or step_index >= num_inference_steps:
             self.shared_state.mark_fail_open(
-                "SeaCache scheduler metadata is invalid; expected a valid step index and exact sigma in [0, 1]."
+                "SeaCache scheduler metadata is invalid; expected a valid step index and step count."
             )
             return args, kwargs
 
@@ -600,7 +631,8 @@ class SeaCacheRootHook(ModelHook):
 
         self.shared_state.forward_metadata = _SeaCacheForwardMetadata(
             step_index=step_index,
-            sigma=sigma,
+            signal_scale=signal_scale,
+            noise_scale=noise_scale,
             num_inference_steps=num_inference_steps,
             raw_vision=raw_vision,
         )
