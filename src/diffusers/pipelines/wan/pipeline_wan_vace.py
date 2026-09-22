@@ -951,6 +951,10 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # We set the index here to remove DtoH sync, helpful especially during compilation.
+        # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
+        self.scheduler.set_begin_index(0)
+
         if self.config.boundary_ratio is not None:
             boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
         else:
@@ -962,6 +966,11 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     continue
 
                 self._current_timestep = t
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "sigma": float(self.scheduler.sigmas[i]),
+                    "num_inference_steps": self._num_timesteps,
+                }
 
                 if boundary_timestep is None or t >= boundary_timestep:
                     # wan2.1 or high-noise stage in wan2.2
@@ -975,7 +984,7 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 latent_model_input = latents.to(transformer_dtype)
                 timestep = t.expand(latents.shape[0])
 
-                with current_model.cache_context("cond"):
+                with current_model.cache_context("cond", **cache_context_kwargs):
                     noise_pred = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
@@ -987,7 +996,7 @@ class WanVACEPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     )[0]
 
                 if self.do_classifier_free_guidance:
-                    with current_model.cache_context("uncond"):
+                    with current_model.cache_context("uncond", **cache_context_kwargs):
                         noise_uncond = current_model(
                             hidden_states=latent_model_input,
                             timestep=timestep,

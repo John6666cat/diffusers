@@ -1101,18 +1101,28 @@ class WanAnimatePipeline(DiffusionPipeline, WanLoraLoaderMixin):
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             self._num_timesteps = len(timesteps)
 
+            if start > 0:
+                # Each segment is an independent denoising trajectory even though the cache context names are reused.
+                self.transformer._reset_stateful_cache()
+            self.scheduler.set_begin_index(0)
+
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     if self.interrupt:
                         continue
 
                     self._current_timestep = t
+                    cache_context_kwargs = {
+                        "step_index": i,
+                        "sigma": float(self.scheduler.sigmas[i]),
+                        "num_inference_steps": self._num_timesteps,
+                    }
 
                     # Concatenate the reference image + prev segment conditioning in the channel dim
                     latent_model_input = torch.cat([latents, reference_latents], dim=1).to(transformer_dtype)
                     timestep = t.expand(latents.shape[0])
 
-                    with self.transformer.cache_context("cond"):
+                    with self.transformer.cache_context("cond", **cache_context_kwargs):
                         noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep,
@@ -1128,7 +1138,7 @@ class WanAnimatePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     if self.do_classifier_free_guidance:
                         # Blank out face for unconditional guidance (set all pixels to -1)
                         face_pixel_values_uncond = face_video_segment * 0 - 1
-                        with self.transformer.cache_context("uncond"):
+                        with self.transformer.cache_context("uncond", **cache_context_kwargs):
                             noise_uncond = self.transformer(
                                 hidden_states=latent_model_input,
                                 timestep=timestep,

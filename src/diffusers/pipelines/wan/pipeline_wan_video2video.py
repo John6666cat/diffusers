@@ -450,7 +450,11 @@ class WanVideoToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
 
         t_start = max(num_inference_steps - init_timestep, 0)
-        timesteps = timesteps[t_start * self.scheduler.order :]
+        begin_index = t_start * self.scheduler.order
+        timesteps = timesteps[begin_index:]
+
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(begin_index)
 
         return timesteps, num_inference_steps - t_start
 
@@ -675,25 +679,33 @@ class WanVideoToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     continue
 
                 self._current_timestep = t
+                sigma_index = (getattr(self.scheduler, "begin_index", None) or 0) + i
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "sigma": float(self.scheduler.sigmas[sigma_index]),
+                    "num_inference_steps": self._num_timesteps,
+                }
                 latent_model_input = latents.to(transformer_dtype)
                 timestep = t.expand(latents.shape[0])
 
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-                if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
+                with self.transformer.cache_context("cond", **cache_context_kwargs):
+                    noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
+
+                if self.do_classifier_free_guidance:
+                    with self.transformer.cache_context("uncond", **cache_context_kwargs):
+                        noise_uncond = self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            attention_kwargs=attention_kwargs,
+                            return_dict=False,
+                        )[0]
                     noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
