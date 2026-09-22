@@ -346,6 +346,31 @@ def _prepare_cosmos3_raw_vision_metadata(
     return raw_vision if raw_vision and has_noisy_vision else None
 
 
+def _prepare_anima_raw_vision_metadata(
+    module: torch.nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> list[torch.Tensor] | None:
+    """Return single-frame raw latents for the qualified Anima-like Cosmos route.
+
+    Unsupported Cosmos video/control/image-context calls return None so SeaCache stays fail-open/full-compute.
+    """
+    module = unwrap_module(module)
+    bound_arguments = inspect.signature(module.__class__.forward).bind_partial(module, *args, **kwargs).arguments
+    hidden_states = bound_arguments.get("hidden_states")
+    encoder_hidden_states = bound_arguments.get("encoder_hidden_states")
+
+    if (
+        not isinstance(hidden_states, torch.Tensor)
+        or hidden_states.ndim != 5
+        or hidden_states.shape[2] != 1
+        or bound_arguments.get("fps") is not None
+        or bound_arguments.get("condition_mask") is not None
+        or bound_arguments.get("block_controlnet_hidden_states") is not None
+        or isinstance(encoder_hidden_states, tuple)
+    ):
+        return None
+    return list(hidden_states.unbind(dim=0))
+
+
 def _prepare_wan_t2v_raw_vision_metadata(
     module: torch.nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> list[torch.Tensor] | None:
@@ -989,17 +1014,32 @@ def apply_sea_cache(module: torch.nn.Module, config: SeaCacheConfig) -> None:
         config (`SeaCacheConfig`):
             SeaCache configuration.
     """
+    from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
     from ..models.transformers.transformer_cosmos3 import Cosmos3OmniTransformer
     from ..models.transformers.transformer_wan import WanTransformer3DModel
 
     unwrapped_module = unwrap_module(module)
     is_cosmos3 = isinstance(unwrapped_module, Cosmos3OmniTransformer)
+    is_anima_cosmos = isinstance(unwrapped_module, CosmosTransformer3DModel)
     is_wan_t2v = isinstance(unwrapped_module, WanTransformer3DModel) and (
         unwrapped_module.config.in_channels == unwrapped_module.config.out_channels
     )
+
+    if is_anima_cosmos and getattr(unwrapped_module.config, "img_context_dim_in", None):
+        raise ValueError(
+            "SeaCache CosmosTransformer3DModel support is currently limited to the Anima-like single-stream "
+            "text-conditioning route; image-context block outputs are not qualified."
+        )
+    if is_anima_cosmos and getattr(unwrapped_module.config, "controlnet_block_every_n", None) is not None:
+        raise ValueError(
+            "SeaCache CosmosTransformer3DModel support is not qualified for ControlNet-configured routes."
+        )
+
     raw_vision_callback = config.raw_vision_callback
     if raw_vision_callback is None and is_cosmos3:
         raw_vision_callback = _prepare_cosmos3_raw_vision_metadata
+    elif raw_vision_callback is None and is_anima_cosmos:
+        raw_vision_callback = _prepare_anima_raw_vision_metadata
     elif raw_vision_callback is None and is_wan_t2v:
         raw_vision_callback = _prepare_wan_t2v_raw_vision_metadata
 

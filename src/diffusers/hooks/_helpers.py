@@ -175,6 +175,7 @@ def _register_transformer_blocks_metadata():
     from ..models.transformers.cogvideox_transformer_3d import CogVideoXBlock
     from ..models.transformers.transformer_bria import BriaTransformerBlock
     from ..models.transformers.transformer_cogview4 import CogView4TransformerBlock
+    from ..models.transformers.transformer_cosmos import CosmosTransformerBlock
     from ..models.transformers.transformer_cosmos3 import Cosmos3VLTextMoTDecoderLayer
     from ..models.transformers.transformer_flux import FluxSingleTransformerBlock, FluxTransformerBlock
     from ..models.transformers.transformer_hunyuan_video import (
@@ -231,6 +232,15 @@ def _register_transformer_blocks_metadata():
         metadata=TransformerBlockMetadata(
             return_hidden_states_index=0,
             return_encoder_hidden_states_index=1,
+        ),
+    )
+
+    # Cosmos / Anima
+    TransformerBlockRegistry.register(
+        model_class=CosmosTransformerBlock,
+        metadata=TransformerBlockMetadata(
+            return_hidden_states_index=0,
+            return_encoder_hidden_states_index=None,
         ),
     )
 
