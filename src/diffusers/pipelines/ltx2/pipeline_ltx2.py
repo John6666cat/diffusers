@@ -1384,6 +1384,12 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
                     continue
 
                 self._current_timestep = t
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "sigma": float(self.scheduler.sigmas[i]),
+                    "num_inference_steps": self._num_timesteps,
+                    "timestep": t,
+                }
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 latent_model_input = latent_model_input.to(prompt_embeds.dtype)
@@ -1395,7 +1401,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
-                with self.transformer.cache_context("cond_uncond"):
+                with self.transformer.cache_context("cond_uncond", **cache_context_kwargs):
                     noise_pred_video, noise_pred_audio = self.transformer(
                         hidden_states=latent_model_input,
                         audio_hidden_states=audio_latent_model_input,
@@ -1467,7 +1473,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
                     noise_pred_audio = self.convert_velocity_to_x0(audio_latents, noise_pred_audio, i, audio_scheduler)
 
                 if self.do_spatio_temporal_guidance:
-                    with self.transformer.cache_context("uncond_stg"):
+                    with self.transformer.cache_context("uncond_stg", **cache_context_kwargs):
                         noise_pred_video_uncond_stg, noise_pred_audio_uncond_stg = self.transformer(
                             hidden_states=latents.to(dtype=prompt_embeds.dtype),
                             audio_hidden_states=audio_latents.to(dtype=prompt_embeds.dtype),
@@ -1507,7 +1513,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
                     video_stg_delta = audio_stg_delta = 0
 
                 if self.do_modality_isolation_guidance:
-                    with self.transformer.cache_context("uncond_modality"):
+                    with self.transformer.cache_context("uncond_modality", **cache_context_kwargs):
                         noise_pred_video_uncond_modality, noise_pred_audio_uncond_modality = self.transformer(
                             hidden_states=latents.to(dtype=prompt_embeds.dtype),
                             audio_hidden_states=audio_latents.to(dtype=prompt_embeds.dtype),

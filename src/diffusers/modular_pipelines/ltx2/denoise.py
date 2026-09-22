@@ -399,12 +399,18 @@ class LTX2LoopDenoiser(ModularPipelineBlocks):
         # mean-relative latent divergence. A batched cond+uncond forward would be fp32-bitwise but cannot drive the
         # guider API per-pass, so this trades bitwiseness for using the guider API end-to-end. Gate any parity check
         # against `LTX2Pipeline` on fp32 and treat bf16 as close-but-not-bitwise.
+        cache_context_kwargs = {
+            "step_index": i,
+            "sigma": float(components.scheduler.sigmas[i]),
+            "num_inference_steps": block_state.num_inference_steps,
+            "timestep": t,
+        }
         for batch in guider_state:
             components.guider.prepare_models(components.transformer)
             cond_kwargs = {name: getattr(batch, name) for name in self._guider_input_fields}
             cond_kwargs["spatio_temporal_guidance_blocks"] = batch.spatio_temporal_guidance_blocks
             cond_kwargs["isolate_modalities"] = batch.isolate_modalities
-            with components.transformer.cache_context(getattr(batch, identifier_key)):
+            with components.transformer.cache_context(getattr(batch, identifier_key), **cache_context_kwargs):
                 noise_pred_video, noise_pred_audio = components.transformer(
                     hidden_states=block_state.latent_model_input,
                     audio_hidden_states=block_state.audio_latent_model_input,

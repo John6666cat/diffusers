@@ -1439,6 +1439,10 @@ class LTX2ImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraL
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+        # Set begin index to skip nonzero().item() call in scheduler initialization, which triggers GPU sync
+        self.scheduler.set_begin_index(0)
+        audio_scheduler.set_begin_index(0)
+
         # 6. Prepare micro-conditions
         # Pre-compute video and audio positional ids as they will be the same at each step of the denoising loop
         video_coords = self.transformer.rope.prepare_video_coords(
@@ -1459,6 +1463,12 @@ class LTX2ImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraL
                     continue
 
                 self._current_timestep = t
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "sigma": float(self.scheduler.sigmas[i]),
+                    "num_inference_steps": self._num_timesteps,
+                    "timestep": t,
+                }
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 latent_model_input = latent_model_input.to(prompt_embeds.dtype)
@@ -1470,7 +1480,7 @@ class LTX2ImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraL
                 timestep = t.expand(latent_model_input.shape[0])
                 video_timestep = timestep.unsqueeze(-1) * (1 - conditioning_mask)
 
-                with self.transformer.cache_context("cond_uncond"):
+                with self.transformer.cache_context("cond_uncond", **cache_context_kwargs):
                     noise_pred_video, noise_pred_audio = self.transformer(
                         hidden_states=latent_model_input,
                         audio_hidden_states=audio_latent_model_input,
@@ -1544,7 +1554,7 @@ class LTX2ImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraL
                     noise_pred_audio = self.convert_velocity_to_x0(audio_latents, noise_pred_audio, i, audio_scheduler)
 
                 if self.do_spatio_temporal_guidance:
-                    with self.transformer.cache_context("uncond_stg"):
+                    with self.transformer.cache_context("uncond_stg", **cache_context_kwargs):
                         noise_pred_video_uncond_stg, noise_pred_audio_uncond_stg = self.transformer(
                             hidden_states=latents.to(dtype=prompt_embeds.dtype),
                             audio_hidden_states=audio_latents.to(dtype=prompt_embeds.dtype),
@@ -1585,7 +1595,7 @@ class LTX2ImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraL
                     video_stg_delta = audio_stg_delta = 0
 
                 if self.do_modality_isolation_guidance:
-                    with self.transformer.cache_context("uncond_modality"):
+                    with self.transformer.cache_context("uncond_modality", **cache_context_kwargs):
                         noise_pred_video_uncond_modality, noise_pred_audio_uncond_modality = self.transformer(
                             hidden_states=latents.to(dtype=prompt_embeds.dtype),
                             audio_hidden_states=audio_latents.to(dtype=prompt_embeds.dtype),
