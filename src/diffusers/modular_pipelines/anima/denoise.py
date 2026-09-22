@@ -121,18 +121,34 @@ class AnimaLoopDenoiser(ModularPipelineBlocks):
         components.guider.set_state(step=i, num_inference_steps=block_state.num_inference_steps, timestep=t)
         guider_state = components.guider.prepare_inputs_from_block_state(block_state, self._guider_input_fields)
 
+        begin_index = components.scheduler.begin_index or 0
+        sigma_index = begin_index + i
+        if sigma_index >= len(components.scheduler.sigmas):
+            raise RuntimeError(
+                f"Anima cache-context sigma index {sigma_index} is outside scheduler sigma table "
+                f"of length {len(components.scheduler.sigmas)}."
+            )
+        cache_context_kwargs = {
+            "step_index": i,
+            "num_inference_steps": block_state.num_inference_steps,
+            "timestep": t,
+            "sigma": float(components.scheduler.sigmas[sigma_index]),
+        }
+
         for guider_state_batch in guider_state:
             components.guider.prepare_models(components.transformer)
             cond_kwargs = {
                 key: getattr(guider_state_batch, key).to(block_state.dtype) for key in self._guider_input_fields.keys()
             }
-            guider_state_batch.noise_pred = components.transformer(
-                hidden_states=block_state.latent_model_input,
-                timestep=block_state.timestep,
-                padding_mask=block_state.padding_mask,
-                return_dict=False,
-                **cond_kwargs,
-            )[0]
+            context_name = getattr(guider_state_batch, components.guider._identifier_key)
+            with components.transformer.cache_context(context_name, **cache_context_kwargs):
+                guider_state_batch.noise_pred = components.transformer(
+                    hidden_states=block_state.latent_model_input,
+                    timestep=block_state.timestep,
+                    padding_mask=block_state.padding_mask,
+                    return_dict=False,
+                    **cond_kwargs,
+                )[0]
             components.guider.cleanup_models(components.transformer)
 
         block_state.noise_pred = components.guider(guider_state)[0]
