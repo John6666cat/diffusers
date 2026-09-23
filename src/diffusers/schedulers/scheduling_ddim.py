@@ -259,6 +259,17 @@ class DDIMScheduler(SchedulerMixin, ConfigMixin):
         """
         return sample
 
+
+    def get_model_input_coefficients(
+        self, timestep: int | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return signal/noise coefficients of the tensor presented to the denoiser."""
+        timestep = torch.as_tensor(timestep, device=self.alphas_cumprod.device)
+        if timestep.numel() != 1:
+            raise ValueError("`timestep` must be scalar.")
+        alpha_prod_t = self.alphas_cumprod[timestep.long()]
+        return alpha_prod_t.sqrt(), (1 - alpha_prod_t).sqrt()
+
     def _get_variance(self, timestep: int, prev_timestep: int) -> torch.Tensor:
         """
         Computes the variance of the noise added at a given diffusion step.

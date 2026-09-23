@@ -1246,6 +1246,20 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         """
         return sample
 
+
+    def get_model_input_coefficients(
+        self, timestep: float | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return signal/noise coefficients of the tensor presented to the denoiser."""
+        if self.step_index is not None:
+            step_index = self.step_index
+        elif self.begin_index is not None:
+            step_index = self.begin_index
+        else:
+            step_index = self.index_for_timestep(timestep)
+        sigma = self.sigmas[step_index]
+        return self._sigma_to_alpha_sigma_t(sigma)
+
     # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler.add_noise
     def add_noise(
         self,

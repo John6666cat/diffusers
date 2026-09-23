@@ -347,6 +347,21 @@ class EulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         self.is_scale_input_called = True
         return sample
 
+
+    def get_model_input_coefficients(
+        self, timestep: float | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return signal/noise coefficients of the tensor presented to the denoiser."""
+        if self.step_index is not None:
+            step_index = self.step_index
+        elif self.begin_index is not None:
+            step_index = self.begin_index
+        else:
+            step_index = self.index_for_timestep(timestep)
+        sigma = self.sigmas[step_index]
+        denom = (sigma**2 + 1) ** 0.5
+        return 1 / denom, sigma / denom
+
     def set_timesteps(
         self,
         num_inference_steps: int = None,

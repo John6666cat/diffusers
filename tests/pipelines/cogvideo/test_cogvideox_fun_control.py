@@ -139,6 +139,38 @@ class TestCogVideoXFunControlPipeline(CogVideoXFunControlPipelineTesterConfig, P
         generated_slice = torch.cat([generated_slice[:8], generated_slice[-8:]])
         assert_tensors_close(generated_slice, expected_slice, atol=1e-3)
 
+    def test_cache_context_scheduler_coefficients(self):
+        from contextlib import contextmanager
+
+        pipe = self.get_pipeline()
+        inputs = self.get_dummy_inputs()
+        seen = []
+        original_cache_context = pipe.transformer.cache_context
+
+        @contextmanager
+        def capture(name, **kwargs):
+            seen.append((name, dict(kwargs)))
+            with original_cache_context(name, **kwargs):
+                yield
+
+        pipe.transformer.cache_context = capture
+        pipe(**inputs)
+
+        assert len(seen) == inputs["num_inference_steps"]
+        for i, (name, kwargs) in enumerate(seen):
+            assert name == "cond_uncond"
+            assert kwargs["step_index"] == i
+            assert kwargs["num_inference_steps"] == inputs["num_inference_steps"]
+            assert kwargs["timestep"] is not None
+            assert kwargs["signal_scale"] is not None
+            assert kwargs["noise_scale"] is not None
+
+            alpha_prod_t = pipe.scheduler.alphas_cumprod[
+                kwargs["timestep"].to(pipe.scheduler.alphas_cumprod.device).long()
+            ]
+            assert torch.allclose(kwargs["signal_scale"], alpha_prod_t.sqrt())
+            assert torch.allclose(kwargs["noise_scale"], (1 - alpha_prod_t).sqrt())
+
     def test_inference_batch_single_identical(self):
         super().test_inference_batch_single_identical(batch_size=3, expected_max_diff=1e-3)
 

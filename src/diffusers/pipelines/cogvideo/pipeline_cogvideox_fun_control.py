@@ -793,7 +793,18 @@ class CogVideoXFunControlPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 timestep = t.expand(latent_model_input.shape[0])
 
                 # predict noise model_output
-                with self.transformer.cache_context("cond_uncond"):
+                signal_scale = noise_scale = None
+                coefficient_resolver = getattr(self.scheduler, "get_model_input_coefficients", None)
+                if coefficient_resolver is not None:
+                    signal_scale, noise_scale = coefficient_resolver(t)
+                with self.transformer.cache_context(
+                    "cond_uncond",
+                    step_index=i,
+                    num_inference_steps=num_inference_steps,
+                    timestep=t,
+                    signal_scale=signal_scale,
+                    noise_scale=noise_scale,
+                ):
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         encoder_hidden_states=prompt_embeds,
