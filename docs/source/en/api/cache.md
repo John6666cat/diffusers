@@ -47,6 +47,47 @@ Cache methods speedup diffusion transformers by storing and reusing intermediate
 
 [[autodoc]] apply_spectrum_cache
 
+### Qualified 2D UNet profiles in this fork
+
+The global `SpectrumCacheConfig()` defaults remain the original FLUX.1 research profile.
+For qualified Stable Diffusion UNet routes, use the explicit profile factories instead.
+
+```python
+from diffusers import SpectrumCacheConfig
+
+# SDXL ordinary route profile
+config = SpectrumCacheConfig.for_sdxl()
+
+# SDXL conservative quality-oriented alternate
+conservative = SpectrumCacheConfig.for_sdxl(conservative=True)
+
+# SDXL PAG routes
+pag_config = SpectrumCacheConfig.for_sdxl(pag=True)
+
+# Stable Diffusion 1.5 ordinary route profile
+sd15_config = SpectrumCacheConfig.for_sd15()
+```
+
+The SDXL standard profile is `degree=4`, `ridge_lambda=0.1`, `blend_w=0.60`,
+`warmup_steps=6`, `window_size=2.0`, `flex_window=0.75`, and
+`tail_actual_steps=3`. The conservative SDXL alternate uses `warmup_steps=5`
+and `flex_window=0.25`; PAG uses `warmup_steps=8`.
+
+The SD1.5 ordinary profile is `degree=4`, `ridge_lambda=0.05`, `blend_w=0.55`,
+`warmup_steps=6`, `window_size=2.0`, `flex_window=0.75`, and
+`tail_actual_steps=3`.
+
+These are measured profiles rather than universal lossless guarantees. SDXL has
+been exercised across ordinary generation, 1024px runs, partial trajectories,
+ControlNet, T2I-Adapter, IP-Adapter, PAG, compositions, and ControlNet Union. Mixed ControlNet + IP-Adapter remains intentionally fail-closed.
+
+For SD1.5, the ordinary profile has passed full-route, composition, static-LoRA,
+resolution/aspect, and representative-route qualification. A fresh scheduler
+portability sweep remained structurally valid on Euler, DDIM, DPM++ 2M, UniPC,
+and PNDM, but isolated Euler/DPM++/PNDM cases fell slightly below the 20 dB
+research PSNR floor. Do not interpret `for_sd15()` as a universal scheduler
+quality guarantee. The tested LCM-LoRA 4/6/8-step forecast profile was not
+promoted.
 
 ## MagCacheConfig
 

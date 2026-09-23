@@ -117,6 +117,64 @@ class SpectrumCacheConfig:
     allow_unet_ip_adapter_image_embeds: bool = False
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
 
+    @classmethod
+    def for_sdxl(
+        cls,
+        num_inference_steps: int = 24,
+        *,
+        conservative: bool = False,
+        pag: bool = False,
+    ) -> "SpectrumCacheConfig":
+        """Build the route-qualified SDXL UNet profile used by this fork.
+
+        The standard profile uses ``warmup=6 / window=2.0 / flex=0.75 / tail=3`` with
+        ``degree=4 / ridge=0.1 / blend=0.60``. ``conservative=True`` selects the
+        separately qualified ``warmup=5 / flex=0.25`` quality-oriented alternate.
+        PAG routes use the standard coefficients with ``warmup=8``.
+
+        ``conservative`` and ``pag`` are intentionally mutually exclusive because the
+        conservative PAG combination has not been qualified.
+        """
+        if conservative and pag:
+            raise ValueError("conservative and pag SDXL SPECTRUM profiles cannot be combined")
+
+        warmup_steps = 8 if pag else (5 if conservative else 6)
+        flex_window = 0.25 if conservative else 0.75
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=warmup_steps,
+            window_size=2.0,
+            flex_window=flex_window,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.60,
+            coordinate_max=50.0,
+            tail_actual_steps=3,
+        )
+
+    @classmethod
+    def for_sd15(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
+        """Build the ordinary route-qualified SD1.5 UNet profile used by this fork.
+
+        The profile is ``warmup=6 / window=2.0 / flex=0.75 / tail=3`` with
+        ``degree=4 / ridge=0.05 / blend=0.55``.
+
+        This preset records the qualified ordinary SD1.5 route profile. It does not
+        imply universal quality portability across every scheduler, prompt, seed, or
+        low-step regime.
+        """
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=6,
+            window_size=2.0,
+            flex_window=0.75,
+            degree=4,
+            ridge_lambda=0.05,
+            blend_w=0.55,
+            coordinate_max=50.0,
+            tail_actual_steps=3,
+        )
+
     def __post_init__(self) -> None:
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")

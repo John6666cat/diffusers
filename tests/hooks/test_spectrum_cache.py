@@ -86,3 +86,50 @@ def test_spectrum_forecaster_rejects_shape_change():
 def test_spectrum_config_validation(kwargs):
     with pytest.raises(ValueError):
         SpectrumCacheConfig(**kwargs)
+
+
+def test_spectrum_sdxl_profile_factories_and_schedules():
+    standard = SpectrumCacheConfig.for_sdxl()
+    conservative = SpectrumCacheConfig.for_sdxl(conservative=True)
+    pag = SpectrumCacheConfig.for_sdxl(pag=True)
+
+    assert (standard.degree, standard.ridge_lambda, standard.blend_w) == (4, 0.1, 0.60)
+    assert (standard.warmup_steps, standard.window_size, standard.flex_window, standard.tail_actual_steps) == (
+        6,
+        2.0,
+        0.75,
+        3,
+    )
+    standard_schedule = SpectrumSchedule(standard)
+    conservative_schedule = SpectrumSchedule(conservative)
+    pag_schedule = SpectrumSchedule(pag)
+
+    assert [step for step in range(24) if standard_schedule.decide(step)] == [
+        0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 21, 22, 23
+    ]
+    assert [step for step in range(24) if conservative_schedule.decide(step)] == [
+        0, 1, 2, 3, 4, 6, 8, 10, 12, 15, 18, 21, 22, 23
+    ]
+    assert [step for step in range(24) if pag_schedule.decide(step)] == [
+        0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 14, 18, 21, 22, 23
+    ]
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        SpectrumCacheConfig.for_sdxl(conservative=True, pag=True)
+
+
+def test_spectrum_sd15_profile_factory_and_schedule():
+    config = SpectrumCacheConfig.for_sd15()
+
+    assert (config.degree, config.ridge_lambda, config.blend_w) == (4, 0.05, 0.55)
+    assert (config.warmup_steps, config.window_size, config.flex_window, config.tail_actual_steps) == (
+        6,
+        2.0,
+        0.75,
+        3,
+    )
+
+    schedule = SpectrumSchedule(config)
+    assert [step for step in range(20) if schedule.decide(step)] == [
+        0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 17, 18, 19
+    ]
