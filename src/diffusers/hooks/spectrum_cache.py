@@ -197,6 +197,27 @@ class SpectrumCacheConfig:
             forecast_step_indices=(20, 22, 24, 27, 32, 34, 36, 38, 40, 42),
         )
 
+    @classmethod
+    def for_cogvideox5b_t2v(cls) -> "SpectrumCacheConfig":
+        """Build the qualified original CogVideoX-5B 720x480 / 49-frame 50-step T2V profile.
+
+        This preset is intentionally route-specific. CogVideoX 1.5, I2V/V2V, Fun-Control,
+        LoRA/attention-kwargs, training/autograd, and alternate step-count routes remain unqualified.
+        """
+        return cls(
+            num_inference_steps=50,
+            warmup_steps=5,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=5,
+            coordinate_max=50.0,
+            tail_actual_steps=5,
+            forecast_step_indices=(17, 19, 22, 24, 27, 29, 32, 34, 37, 39, 42, 44),
+        )
+
     def __post_init__(self) -> None:
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")
@@ -4824,3 +4845,251 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
 
 # --- end HunyuanVideo 1.5 native SPECTRUM candidate -----------------------------------------------
+
+# --- CogVideoX-5B T2V native SPECTRUM candidate ---------------------------------------------------
+
+_SPECTRUM_COGVIDEOX5B_FEATURE_HOOK = "spectrum_cache_cogvideox5b_feature"
+_COGVIDEOX5B_T2V_50STEP_FORECAST_STEPS = (17, 19, 22, 24, 27, 29, 32, 34, 37, 39, 42, 44)
+
+
+class SpectrumCogVideoX5BState(SpectrumFlux2State):
+    """Context-local SPECTRUM state for the pinned original CogVideoX-5B T2V route."""
+
+
+class SpectrumCogVideoX5BDenoiserHook(ModelHook):
+    """Root adapter for the original CogVideoX-5B 50-step T2V SPECTRUM qualified route.
+
+    Full-compute calls execute the source forward unchanged and capture the post-42-block video feature immediately
+    before ``norm_final``. Forecast calls skip the complete transformer body and reproduce the source-faithful
+    ``time_proj -> time_embedding -> norm_final -> norm_out -> proj_out -> unpatchify`` tail.
+
+    The native pipeline's batched-CFG ``cond_uncond`` cache context owns the forecaster history. Unsupported contexts,
+    CogVideoX 1.5/ofs, timestep conditioning, LoRA/attention kwargs, autograd/training, or changing context-local
+    conditioning identities latch sticky full-compute behavior.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    @staticmethod
+    def _conditioning_identity(value: Any) -> Any:
+        if isinstance(value, (tuple, list)):
+            return tuple(SpectrumCogVideoX5BDenoiserHook._conditioning_identity(item) for item in value)
+        return _spectrum_tensor_identity(value)
+
+    def _record(
+        self,
+        state: SpectrumCogVideoX5BState,
+        predicted: bool,
+        fallback_reason: str | None = None,
+    ) -> None:
+        state.records.append(
+            {
+                "logical_step": state.step_index,
+                "cache_context": self.state_manager.context.name,
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: int | float | torch.LongTensor,
+        timestep_cond: torch.Tensor | None = None,
+        ofs: int | float | torch.LongTensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+    ):
+        from ..models.modeling_outputs import Transformer2DModelOutput
+
+        state: SpectrumCogVideoX5BState = self.state_manager.get_state()
+        context = self.state_manager.context
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "timestep": _spectrum_tensor_signature(timestep),
+            "encoder_hidden_states": self._conditioning_identity(encoder_hidden_states),
+            "image_rotary_emb": self._conditioning_identity(image_rotary_emb),
+        }
+        state.start_call(signature)
+
+        if context.name != "cond_uncond":
+            state.latch("cache-context lane is not qualified for CogVideoX-5B T2V SPECTRUM")
+        if context.step_index is None or int(context.step_index) != int(state.step_index):
+            state.latch("cache-context step_index is missing or out of sync")
+        if context.num_inference_steps is None or int(context.num_inference_steps) != int(state.config.num_inference_steps):
+            state.latch("cache-context num_inference_steps is missing or does not match the qualified profile")
+        if torch.is_grad_enabled() or module.training:
+            state.latch("autograd/training is not qualified for CogVideoX-5B T2V SPECTRUM")
+        if timestep_cond is not None:
+            state.latch("timestep_cond route is not qualified for CogVideoX-5B T2V SPECTRUM")
+        if ofs is not None:
+            state.latch("ofs / CogVideoX 1.5 route is not qualified")
+        if isinstance(attention_kwargs, dict) and attention_kwargs:
+            state.latch("non-empty attention_kwargs / LoRA route is not qualified")
+
+        call_kwargs = {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+            "timestep": timestep,
+            "timestep_cond": timestep_cond,
+            "ofs": ofs,
+            "image_rotary_emb": image_rotary_emb,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": return_dict,
+        }
+
+        if state.guard_latched:
+            state.should_compute = True
+
+        if state.should_compute or not state.can_predict():
+            state.record_real_feature_enabled = not state.guard_latched
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.record_real_feature_enabled = False
+            self._record(state, predicted=False)
+            return output
+
+        try:
+            predicted = state.predict()
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite predicted CogVideoX-5B body feature")
+            predicted = predicted.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+            batch_size, num_frames, _, height, width = hidden_states.shape
+            t_emb = module.time_proj(timestep).to(dtype=hidden_states.dtype)
+            temb = module.time_embedding(t_emb, None)
+            output = module.proj_out(module.norm_out(module.norm_final(predicted), temb=temb))
+
+            p = int(module.config.patch_size)
+            output = output.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
+            output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+            state.predict_failures.append({"step": state.step_index, "error": reason})
+            state.latch("forecast failure; sticky fail-closed")
+            state.record_real_feature_enabled = False
+            result = self.fn_ref.original_forward(**call_kwargs)
+            self._record(state, predicted=False, fallback_reason=reason)
+            return result
+
+        self._record(state, predicted=True)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumCogVideoX5BFeatureHook(ModelHook):
+    """Record the real post-block CogVideoX-5B video feature immediately before ``norm_final``."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def pre_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumCogVideoX5BState = self.state_manager.get_state()
+        if not state.record_real_feature_enabled:
+            return args, kwargs
+
+        feature = args[0] if args else kwargs.get("input")
+        if not torch.is_tensor(feature):
+            raise RuntimeError("SPECTRUM CogVideoX-5B feature hook could not locate norm_final input.")
+        state.record_real_feature(feature)
+        return args, kwargs
+
+
+_apply_spectrum_cache_before_cogvideox5b = apply_spectrum_cache
+
+
+def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
+    """Apply SPECTRUM, adding the pinned original CogVideoX-5B 50-step T2V qualified route adapter."""
+
+    from ..models.transformers.cogvideox_transformer_3d import CogVideoXTransformer3DModel
+
+    unwrapped_module = unwrap_module(module)
+    if not isinstance(unwrapped_module, CogVideoXTransformer3DModel):
+        return _apply_spectrum_cache_before_cogvideox5b(module, config)
+
+    expected_signature = {
+        "num_attention_heads": 48,
+        "attention_head_dim": 64,
+        "in_channels": 16,
+        "out_channels": 16,
+        "time_embed_dim": 512,
+        "ofs_embed_dim": None,
+        "text_embed_dim": 4096,
+        "num_layers": 42,
+        "sample_width": 90,
+        "sample_height": 60,
+        "sample_frames": 49,
+        "patch_size": 2,
+        "patch_size_t": None,
+        "temporal_compression_ratio": 4,
+        "max_text_seq_length": 226,
+        "use_rotary_positional_embeddings": True,
+        "use_learned_positional_embeddings": False,
+        "patch_bias": True,
+    }
+    observed_signature = {key: getattr(unwrapped_module.config, key, None) for key in expected_signature}
+    if observed_signature != expected_signature:
+        raise ValueError(
+            "The CogVideoX-5B SPECTRUM adapter is qualified only for the pinned original 5B T2V transformer "
+            f"architecture. Expected {expected_signature}, got {observed_signature}."
+        )
+
+    blocks = list(unwrapped_module.transformer_blocks)
+    if len(blocks) != 42:
+        raise ValueError("CogVideoX-5B SPECTRUM requires exactly 42 materialized transformer blocks.")
+    if any(getattr(unwrapped_module, name, None) is None for name in ("norm_final", "norm_out", "proj_out")):
+        raise ValueError("CogVideoX-5B SPECTRUM requires norm_final, norm_out, and proj_out.")
+
+    observed_steps = tuple(config.forecast_step_indices or ())
+    profile_ok = (
+        config.forecast_step_indices is not None
+        and observed_steps in {(), _COGVIDEOX5B_T2V_50STEP_FORECAST_STEPS}
+        and int(config.num_inference_steps) == 50
+        and int(config.warmup_steps) == 5
+        and float(config.window_size) == 2.0
+        and float(config.flex_window) == 0.0
+        and int(config.degree) == 4
+        and float(config.ridge_lambda) == 0.1
+        and float(config.blend_w) == 0.5
+        and int(config.history_limit) == 5
+        and float(config.coordinate_max) == 50.0
+        and int(config.tail_actual_steps) == 5
+    )
+    if not profile_ok:
+        raise ValueError(
+            "The CogVideoX-5B qualified route adapter accepts only the pinned 50-step control profile "
+            "(forecast_step_indices=()) or the qualified 12-skip profile "
+            f"{_COGVIDEOX5B_T2V_50STEP_FORECAST_STEPS}; both require "
+            "warmup=5/window=2/flex=0/d4/ridge=0.1/blend=0.5/history=5/coordinate_max=50/tail=5."
+        )
+
+    state_manager = StateManager(SpectrumCogVideoX5BState, init_args=(config,))
+    root_registry = HookRegistry.check_if_exists_or_initialize(module)
+    root_registry.register_hook(SpectrumCogVideoX5BDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+    feature_registry = HookRegistry.check_if_exists_or_initialize(unwrapped_module.norm_final)
+    feature_registry.register_hook(SpectrumCogVideoX5BFeatureHook(state_manager), _SPECTRUM_COGVIDEOX5B_FEATURE_HOOK)
+
+    logger.debug(
+        "Applied original CogVideoX-5B native SPECTRUM qualified T2V adapter with forecast steps %s.",
+        observed_steps,
+    )
+
+
+# --- end CogVideoX-5B T2V native SPECTRUM candidate -----------------------------------------------
