@@ -133,3 +133,9 @@ def test_spectrum_sd15_profile_factory_and_schedule():
     assert [step for step in range(20) if schedule.decide(step)] == [
         0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 17, 18, 19
     ]
+
+def test_spectrum_hunyuan_video15_profile_factory():
+    config = SpectrumCacheConfig.for_hunyuan_video15()
+    assert (config.num_inference_steps, config.history_limit) == (50, 8)
+    assert (config.degree, config.ridge_lambda, config.blend_w) == (4, 0.1, 0.5)
+    assert config.forecast_step_indices == (20, 22, 24, 27, 32, 34, 36, 38, 40, 42)

@@ -175,6 +175,28 @@ class SpectrumCacheConfig:
             tail_actual_steps=3,
         )
 
+    @classmethod
+    def for_hunyuan_video15(cls) -> "SpectrumCacheConfig":
+        """Build the qualified HunyuanVideo 1.5 480p T2V 50-step SPECTRUM profile.
+
+        The measured profile forecasts ten steps on each CFG lane and keeps eight real feature
+        snapshots per lane. It is qualified only for the pinned 54-block HunyuanVideo 1.5 T2V
+        architecture and does not imply I2V, mean-flow, LoRA, or alternate-step portability.
+        """
+        return cls(
+            num_inference_steps=50,
+            warmup_steps=5,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            coordinate_max=50.0,
+            tail_actual_steps=0,
+            forecast_step_indices=(20, 22, 24, 27, 32, 34, 36, 38, 40, 42),
+        )
+
     def __post_init__(self) -> None:
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")
@@ -4547,3 +4569,258 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
 
 # --- end Chroma1-HD native SPECTRUM candidate -----------------------------------------------------
+
+# --- HunyuanVideo 1.5 native SPECTRUM candidate ---------------------------------------------------
+
+_SPECTRUM_HUNYUAN_VIDEO15_FEATURE_HOOK = "spectrum_cache_hunyuan_video15_feature"
+_HUNYUAN_VIDEO15_50STEP_FORECAST_STEPS = (20, 22, 24, 27, 32, 34, 36, 38, 40, 42)
+
+
+class SpectrumHunyuanVideo15State(SpectrumFlux2State):
+    """Context-local SPECTRUM state for the pinned HunyuanVideo 1.5 480p T2V qualified route."""
+
+    def reset(self) -> None:
+        super().reset()
+        self.t2v_image_sentinel_checked = False
+
+
+class SpectrumHunyuanVideo15DenoiserHook(ModelHook):
+    """Root adapter for the HunyuanVideo 1.5 480p T2V SPECTRUM qualified route adapter.
+
+    Full-compute calls execute the source forward unchanged and capture the post-transformer-block
+    video feature at ``norm_out``. Forecast calls skip the 54-block transformer body and reproduce
+    only the source-faithful ``time_embed -> norm_out -> proj_out -> unpatchify`` tail.
+
+    This candidate is intentionally fail-closed outside the pinned 50-step T2V experiment. The
+    surrounding pipeline already supplies independent cache contexts (normally ``pred_cond`` and
+    ``pred_uncond``), so each guider lane owns an isolated forecaster history.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def _record(
+        self,
+        state: SpectrumHunyuanVideo15State,
+        predicted: bool,
+        fallback_reason: str | None = None,
+    ) -> None:
+        state.records.append(
+            {
+                "logical_step": state.step_index,
+                "cache_context": self.state_manager.context.name,
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor,
+        timestep_r: torch.LongTensor | None = None,
+        encoder_hidden_states_2: torch.Tensor | None = None,
+        encoder_attention_mask_2: torch.Tensor | None = None,
+        image_embeds: torch.Tensor | None = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+    ):
+        from ..models.modeling_outputs import Transformer2DModelOutput
+
+        state: SpectrumHunyuanVideo15State = self.state_manager.get_state()
+        signature = {
+            # Latents/timestep vary by denoising step, so guard their structural contract only.
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "timestep": _spectrum_tensor_signature(timestep),
+            # Conditioning must remain the same object within one cache-context lane.
+            "encoder_hidden_states": _spectrum_tensor_identity(encoder_hidden_states),
+            "encoder_attention_mask": _spectrum_tensor_identity(encoder_attention_mask),
+            "encoder_hidden_states_2": _spectrum_tensor_identity(encoder_hidden_states_2),
+            "encoder_attention_mask_2": _spectrum_tensor_identity(encoder_attention_mask_2),
+            "image_embeds": _spectrum_tensor_identity(image_embeds),
+        }
+        state.start_call(signature)
+
+        if self.state_manager.context.name not in {"pred_cond", "pred_uncond"}:
+            state.latch("cache-context lane is not qualified for HunyuanVideo 1.5 SPECTRUM")
+        if torch.is_grad_enabled() or module.training:
+            state.latch("autograd/training is not qualified for HunyuanVideo 1.5 SPECTRUM")
+        if timestep_r is not None:
+            state.latch("timestep_r / mean-flow-refiner route is not qualified")
+        if isinstance(attention_kwargs, dict) and attention_kwargs:
+            state.latch("non-empty attention_kwargs / LoRA route is not qualified")
+        if not state.t2v_image_sentinel_checked:
+            if image_embeds is None:
+                state.latch("missing image_embeds T2V sentinel")
+            elif not bool(torch.all(image_embeds == 0).item()):
+                state.latch("image-conditioned HunyuanVideo 1.5 route is not qualified")
+            else:
+                state.t2v_image_sentinel_checked = True
+
+        call_kwargs = {
+            "hidden_states": hidden_states,
+            "timestep": timestep,
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_attention_mask": encoder_attention_mask,
+            "timestep_r": timestep_r,
+            "encoder_hidden_states_2": encoder_hidden_states_2,
+            "encoder_attention_mask_2": encoder_attention_mask_2,
+            "image_embeds": image_embeds,
+            "attention_kwargs": attention_kwargs,
+            "return_dict": return_dict,
+        }
+
+        if state.guard_latched:
+            state.should_compute = True
+
+        if state.should_compute or not state.can_predict():
+            state.record_real_feature_enabled = not state.guard_latched
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.record_real_feature_enabled = False
+            self._record(state, predicted=False)
+            return output
+
+        try:
+            predicted = state.predict()
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite predicted HunyuanVideo 1.5 body feature")
+            predicted = predicted.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+            batch_size, _, num_frames, height, width = hidden_states.shape
+            p_t = int(module.config.patch_size_t)
+            p_h = int(module.config.patch_size)
+            p_w = int(module.config.patch_size)
+            post_patch_num_frames = num_frames // p_t
+            post_patch_height = height // p_h
+            post_patch_width = width // p_w
+
+            temb = module.time_embed(timestep, timestep_r=None)
+            output = module.proj_out(module.norm_out(predicted, temb))
+            output = output.reshape(
+                batch_size,
+                post_patch_num_frames,
+                post_patch_height,
+                post_patch_width,
+                -1,
+                p_t,
+                p_h,
+                p_w,
+            )
+            output = output.permute(0, 4, 1, 5, 2, 6, 3, 7)
+            output = output.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        except Exception as error:
+            reason = f"{type(error).__name__}: {error}"
+            state.predict_failures.append({"step": state.step_index, "error": reason})
+            state.latch("forecast failure; sticky fail-closed")
+            state.record_real_feature_enabled = False
+            result = self.fn_ref.original_forward(**call_kwargs)
+            self._record(state, predicted=False, fallback_reason=reason)
+            return result
+
+        self._record(state, predicted=True)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumHunyuanVideo15FeatureHook(ModelHook):
+    """Record the real post-block HunyuanVideo 1.5 video feature immediately before ``norm_out``."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def pre_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumHunyuanVideo15State = self.state_manager.get_state()
+        if not state.record_real_feature_enabled:
+            return args, kwargs
+
+        feature = args[0] if args else kwargs.get("hidden_states")
+        if not torch.is_tensor(feature):
+            raise RuntimeError("SPECTRUM HunyuanVideo 1.5 feature hook could not locate norm_out input.")
+        state.record_real_feature(feature)
+        return args, kwargs
+
+
+_apply_spectrum_cache_before_hunyuan_video15 = apply_spectrum_cache
+
+
+def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
+    """Apply SPECTRUM, adding the pinned HunyuanVideo 1.5 480p T2V qualified route adapter."""
+
+    from ..models.transformers.transformer_hunyuan_video15 import HunyuanVideo15Transformer3DModel
+
+    unwrapped_module = unwrap_module(module)
+    if not isinstance(unwrapped_module, HunyuanVideo15Transformer3DModel):
+        return _apply_spectrum_cache_before_hunyuan_video15(module, config)
+
+    if getattr(unwrapped_module.config, "task_type", None) != "t2v":
+        raise ValueError("The HunyuanVideo 1.5 SPECTRUM candidate is T2V-only.")
+    if bool(getattr(unwrapped_module.config, "use_meanflow", False)):
+        raise ValueError("The HunyuanVideo 1.5 SPECTRUM candidate does not qualify mean-flow routes.")
+    if int(getattr(unwrapped_module.config, "num_layers", -1)) != 54:
+        raise ValueError("HunyuanVideo 1.5 SPECTRUM requires exactly 54 transformer blocks.")
+    if int(getattr(unwrapped_module.config, "patch_size", -1)) != 1 or int(
+        getattr(unwrapped_module.config, "patch_size_t", -1)
+    ) != 1:
+        raise ValueError("HunyuanVideo 1.5 SPECTRUM requires the 1x1x1 patch route.")
+
+    blocks = list(unwrapped_module.transformer_blocks)
+    if len(blocks) != 54:
+        raise ValueError("HunyuanVideo 1.5 SPECTRUM requires exactly 54 materialized transformer blocks.")
+    if getattr(unwrapped_module, "norm_out", None) is None or getattr(unwrapped_module, "proj_out", None) is None:
+        raise ValueError("HunyuanVideo 1.5 SPECTRUM requires norm_out and proj_out.")
+
+    observed_steps = tuple(config.forecast_step_indices or ())
+    profile_ok = (
+        config.forecast_step_indices is not None
+        and observed_steps in {(), _HUNYUAN_VIDEO15_50STEP_FORECAST_STEPS}
+        and int(config.num_inference_steps) == 50
+        and int(config.warmup_steps) == 5
+        and float(config.window_size) == 2.0
+        and float(config.flex_window) == 0.0
+        and int(config.degree) == 4
+        and float(config.ridge_lambda) == 0.1
+        and float(config.blend_w) == 0.5
+        and int(config.history_limit) == 8
+        and float(config.coordinate_max) == 50.0
+        and int(config.tail_actual_steps) == 0
+    )
+    if not profile_ok:
+        raise ValueError(
+            "The HunyuanVideo 1.5 qualified route adapter accepts only the pinned 50-step control profile "
+            "(forecast_step_indices=()) or the qualified 10-skip profile "
+            f"{_HUNYUAN_VIDEO15_50STEP_FORECAST_STEPS}; both require "
+            "warmup=5/window=2/flex=0/d4/ridge=0.1/blend=0.5/history=8/coordinate_max=50/tail=0."
+        )
+
+    state_manager = StateManager(SpectrumHunyuanVideo15State, init_args=(config,))
+    root_registry = HookRegistry.check_if_exists_or_initialize(module)
+    root_registry.register_hook(SpectrumHunyuanVideo15DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK)
+
+    feature_registry = HookRegistry.check_if_exists_or_initialize(unwrapped_module.norm_out)
+    feature_registry.register_hook(
+        SpectrumHunyuanVideo15FeatureHook(state_manager), _SPECTRUM_HUNYUAN_VIDEO15_FEATURE_HOOK
+    )
+
+    logger.debug(
+        "Applied HunyuanVideo 1.5 native SPECTRUM qualified route adapter with forecast steps %s.",
+        observed_steps,
+    )
+
+
+# --- end HunyuanVideo 1.5 native SPECTRUM candidate -----------------------------------------------

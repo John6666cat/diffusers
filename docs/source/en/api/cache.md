@@ -89,6 +89,22 @@ research PSNR floor. Do not interpret `for_sd15()` as a universal scheduler
 quality guarantee. The tested LCM-LoRA 4/6/8-step forecast profile was not
 promoted.
 
+### Qualified HunyuanVideo 1.5 profile in this fork
+
+For the measured 480p T2V 50-step route, use the explicit factory:
+
+```python
+from diffusers import SpectrumCacheConfig
+
+config = SpectrumCacheConfig.for_hunyuan_video15()
+```
+
+The qualified profile forecasts steps `(20, 22, 24, 27, 32, 34, 36, 38, 40, 42)` on each CFG lane
+and retains eight real feature snapshots per lane. In the pinned 480p T2V qualification, this
+reduced first-block calls from 100 to 80 and measured about 1.23x-1.25x wall-time speedup on two
+prompts. The adapter remains fail-closed for I2V, mean-flow, training/autograd, non-empty attention
+kwargs / LoRA, unsupported cache-context lanes, and non-qualified profile values.
+
 ## MagCacheConfig
 
 [[autodoc]] MagCacheConfig

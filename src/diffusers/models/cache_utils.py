@@ -146,6 +146,7 @@ class CacheMixin:
             _SPECTRUM_CHROMA_FEATURE_HOOK,
             _SPECTRUM_COSMOS_FEATURE_HOOK,
             _SPECTRUM_FLUX2_FEATURE_HOOK,
+            _SPECTRUM_HUNYUAN_VIDEO15_FEATURE_HOOK,
             _SPECTRUM_DENOISER_HOOK,
             _SPECTRUM_HEAD_BLOCK_HOOK,
             _SPECTRUM_UNET_FEATURE_HOOK,
@@ -185,6 +186,7 @@ class CacheMixin:
             registry.remove_hook(_SPECTRUM_CHROMA_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_COSMOS_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_FLUX2_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_HUNYUAN_VIDEO15_FEATURE_HOOK, recurse=True)
         elif isinstance(self._cache_config, TaylorSeerCacheConfig):
             registry.remove_hook(_TAYLORSEER_CACHE_HOOK, recurse=True)
         else:
