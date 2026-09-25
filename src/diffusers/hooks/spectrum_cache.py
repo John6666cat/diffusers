@@ -563,6 +563,7 @@ class SpectrumState(BaseState):
     def reset(self) -> None:
         self.schedule.reset()
         self.forecaster.reset()
+        self._reset_coordinate_provenance()
         self.step_index = -1
         self.should_compute = True
         self.bypass = False
@@ -575,13 +576,139 @@ class SpectrumState(BaseState):
         self.forecast_steps: list[int] = []
         self.peak_history_bytes = 0
 
-    def start_step(self) -> None:
+    def _reset_coordinate_provenance(self) -> None:
+        self.coordinate_provenance_source: str | None = None
+        self.coordinate_runtime_num_inference_steps: int | None = None
+        self.coordinate_last_step_index: int | None = None
+        self.coordinate_failure_latched = False
+        self.coordinate_failure_latched_at: int | None = None
+        self.coordinate_failures: list[dict[str, Any]] = []
+
+    def coordinate_summary(self) -> dict[str, Any]:
+        return {
+            "coordinate_policy": self.config.coordinate_policy,
+            "provenance_source": self.coordinate_provenance_source,
+            "configured_num_inference_steps": int(self.config.num_inference_steps),
+            "runtime_num_inference_steps": self.coordinate_runtime_num_inference_steps,
+            "last_logical_step_index": self.coordinate_last_step_index,
+            "failure_latched": self.coordinate_failure_latched,
+            "failure_latched_at": self.coordinate_failure_latched_at,
+            "failures": list(self.coordinate_failures),
+        }
+
+    def _fail_closed_coordinate_provenance(self, reason: str) -> bool:
+        logical_step = max(int(self.step_index), 0)
+        if not self.coordinate_failure_latched:
+            self.coordinate_failure_latched = True
+            self.coordinate_failure_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.coordinate_failures:
+            self.coordinate_failures.append(record)
+        self.should_compute = True
+        self._reset_prediction_history()
+        return False
+
+    def _validate_coordinate_provenance(
+        self,
+        *,
+        logical_step_index: int | None,
+        runtime_num_inference_steps: int | None,
+        provenance_source: str | None,
+        allow_repeat_logical_step: bool = False,
+    ) -> bool:
+        if self.config.coordinate_policy != "runtime_index_normalized":
+            return True
+        if self.coordinate_failure_latched:
+            return False
+        if logical_step_index is None:
+            return self._fail_closed_coordinate_provenance("logical step provenance is missing")
+        if runtime_num_inference_steps is None:
+            return self._fail_closed_coordinate_provenance("runtime logical step count is missing")
+        if not isinstance(provenance_source, str) or not provenance_source:
+            return self._fail_closed_coordinate_provenance("coordinate provenance source is missing")
+        if isinstance(logical_step_index, bool) or not isinstance(logical_step_index, int):
+            return self._fail_closed_coordinate_provenance("logical step index must be an integer")
+        if isinstance(runtime_num_inference_steps, bool) or not isinstance(runtime_num_inference_steps, int):
+            return self._fail_closed_coordinate_provenance("runtime logical step count must be an integer")
+        if runtime_num_inference_steps < 1:
+            return self._fail_closed_coordinate_provenance("runtime logical step count must be >= 1")
+        if logical_step_index < 0 or logical_step_index >= runtime_num_inference_steps:
+            return self._fail_closed_coordinate_provenance(
+                f"logical step {logical_step_index} outside runtime range {runtime_num_inference_steps}"
+            )
+        if runtime_num_inference_steps != self.config.num_inference_steps:
+            return self._fail_closed_coordinate_provenance(
+                f"runtime logical step count {runtime_num_inference_steps} != configured "
+                f"{self.config.num_inference_steps}"
+            )
+        if logical_step_index != self.step_index:
+            return self._fail_closed_coordinate_provenance(
+                f"logical step provenance {logical_step_index} != route-owned logical step {self.step_index}"
+            )
+        if self.coordinate_provenance_source is not None and provenance_source != self.coordinate_provenance_source:
+            return self._fail_closed_coordinate_provenance(
+                f"coordinate provenance source changed {self.coordinate_provenance_source!r}->{provenance_source!r}"
+            )
+        if (
+            self.coordinate_runtime_num_inference_steps is not None
+            and runtime_num_inference_steps != self.coordinate_runtime_num_inference_steps
+        ):
+            return self._fail_closed_coordinate_provenance(
+                f"runtime logical step count changed {self.coordinate_runtime_num_inference_steps}->"
+                f"{runtime_num_inference_steps}"
+            )
+
+        previous = self.coordinate_last_step_index
+        if previous is None:
+            if logical_step_index != 0:
+                return self._fail_closed_coordinate_provenance(
+                    f"logical step provenance must start at 0, got {logical_step_index}"
+                )
+        elif allow_repeat_logical_step:
+            if logical_step_index not in {previous, previous + 1}:
+                return self._fail_closed_coordinate_provenance(
+                    f"non-monotonic dual-lane logical step provenance {previous}->{logical_step_index}"
+                )
+        elif logical_step_index != previous + 1:
+            return self._fail_closed_coordinate_provenance(
+                f"non-monotonic logical step provenance {previous}->{logical_step_index}"
+            )
+
+        self.coordinate_provenance_source = provenance_source
+        self.coordinate_runtime_num_inference_steps = runtime_num_inference_steps
+        if previous is None or logical_step_index > previous:
+            self.coordinate_last_step_index = logical_step_index
+        return True
+
+    def start_step(
+        self,
+        *,
+        logical_step_index: int | None = None,
+        runtime_num_inference_steps: int | None = None,
+        provenance_source: str | None = None,
+    ) -> None:
         self.step_index += 1
         if self.step_index >= self.config.num_inference_steps:
-            raise ValueError(
-                f"SPECTRUM received denoising step {self.step_index}, but config expects "
-                f"{self.config.num_inference_steps} steps. Reset the cache state or use a matching config."
+            if self.config.coordinate_policy == "legacy_fixed_max":
+                raise ValueError(
+                    f"SPECTRUM received denoising step {self.step_index}, but config expects "
+                    f"{self.config.num_inference_steps} steps. Reset the cache state or use a matching config."
+                )
+            self._fail_closed_coordinate_provenance(
+                f"route-owned logical step {self.step_index} outside configured inference-step range "
+                f"{self.config.num_inference_steps}"
             )
+        elif self.config.coordinate_policy == "runtime_index_normalized":
+            self._validate_coordinate_provenance(
+                logical_step_index=logical_step_index,
+                runtime_num_inference_steps=runtime_num_inference_steps,
+                provenance_source=provenance_source,
+            )
+
+        if self.coordinate_failure_latched:
+            self.should_compute = True
+            self.compute_steps.append(self.step_index)
+            return
 
         if self.prediction_failure_latched:
             self.should_compute = True
@@ -608,10 +735,14 @@ class SpectrumState(BaseState):
         self.forecaster.reset()
 
     def record_real_feature(self, image_feature: torch.Tensor) -> None:
+        if self.coordinate_failure_latched:
+            return
         self.forecaster.update(self.step_index, image_feature)
         self.peak_history_bytes = max(self.peak_history_bytes, self.forecaster.history_bytes())
 
     def predict(self) -> torch.Tensor:
+        if self.coordinate_failure_latched:
+            raise RuntimeError("SPECTRUM coordinate provenance is fail-closed for this run.")
         return self.forecaster.predict(self.step_index)
 
 
@@ -637,6 +768,7 @@ class SpectrumWanState(SpectrumState):
 
     def summary(self) -> dict[str, Any]:
         return {
+            "coordinate": self.coordinate_summary(),
             "guard_latched": self.guard_latched,
             "guard_latched_at": self.guard_latched_at,
             "guard_reasons": list(self.guard_reasons),
@@ -679,6 +811,7 @@ class SpectrumKrea2RawState(SpectrumWanState):
             "positive": SpectrumForecaster(self.config),
             "negative": SpectrumForecaster(self.config),
         }
+        self._reset_coordinate_provenance()
         self.call_index = -1
         self.step_index = -1
         self.current_lane: str | None = None
@@ -732,9 +865,30 @@ class SpectrumKrea2RawState(SpectrumWanState):
         ):
             self.latch("Krea 2 Raw CFG positive/negative conditioning identities are not distinct")
 
-    def start_step(self) -> None:
+    def start_step(
+        self,
+        *,
+        logical_step_index: int | None = None,
+        runtime_num_inference_steps: int | None = None,
+        provenance_source: str | None = None,
+    ) -> None:
         if self.current_lane is None:
             raise RuntimeError("SPECTRUM Krea 2 Raw call has no active CFG lane.")
+
+        if self.config.coordinate_policy == "runtime_index_normalized":
+            self._validate_coordinate_provenance(
+                logical_step_index=logical_step_index,
+                runtime_num_inference_steps=runtime_num_inference_steps,
+                provenance_source=provenance_source,
+                allow_repeat_logical_step=True,
+            )
+            if self.coordinate_failure_latched:
+                self.should_compute = True
+                self.decisions[self.step_index] = True
+                if self.step_index not in self.compute_steps:
+                    self.compute_steps.append(self.step_index)
+                return
+
         if self.guard_latched:
             self.should_compute = True
             return
@@ -768,15 +922,20 @@ class SpectrumKrea2RawState(SpectrumWanState):
             forecaster.reset()
 
     def record_real_feature(self, image_feature: torch.Tensor) -> None:
+        if self.coordinate_failure_latched:
+            return
         self._forecaster().update(self.step_index, image_feature)
         total = sum(forecaster.history_bytes() for forecaster in self.forecasters.values())
         self.peak_history_bytes = max(self.peak_history_bytes, total)
 
     def predict(self) -> torch.Tensor:
+        if self.coordinate_failure_latched:
+            raise RuntimeError("SPECTRUM coordinate provenance is fail-closed for this run.")
         return self._forecaster().predict(self.step_index)
 
     def summary(self) -> dict[str, Any]:
         return {
+            "coordinate": self.coordinate_summary(),
             "guard_latched": self.guard_latched,
             "guard_latched_at": self.guard_latched_at,
             "guard_reasons": list(self.guard_reasons),
