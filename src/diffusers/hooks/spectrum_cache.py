@@ -80,8 +80,13 @@ class SpectrumCacheConfig:
             Maximum native coefficient bytes retained by the `"bounded"` backend.
         predictor_chunk_size (`int`, defaults to `1048576`):
             Feature elements per temporary coefficient chunk while building the bounded slab and evaluating its suffix.
+        coordinate_policy (`str`, defaults to `"legacy_fixed_max"`):
+            Coordinate mapping used by the spectral predictor. `"legacy_fixed_max"` preserves the historical
+            `coordinate_max` mapping. `"runtime_index_normalized"` maps logical denoising-step indices over the
+            configured runtime step count so index 0 maps to -1 and index `N-1` maps to +1.
         coordinate_max (`float`, defaults to `50.0`):
-            Maximum coordinate used to map denoising-step indices into the Chebyshev domain.
+            Maximum coordinate used by `"legacy_fixed_max"`. Existing qualified profiles remain pinned to their
+            historical value until separately requalified.
         tail_actual_steps (`int`, defaults to `0`):
             Number of final denoising steps forced to full compute. This is a generic quality guard; the default `0`
             preserves the source-faithful refresh schedule.
@@ -121,6 +126,7 @@ class SpectrumCacheConfig:
     predictor_backend: str = "dense"
     predictor_cache_bytes: int = 67_108_864
     predictor_chunk_size: int = 1_048_576
+    coordinate_policy: str = "legacy_fixed_max"
     coordinate_max: float = 50.0
     tail_actual_steps: int = 0
     forecast_step_indices: tuple[int, ...] | None = None
@@ -160,6 +166,7 @@ class SpectrumCacheConfig:
             degree=4,
             ridge_lambda=0.1,
             blend_w=0.60,
+            coordinate_policy="legacy_fixed_max",
             coordinate_max=50.0,
             tail_actual_steps=3,
         )
@@ -183,6 +190,7 @@ class SpectrumCacheConfig:
             degree=4,
             ridge_lambda=0.05,
             blend_w=0.55,
+            coordinate_policy="legacy_fixed_max",
             coordinate_max=50.0,
             tail_actual_steps=3,
         )
@@ -204,6 +212,7 @@ class SpectrumCacheConfig:
             ridge_lambda=0.1,
             blend_w=0.5,
             history_limit=8,
+            coordinate_policy="legacy_fixed_max",
             coordinate_max=50.0,
             tail_actual_steps=0,
             forecast_step_indices=(20, 22, 24, 27, 32, 34, 36, 38, 40, 42),
@@ -225,6 +234,7 @@ class SpectrumCacheConfig:
             ridge_lambda=0.1,
             blend_w=0.5,
             history_limit=5,
+            coordinate_policy="legacy_fixed_max",
             coordinate_max=50.0,
             tail_actual_steps=5,
             forecast_step_indices=(17, 19, 22, 24, 27, 29, 32, 34, 37, 39, 42, 44),
@@ -253,6 +263,10 @@ class SpectrumCacheConfig:
             raise ValueError("predictor_cache_bytes must be >= 0")
         if self.predictor_chunk_size < 1:
             raise ValueError("predictor_chunk_size must be >= 1")
+        if self.coordinate_policy not in {"legacy_fixed_max", "runtime_index_normalized"}:
+            raise ValueError(
+                'coordinate_policy must be "legacy_fixed_max" or "runtime_index_normalized"'
+            )
         if self.coordinate_max <= 0:
             raise ValueError("coordinate_max must be > 0")
         if self.tail_actual_steps < 0:
@@ -362,7 +376,13 @@ class SpectrumForecaster:
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors if tensor is not None)
 
     def _tau(self, steps: torch.Tensor) -> torch.Tensor:
-        return (steps - self.config.coordinate_max / 2.0) * (2.0 / self.config.coordinate_max)
+        if self.config.coordinate_policy == "legacy_fixed_max":
+            return (steps - self.config.coordinate_max / 2.0) * (2.0 / self.config.coordinate_max)
+        if self.config.coordinate_policy == "runtime_index_normalized":
+            if self.config.num_inference_steps == 1:
+                return torch.zeros_like(steps)
+            return 2.0 * steps / float(self.config.num_inference_steps - 1) - 1.0
+        raise RuntimeError(f"Unsupported SPECTRUM coordinate policy: {self.config.coordinate_policy}")
 
     def _design(self, tau: torch.Tensor) -> torch.Tensor:
         tau = tau.reshape(-1, 1)
