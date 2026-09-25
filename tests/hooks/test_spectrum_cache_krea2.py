@@ -2,7 +2,7 @@ import torch
 
 from diffusers import Krea2Transformer2DModel
 from diffusers.hooks._helpers import TransformerBlockRegistry
-from diffusers.hooks.spectrum_cache import SpectrumCacheConfig, SpectrumSchedule
+from diffusers.hooks.spectrum_cache import SpectrumCacheConfig, SpectrumKrea2RawState, SpectrumSchedule
 
 
 KREA2_TURBO_CONFIG_SIGNATURE = {
@@ -333,3 +333,44 @@ def test_spectrum_krea2_raw_requires_explicit_schedule():
         assert "requires explicit forecast_step_indices" in str(error)
     else:
         raise AssertionError("Expected Krea 2 Raw 52-step route without an explicit schedule to fail.")
+
+
+
+def test_spectrum_krea2_raw_prediction_failure_latches_both_lanes_and_resets():
+    config = SpectrumCacheConfig(num_inference_steps=2, forecast_step_indices=(1,), degree=1)
+    state = SpectrumKrea2RawState(config)
+    positive = torch.ones(1, 2, 3)
+    negative = torch.full((1, 2, 3), 2.0)
+
+    state.prepare_call("positive")
+    state.start_step()
+    state.record_real_feature(positive)
+    state.prepare_call("negative")
+    state.start_step()
+    state.record_real_feature(negative)
+
+    state.prepare_call("positive")
+    state.start_step()
+    assert state.should_compute is False
+    state.fail_closed_prediction(RuntimeError("injected predictor failure"))
+    assert state.prediction_failure_latched is True
+    assert state.prediction_failure_latched_at == 1
+    assert state.fallback_steps == [1]
+    summary = state.summary()
+    assert summary["prediction_failure_latched"] is True
+    assert summary["predict_failures"][0]["step"] == 1
+    assert summary["fallback_steps"] == [1]
+    assert all(forecaster.features == [] for forecaster in state.forecasters.values())
+
+    state.record_real_feature(positive + 1)
+    state.prepare_call("negative")
+    state.start_step()
+    assert state.should_compute is True
+    state.record_real_feature(negative + 1)
+    assert state.forecasters["positive"].steps == [1]
+    assert state.forecasters["negative"].steps == [1]
+
+    state.reset()
+    assert state.prediction_failure_latched is False
+    assert state.predict_failures == []
+    assert state.fallback_steps == []

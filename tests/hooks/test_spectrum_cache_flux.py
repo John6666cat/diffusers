@@ -1,3 +1,6 @@
+from unittest.mock import Mock
+
+import pytest
 import torch
 
 from diffusers import SpectrumCacheConfig
@@ -7,8 +10,8 @@ from diffusers.hooks.spectrum_cache import (
     _SPECTRUM_HEAD_BLOCK_HOOK,
 )
 from diffusers.utils.testing_utils import torch_device
-
 from tests.models.transformers.test_models_transformer_flux import FluxTransformerTesterConfig
+
 
 class TestFluxTransformerSpectrumCache(FluxTransformerTesterConfig):
     """Native-style SPECTRUM cache tests for Flux Transformer."""
@@ -143,3 +146,62 @@ class TestFluxTransformerSpectrumCache(FluxTransformerTesterConfig):
         model.disable_cache()
         output_uncached_model = model(**controlled_inputs, return_dict=False)[0]
         assert torch.allclose(output_cached_model, output_uncached_model, atol=1e-5)
+
+
+@pytest.mark.parametrize("failure_kind", ["exception", "nonfinite", "shape"])
+@torch.no_grad()
+def test_spectrum_cache_forecast_failure_falls_back_and_latches(failure_kind):
+    tester = TestFluxTransformerSpectrumCache()
+    model = tester._get_spectrum_model()
+    inputs = tester.get_dummy_inputs()
+    second_inputs = inputs.copy()
+    second_inputs["hidden_states"] = inputs["hidden_states"] + 0.2
+    third_inputs = inputs.copy()
+    third_inputs["hidden_states"] = inputs["hidden_states"] - 0.15
+
+    expected_second = model(**second_inputs, return_dict=False)[0]
+    expected_third = model(**third_inputs, return_dict=False)[0]
+
+    config = SpectrumCacheConfig(
+        num_inference_steps=3,
+        warmup_steps=1,
+        degree=1,
+        forecast_step_indices=(1, 2),
+    )
+    model.enable_cache(config)
+    root_hook = model._diffusers_hook.get_hook(_SPECTRUM_DENOISER_HOOK)
+
+    with model.cache_context("forecast-failure"):
+        _ = model(**inputs, return_dict=False)[0]
+        state = root_hook.state_manager.get_state()
+        feature = state.forecaster.features[-1]
+
+        if failure_kind == "exception":
+            state.predict = Mock(side_effect=RuntimeError("injected predictor failure"))
+        elif failure_kind == "nonfinite":
+            state.predict = Mock(return_value=torch.full_like(feature, float("nan")))
+        else:
+            shape = (*feature.shape[:-1], feature.shape[-1] + 1)
+            state.predict = Mock(return_value=torch.zeros(shape, device=feature.device, dtype=feature.dtype))
+        fallback = model(**second_inputs, return_dict=False)[0]
+        sticky = model(**third_inputs, return_dict=False)[0]
+
+        assert state.prediction_failure_latched is True
+        assert state.prediction_failure_latched_at == 1
+        assert state.fallback_steps == [1]
+        assert len(state.predict_failures) == 1
+        assert state.predict_failures[0]["step"] == 1
+        assert state.forecast_steps == [1]
+        assert state.compute_steps == [0, 2]
+        assert state.forecaster.steps == [1, 2]
+        assert torch.allclose(fallback, expected_second, atol=1e-5)
+        assert torch.allclose(sticky, expected_third, atol=1e-5)
+
+    model._reset_stateful_cache()
+    with model.cache_context("forecast-failure"):
+        state = root_hook.state_manager.get_state()
+        assert state.prediction_failure_latched is False
+        assert state.predict_failures == []
+        assert state.fallback_steps == []
+
+    model.disable_cache()

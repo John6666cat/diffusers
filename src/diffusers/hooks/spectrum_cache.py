@@ -71,6 +71,15 @@ class SpectrumCacheConfig:
             first-order extrapolation.
         history_limit (`int`, defaults to `100`):
             Maximum number of full-compute feature snapshots retained per cache context.
+        predictor_backend (`str`, defaults to `"dense"`):
+            Forecaster evaluation backend. `"dense"` retains the qualified coefficient-tensor reference path;
+            `"chunked"` materializes coefficients only in fixed chunks with near-zero retained coefficient state;
+            `"bounded"` retains at most a bounded contiguous native coefficient slab and evaluates the uncached suffix
+            in chunks, preserving the current low-precision coefficient-quantization boundary.
+        predictor_cache_bytes (`int`, defaults to `67108864`):
+            Maximum native coefficient bytes retained by the `"bounded"` backend.
+        predictor_chunk_size (`int`, defaults to `1048576`):
+            Feature elements per temporary coefficient chunk while building the bounded slab and evaluating its suffix.
         coordinate_max (`float`, defaults to `50.0`):
             Maximum coordinate used to map denoising-step indices into the Chebyshev domain.
         tail_actual_steps (`int`, defaults to `0`):
@@ -109,6 +118,9 @@ class SpectrumCacheConfig:
     ridge_lambda: float = 0.1
     blend_w: float = 0.5
     history_limit: int = 100
+    predictor_backend: str = "dense"
+    predictor_cache_bytes: int = 67_108_864
+    predictor_chunk_size: int = 1_048_576
     coordinate_max: float = 50.0
     tail_actual_steps: int = 0
     forecast_step_indices: tuple[int, ...] | None = None
@@ -235,6 +247,12 @@ class SpectrumCacheConfig:
             raise ValueError("blend_w must be in [0, 1]")
         if self.history_limit < 1:
             raise ValueError("history_limit must be >= 1")
+        if self.predictor_backend not in {"dense", "chunked", "bounded"}:
+            raise ValueError('predictor_backend must be "dense", "chunked", or "bounded"')
+        if self.predictor_cache_bytes < 0:
+            raise ValueError("predictor_cache_bytes must be >= 0")
+        if self.predictor_chunk_size < 1:
+            raise ValueError("predictor_chunk_size must be >= 1")
         if self.coordinate_max <= 0:
             raise ValueError("coordinate_max must be > 0")
         if self.tail_actual_steps < 0:
@@ -296,17 +314,27 @@ class SpectrumSchedule:
 class SpectrumForecaster:
     """Chebyshev ridge predictor with a local first-order blend."""
 
+    _CHUNKED_COEFFICIENT_SIZE = 262_144
+
     def __init__(self, config: SpectrumCacheConfig):
         self.config = config
         self.steps: list[int] = []
         self.features: list[torch.Tensor] = []
         self._coef: torch.Tensor | None = None
+        self._history_design: torch.Tensor | None = None
+        self._history_chol: torch.Tensor | None = None
+        self._coef_slab: torch.Tensor | None = None
+        self._slab_elements = 0
         self._shape: torch.Size | None = None
 
     def reset(self) -> None:
         self.steps.clear()
         self.features.clear()
         self._coef = None
+        self._history_design = None
+        self._history_chol = None
+        self._coef_slab = None
+        self._slab_elements = 0
         self._shape = None
 
     def update(self, step: int, feature: torch.Tensor) -> None:
@@ -321,9 +349,17 @@ class SpectrumForecaster:
         self.steps = self.steps[-self.config.history_limit :]
         self.features = self.features[-self.config.history_limit :]
         self._coef = None
+        self._history_design = None
+        self._history_chol = None
+        self._coef_slab = None
+        self._slab_elements = 0
 
     def history_bytes(self) -> int:
         return sum(feature.numel() * feature.element_size() for feature in self.features)
+
+    def predictor_state_bytes(self) -> int:
+        tensors = (self._coef, self._history_design, self._history_chol, self._coef_slab)
+        return sum(tensor.numel() * tensor.element_size() for tensor in tensors if tensor is not None)
 
     def _tau(self, steps: torch.Tensor) -> torch.Tensor:
         return (steps - self.config.coordinate_max / 2.0) * (2.0 / self.config.coordinate_max)
@@ -337,8 +373,20 @@ class SpectrumForecaster:
             columns.append(2 * tau * columns[-1] - columns[-2])
         return torch.cat(columns[: self.config.degree + 1], dim=1)
 
+    def _ridge_cholesky(self, design: torch.Tensor) -> torch.Tensor:
+        order = design.shape[1]
+        design_t = design.transpose(0, 1)
+        gram = design_t @ design
+        identity = torch.eye(order, device=design.device, dtype=torch.float32)
+        gram = gram + self.config.ridge_lambda * identity
+        try:
+            return torch.linalg.cholesky(gram)
+        except RuntimeError:
+            jitter = 1e-6 * gram.diag().mean().clamp_min(1e-12)
+            return torch.linalg.cholesky(gram + jitter * identity)
+
     @torch.compiler.disable
-    def _fit(self) -> None:
+    def _fit_dense(self) -> None:
         if self._coef is not None:
             return
         if not self.features:
@@ -348,19 +396,22 @@ class SpectrumForecaster:
         steps = torch.tensor(self.steps, device=device, dtype=torch.float32)
         design = self._design(self._tau(steps)).to(torch.float32)
         features = torch.stack([feature.reshape(-1) for feature in self.features], dim=0).to(torch.float32)
-
-        order = design.shape[1]
         design_t = design.transpose(0, 1)
-        gram = design_t @ design
-        identity = torch.eye(order, device=device, dtype=torch.float32)
-        gram = gram + self.config.ridge_lambda * identity
-        try:
-            chol = torch.linalg.cholesky(gram)
-        except RuntimeError:
-            jitter = 1e-6 * gram.diag().mean().clamp_min(1e-12)
-            chol = torch.linalg.cholesky(gram + jitter * identity)
-
+        chol = self._ridge_cholesky(design)
         self._coef = torch.cholesky_solve(design_t @ features, chol).to(self.features[-1].dtype)
+
+    @torch.compiler.disable
+    def _fit_history_solver(self) -> None:
+        if self._history_design is not None and self._history_chol is not None:
+            return
+        if not self.features:
+            raise ValueError("SPECTRUM cannot predict before a full-compute feature has been recorded.")
+
+        device = self.features[-1].device
+        steps = torch.tensor(self.steps, device=device, dtype=torch.float32)
+        design = self._design(self._tau(steps)).to(torch.float32)
+        self._history_design = design
+        self._history_chol = self._ridge_cholesky(design)
 
     def _local_first_order(self, step: int) -> torch.Tensor:
         if len(self.features) < 2:
@@ -373,15 +424,106 @@ class SpectrumForecaster:
         return current + scale * (current - previous)
 
     @torch.compiler.disable
-    def predict(self, step: int) -> torch.Tensor:
-        self._fit()
+    def _predict_dense(self, step: int) -> torch.Tensor:
+        self._fit_dense()
         if self._coef is None or self._shape is None:
-            raise RuntimeError("SPECTRUM forecaster fit did not produce coefficients.")
+            raise RuntimeError("SPECTRUM dense forecaster fit did not produce coefficients.")
 
-        device = self.features[-1].device
-        target_step = torch.tensor([step], device=device, dtype=torch.float32)
+        target_step = torch.tensor([step], device=self.features[-1].device, dtype=torch.float32)
         design = self._design(self._tau(target_step)).to(self._coef.dtype)
-        predicted = (design @ self._coef).reshape(self._shape)
+        return (design @ self._coef).reshape(self._shape)
+
+    @torch.compiler.disable
+    def _predict_chunked(self, step: int) -> torch.Tensor:
+        self._fit_history_solver()
+        if self._history_design is None or self._history_chol is None or self._shape is None:
+            raise RuntimeError("SPECTRUM chunked forecaster fit did not produce solver state.")
+
+        feature = self.features[-1]
+        target_step = torch.tensor([step], device=feature.device, dtype=torch.float32)
+        target_design = self._design(self._tau(target_step)).to(feature.dtype)
+        design_t = self._history_design.transpose(0, 1)
+        flat_features = [item.reshape(-1) for item in self.features]
+        predicted = torch.empty(feature.numel(), device=feature.device, dtype=feature.dtype)
+
+        for start in range(0, feature.numel(), self._CHUNKED_COEFFICIENT_SIZE):
+            end = min(start + self._CHUNKED_COEFFICIENT_SIZE, feature.numel())
+            feature_chunk = torch.stack([item[start:end] for item in flat_features], dim=0).to(torch.float32)
+            coefficient_chunk = torch.cholesky_solve(design_t @ feature_chunk, self._history_chol).to(feature.dtype)
+            predicted[start:end] = (target_design @ coefficient_chunk).reshape(-1)
+
+        return predicted.reshape(self._shape)
+
+    @torch.compiler.disable
+    def _fit_bounded_slab(self) -> None:
+        self._fit_history_solver()
+        if self._history_design is None or self._history_chol is None or self._shape is None:
+            raise RuntimeError("SPECTRUM bounded forecaster fit did not produce solver state.")
+        if self._coef_slab is not None:
+            return
+
+        feature = self.features[-1]
+        order = self._history_design.shape[1]
+        coefficient_bytes_per_element = order * feature.element_size()
+        max_cached_elements = self.config.predictor_cache_bytes // max(coefficient_bytes_per_element, 1)
+        self._slab_elements = int(min(feature.numel(), max_cached_elements))
+        self._coef_slab = torch.empty(
+            (order, self._slab_elements), device=feature.device, dtype=feature.dtype
+        )
+        if self._slab_elements == 0:
+            return
+
+        design_t = self._history_design.transpose(0, 1)
+        flat_features = [item.reshape(-1) for item in self.features]
+        for start in range(0, self._slab_elements, self.config.predictor_chunk_size):
+            end = min(start + self.config.predictor_chunk_size, self._slab_elements)
+            feature_chunk = torch.stack([item[start:end] for item in flat_features], dim=0).to(torch.float32)
+            coefficient_chunk = torch.cholesky_solve(
+                design_t @ feature_chunk, self._history_chol
+            ).to(feature.dtype)
+            self._coef_slab[:, start:end] = coefficient_chunk
+
+    @torch.compiler.disable
+    def _predict_bounded(self, step: int) -> torch.Tensor:
+        self._fit_bounded_slab()
+        if (
+            self._coef_slab is None
+            or self._history_design is None
+            or self._history_chol is None
+            or self._shape is None
+        ):
+            raise RuntimeError("SPECTRUM bounded forecaster fit did not produce bounded state.")
+
+        feature = self.features[-1]
+        target_step = torch.tensor([step], device=feature.device, dtype=torch.float32)
+        target_design = self._design(self._tau(target_step)).to(feature.dtype)
+        flat_features = [item.reshape(-1) for item in self.features]
+        predicted = torch.empty(feature.numel(), device=feature.device, dtype=feature.dtype)
+
+        if self._slab_elements:
+            predicted[: self._slab_elements] = (target_design @ self._coef_slab).reshape(-1)
+
+        design_t = self._history_design.transpose(0, 1)
+        for start in range(self._slab_elements, feature.numel(), self.config.predictor_chunk_size):
+            end = min(start + self.config.predictor_chunk_size, feature.numel())
+            feature_chunk = torch.stack([item[start:end] for item in flat_features], dim=0).to(torch.float32)
+            coefficient_chunk = torch.cholesky_solve(
+                design_t @ feature_chunk, self._history_chol
+            ).to(feature.dtype)
+            predicted[start:end] = (target_design @ coefficient_chunk).reshape(-1)
+
+        return predicted.reshape(self._shape)
+
+    @torch.compiler.disable
+    def predict(self, step: int) -> torch.Tensor:
+        if self.config.predictor_backend == "dense":
+            predicted = self._predict_dense(step)
+        elif self.config.predictor_backend == "chunked":
+            predicted = self._predict_chunked(step)
+        elif self.config.predictor_backend == "bounded":
+            predicted = self._predict_bounded(step)
+        else:
+            raise RuntimeError(f"Unsupported SPECTRUM predictor backend: {self.config.predictor_backend}")
 
         if self.config.blend_w < 1.0:
             local = self._local_first_order(step)
@@ -405,6 +547,10 @@ class SpectrumState(BaseState):
         self.should_compute = True
         self.bypass = False
         self.bypass_latched = False
+        self.prediction_failure_latched = False
+        self.prediction_failure_latched_at: int | None = None
+        self.predict_failures: list[dict[str, Any]] = []
+        self.fallback_steps: list[int] = []
         self.compute_steps: list[int] = []
         self.forecast_steps: list[int] = []
         self.peak_history_bytes = 0
@@ -417,9 +563,29 @@ class SpectrumState(BaseState):
                 f"{self.config.num_inference_steps} steps. Reset the cache state or use a matching config."
             )
 
+        if self.prediction_failure_latched:
+            self.should_compute = True
+            self.compute_steps.append(self.step_index)
+            return
+
         self.should_compute = self.schedule.decide(self.step_index)
         target = self.compute_steps if self.should_compute else self.forecast_steps
         target.append(self.step_index)
+
+    def fail_closed_prediction(self, error: Exception) -> None:
+        reason = f"{type(error).__name__}: {error}"
+        if not self.prediction_failure_latched:
+            self.prediction_failure_latched = True
+            self.prediction_failure_latched_at = int(self.step_index)
+        self.predict_failures.append({"step": int(self.step_index), "error": reason})
+        self.fallback_steps.append(int(self.step_index))
+        self.should_compute = True
+        # Once forecasting has failed, discard the old fit/history before the real
+        # current step is allowed to seed a fresh, non-contaminated history.
+        self._reset_prediction_history()
+
+    def _reset_prediction_history(self) -> None:
+        self.forecaster.reset()
 
     def record_real_feature(self, image_feature: torch.Tensor) -> None:
         self.forecaster.update(self.step_index, image_feature)
@@ -454,6 +620,10 @@ class SpectrumWanState(SpectrumState):
             "guard_latched": self.guard_latched,
             "guard_latched_at": self.guard_latched_at,
             "guard_reasons": list(self.guard_reasons),
+            "prediction_failure_latched": self.prediction_failure_latched,
+            "prediction_failure_latched_at": self.prediction_failure_latched_at,
+            "predict_failures": list(self.predict_failures),
+            "fallback_steps": list(self.fallback_steps),
             "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
             "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
             "compute_steps": list(self.compute_steps),
@@ -495,6 +665,10 @@ class SpectrumKrea2RawState(SpectrumWanState):
         self.should_compute = True
         self.bypass = False
         self.bypass_latched = False
+        self.prediction_failure_latched = False
+        self.prediction_failure_latched_at: int | None = None
+        self.predict_failures: list[dict[str, Any]] = []
+        self.fallback_steps: list[int] = []
         self.guard_latched = False
         self.guard_latched_at: int | None = None
         self.guard_reasons: list[dict[str, Any]] = []
@@ -544,6 +718,12 @@ class SpectrumKrea2RawState(SpectrumWanState):
         if self.guard_latched:
             self.should_compute = True
             return
+        if self.prediction_failure_latched:
+            self.should_compute = True
+            if self.current_lane == "positive":
+                self.decisions[self.step_index] = True
+                self.compute_steps.append(self.step_index)
+            return
 
         if self.current_lane == "positive":
             decision = bool(self.schedule.decide(self.step_index))
@@ -563,6 +743,10 @@ class SpectrumKrea2RawState(SpectrumWanState):
             raise RuntimeError("SPECTRUM Krea 2 Raw forecaster has no active CFG lane.")
         return self.forecasters[self.current_lane]
 
+    def _reset_prediction_history(self) -> None:
+        for forecaster in self.forecasters.values():
+            forecaster.reset()
+
     def record_real_feature(self, image_feature: torch.Tensor) -> None:
         self._forecaster().update(self.step_index, image_feature)
         total = sum(forecaster.history_bytes() for forecaster in self.forecasters.values())
@@ -576,6 +760,10 @@ class SpectrumKrea2RawState(SpectrumWanState):
             "guard_latched": self.guard_latched,
             "guard_latched_at": self.guard_latched_at,
             "guard_reasons": list(self.guard_reasons),
+            "prediction_failure_latched": self.prediction_failure_latched,
+            "prediction_failure_latched_at": self.prediction_failure_latched_at,
+            "predict_failures": list(self.predict_failures),
+            "fallback_steps": list(self.fallback_steps),
             "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
             "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
             "compute_steps": list(self.compute_steps),
@@ -893,12 +1081,21 @@ class SpectrumHeadBlockHook(ModelHook):
         if state.should_compute:
             return self.fn_ref.original_forward(*args, **kwargs)
 
-        predicted = state.predict()
-        if predicted.shape != hidden_states.shape:
-            raise ValueError(
-                f"SPECTRUM predicted feature shape {predicted.shape} does not match denoiser feature shape "
-                f"{hidden_states.shape}."
-            )
+        try:
+            predicted = state.predict()
+            if not torch.is_tensor(predicted):
+                raise TypeError("SPECTRUM predictor did not return a tensor.")
+            if predicted.shape != hidden_states.shape:
+                raise ValueError(
+                    f"SPECTRUM predicted feature shape {predicted.shape} does not match denoiser feature shape "
+                    f"{hidden_states.shape}."
+                )
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("SPECTRUM predicted feature contains non-finite values.")
+        except Exception as error:
+            state.fail_closed_prediction(error)
+            return self.fn_ref.original_forward(*args, **kwargs)
+
         return _pack_block_output(self._metadata, predicted, encoder_hidden_states)
 
 
@@ -1972,13 +2169,27 @@ class SpectrumUNetDenoiserHook(ModelHook):
         if state.should_compute:
             return self.fn_ref.original_forward(*args, **kwargs)
 
-        predicted = state.predict()
-        unwrapped = unwrap_module(module)
+        try:
+            predicted = state.predict()
+            if not torch.is_tensor(predicted):
+                raise TypeError("SPECTRUM predictor did not return a tensor.")
+            expected_shape = state.forecaster._shape
+            if expected_shape is None or predicted.shape != expected_shape:
+                raise ValueError(
+                    f"SPECTRUM predicted UNet feature shape {predicted.shape} does not match history shape "
+                    f"{expected_shape}."
+                )
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("SPECTRUM predicted UNet feature contains non-finite values.")
 
-        if unwrapped.conv_norm_out is not None:
-            predicted = unwrapped.conv_norm_out(predicted)
-            predicted = unwrapped.conv_act(predicted)
-        predicted = unwrapped.conv_out(predicted)
+            unwrapped = unwrap_module(module)
+            if unwrapped.conv_norm_out is not None:
+                predicted = unwrapped.conv_norm_out(predicted)
+                predicted = unwrapped.conv_act(predicted)
+            predicted = unwrapped.conv_out(predicted)
+        except Exception as error:
+            state.fail_closed_prediction(error)
+            return self.fn_ref.original_forward(*args, **kwargs)
 
         return_dict = self._get_argument("return_dict", args, kwargs)
         if return_dict is False:
