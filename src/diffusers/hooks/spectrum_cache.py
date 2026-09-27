@@ -84,6 +84,8 @@ class SpectrumCacheConfig:
             Coordinate mapping used by the spectral predictor. `"legacy_fixed_max"` preserves the historical
             `coordinate_max` mapping. `"runtime_index_normalized"` maps logical denoising-step indices over the
             configured runtime step count so index 0 maps to -1 and index `N-1` maps to +1.
+            `"runtime_horizon_normalized"` maps index `i` as `2*i/N - 1`; it is currently qualified only through
+            the opt-in ordinary Anima variable-step profile.
         coordinate_max (`float`, defaults to `50.0`):
             Maximum coordinate used by `"legacy_fixed_max"`. Existing qualified profiles remain pinned to their
             historical value until separately requalified.
@@ -233,6 +235,40 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_anima_variable(cls, num_inference_steps: int = 30) -> "SpectrumCacheConfig":
+        """Build the opt-in ordinary Anima variable-step profile.
+
+        The profile uses ``runtime_horizon_normalized`` coordinates (`2*i/N - 1`) and the
+        qualified ordinary-Anima predictor coefficients. The historical 30-step schedule
+        remains the identity anchor. At 20 and 30 steps the existing ``warmup=8 / tail=5``
+        protection floors are preserved. Above 30 steps, warmup and tail are scaled from
+        the 30-step geometry to avoid increasing forecast pressure simply because the run
+        is longer.
+
+        Qualification covers the pinned ordinary Anima Base v1.0 route at 20/30/40 steps.
+        Few-step/Turbo routes remain separate and this factory intentionally rejects
+        values below 20.
+        """
+        if num_inference_steps < 20:
+            raise ValueError("for_anima_variable requires num_inference_steps >= 20; few-step/Turbo routes are separate")
+
+        warmup_steps = max(8, math.ceil(8 * num_inference_steps / 30))
+        tail_actual_steps = max(5, math.ceil(5 * num_inference_steps / 30))
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=warmup_steps,
+            window_size=2.0,
+            flex_window=0.25,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=100,
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=50.0,
+            tail_actual_steps=tail_actual_steps,
+        )
+
+    @classmethod
     def for_hunyuan_video15(cls) -> "SpectrumCacheConfig":
         """Build the qualified HunyuanVideo 1.5 480p T2V 50-step SPECTRUM profile.
 
@@ -300,9 +336,14 @@ class SpectrumCacheConfig:
             raise ValueError("predictor_cache_bytes must be >= 0")
         if self.predictor_chunk_size < 1:
             raise ValueError("predictor_chunk_size must be >= 1")
-        if self.coordinate_policy not in {"legacy_fixed_max", "runtime_index_normalized"}:
+        if self.coordinate_policy not in {
+            "legacy_fixed_max",
+            "runtime_index_normalized",
+            "runtime_horizon_normalized",
+        }:
             raise ValueError(
-                'coordinate_policy must be "legacy_fixed_max" or "runtime_index_normalized"'
+                'coordinate_policy must be "legacy_fixed_max", "runtime_index_normalized", '
+                'or "runtime_horizon_normalized"'
             )
         if self.coordinate_max <= 0:
             raise ValueError("coordinate_max must be > 0")
@@ -466,6 +507,8 @@ class SpectrumForecaster:
             if self.config.num_inference_steps == 1:
                 return torch.zeros_like(steps)
             return 2.0 * steps / float(self.config.num_inference_steps - 1) - 1.0
+        if self.config.coordinate_policy == "runtime_horizon_normalized":
+            return 2.0 * steps / float(self.config.num_inference_steps) - 1.0
         raise RuntimeError(f"Unsupported SPECTRUM coordinate policy: {self.config.coordinate_policy}")
 
     def _design(self, tau: torch.Tensor) -> torch.Tensor:
@@ -700,7 +743,10 @@ class SpectrumState(BaseState):
         provenance_source: str | None,
         allow_repeat_logical_step: bool = False,
     ) -> bool:
-        if self.config.coordinate_policy != "runtime_index_normalized":
+        if self.config.coordinate_policy not in {
+            "runtime_index_normalized",
+            "runtime_horizon_normalized",
+        }:
             return True
         if self.coordinate_failure_latched:
             return False
@@ -1171,6 +1217,9 @@ class SpectrumCosmosState(BaseState):
         self.records: list[dict[str, Any]] = []
         self.predict_failures: list[dict[str, Any]] = []
         self.peak_history_bytes = 0
+        self.coordinate_runtime_source: str | None = None
+        self.coordinate_runtime_num_inference_steps: int | None = None
+        self.coordinate_last_step_index: int | None = None
 
     def latch(self, step: int, reason: str) -> None:
         if not self.guard_latched:
@@ -1180,6 +1229,56 @@ class SpectrumCosmosState(BaseState):
         if record not in self.guard_reasons:
             self.guard_reasons.append(record)
 
+    def _validate_runtime_coordinate_provenance(
+        self,
+        *,
+        step: int,
+        runtime_num_inference_steps: int,
+        runtime_source: str,
+    ) -> None:
+        if self.config.coordinate_policy not in {
+            "runtime_index_normalized",
+            "runtime_horizon_normalized",
+        }:
+            return
+        if runtime_source != "cache_context":
+            self.latch(step, "runtime-normalized coordinate policy requires native CacheContext provenance")
+            return
+        if runtime_num_inference_steps != self.config.num_inference_steps:
+            self.latch(
+                step,
+                f"runtime num_inference_steps {runtime_num_inference_steps} != configured "
+                f"{self.config.num_inference_steps}",
+            )
+            return
+        if self.coordinate_runtime_source is not None and runtime_source != self.coordinate_runtime_source:
+            self.latch(
+                step,
+                f"runtime coordinate source changed {self.coordinate_runtime_source!r}->{runtime_source!r}",
+            )
+        if (
+            self.coordinate_runtime_num_inference_steps is not None
+            and runtime_num_inference_steps != self.coordinate_runtime_num_inference_steps
+        ):
+            self.latch(
+                step,
+                f"runtime num_inference_steps changed {self.coordinate_runtime_num_inference_steps}->"
+                f"{runtime_num_inference_steps}",
+            )
+
+        previous = self.coordinate_last_step_index
+        if previous is None:
+            if step != 0:
+                self.latch(step, f"runtime-coordinate logical step must start at 0, got {step}")
+        elif step != previous + 1:
+            self.latch(step, f"non-monotonic runtime-coordinate logical step {previous}->{step}")
+
+        if self.guard_latched:
+            return
+        self.coordinate_runtime_source = runtime_source
+        self.coordinate_runtime_num_inference_steps = int(runtime_num_inference_steps)
+        self.coordinate_last_step_index = int(step)
+
     def prepare_call(
         self,
         *,
@@ -1188,9 +1287,16 @@ class SpectrumCosmosState(BaseState):
         num_conditions: int,
         dynamic_conditioning: bool,
         signature: dict[str, Any],
+        runtime_num_inference_steps: int,
+        runtime_source: str,
     ) -> None:
         self.current_step = int(step)
         self.current_label = label
+        self._validate_runtime_coordinate_provenance(
+            step=self.current_step,
+            runtime_num_inference_steps=int(runtime_num_inference_steps),
+            runtime_source=str(runtime_source),
+        )
 
         if self.current_step < 0 or self.current_step >= self.config.num_inference_steps:
             self.latch(self.current_step, "logical step outside configured inference-step range")
@@ -1252,6 +1358,12 @@ class SpectrumCosmosState(BaseState):
             "guard_latched": self.guard_latched,
             "guard_latched_at": self.guard_latched_at,
             "guard_reasons": list(self.guard_reasons),
+            "coordinate": {
+                "policy": self.config.coordinate_policy,
+                "runtime_source": self.coordinate_runtime_source,
+                "runtime_num_inference_steps": self.coordinate_runtime_num_inference_steps,
+                "last_logical_step_index": self.coordinate_last_step_index,
+            },
             "logical_prediction_steps_used": logical_prediction_steps,
             "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
             "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
@@ -2141,6 +2253,8 @@ class SpectrumCosmosDenoiserHook(ModelHook):
             num_conditions=num_conditions,
             dynamic_conditioning=dynamic_conditioning,
             signature=signature,
+            runtime_num_inference_steps=num_inference_steps,
+            runtime_source=str(runtime["runtime_source"]),
         )
 
         if state.guard_latched:
