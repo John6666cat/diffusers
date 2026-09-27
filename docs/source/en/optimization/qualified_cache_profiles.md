@@ -15,6 +15,50 @@ When this fork is rebased or rewritten against a newer upstream Diffusers versio
 4. requalify any profile whose model, scheduler, CFG topology, precision/quantization,
    cache implementation, or step semantics changed.
 
+## SDXL ordinary variable-step SPECTRUM profile
+
+This fork qualifies an opt-in variable-step profile for ordinary Stable Diffusion XL text-to-image inference with the
+Euler scheduler. Enable it on the SDXL UNet and pass the same inference-step count to the pipeline:
+
+```python
+from diffusers import SpectrumCacheConfig
+
+num_inference_steps = 32
+config = SpectrumCacheConfig.for_sdxl_variable(num_inference_steps=num_inference_steps)
+pipe.unet.enable_cache(config)
+
+image = pipe(prompt, num_inference_steps=num_inference_steps).images[0]
+```
+
+The factory retains the ordinary SDXL predictor settings (`degree=4`, `ridge_lambda=0.1`, `blend_w=0.60`) and uses:
+
+- `coordinate_policy="runtime_index_normalized"`;
+- `warmup_steps=6`;
+- `tail_actual_steps=3`;
+- `max_consecutive_forecast_steps=3`.
+
+The max-three guard is compiled from the ordinary adaptive schedule. If a forecast run is longer than three steps, the
+midpoint of the first overlong run is promoted to a real forward pass; this repeats until every forecast run is at most
+three steps. The guard only adds real-compute positions.
+
+The qualification used the historical SDXL Base 1.0 route with the default Euler scheduler at 1024x1024 and guidance
+scale 5.0. The measured/identity step set was `16/20/24/28/32/36/40`. The 16- and 20-step schedules were identity
+controls where the max-three guard did not change the decision mask.
+
+On the fresh broad 24/28/32/36/40-step holdout, the guarded profile beat the matched unguarded comparison schedule in
+68 of 75 cases, with a mean image-PSNR delta of `+0.799557 dB`. A targeted 28/32/40-step multi-person and interaction
+hard-case holdout produced 37 wins and 8 losses over 45 matched cases, with a mean delta of `+0.242122 dB`; the worst
+measured regression was `-0.345157 dB`.
+
+`SpectrumCacheConfig.for_sdxl()` is unchanged and remains on its historical `legacy_fixed_max` coordinate policy.
+`for_sdxl_variable()` is an explicit opt-in, not a new route default.
+
+> [!WARNING]
+> This qualification is specific to ordinary SDXL with the Euler scheduler. The same coordinate/guard policy was not
+> established as universal on SD1.5 PNDM or Wan2.1, and it does not cover PAG, the conservative SDXL preset, arbitrary
+> unmeasured step counts, or few-step/distilled routes. Revalidate when changing the checkpoint, scheduler, guidance
+> topology, precision/quantization, attention backend, adapters, conditioning path, or denoising-step regime.
+
 ## FLUX.2 Klein Base 4B SPECTRUM profile
 
 The retained FLUX.2 Klein Base 4B profile is qualified for

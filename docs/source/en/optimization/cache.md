@@ -169,8 +169,15 @@ config = SpectrumCacheConfig(
 pipe.transformer.enable_cache(config)
 ```
 
-SPECTRUM history is partitioned by [`~CacheMixin.cache_context`]. Profiles are route-specific. Fork-qualified
-measurements are tracked separately in [Fork-qualified cache profiles](qualified_cache_profiles).
+SPECTRUM history is partitioned by [`~CacheMixin.cache_context`]. Profiles are route-specific.
+
+For adaptive schedules, the optional `max_consecutive_forecast_steps` guard limits forecast-run length by promoting
+midpoint positions in overlong forecast runs to full-compute steps until the configured limit is satisfied. The guard
+is disabled by default and cannot be combined with `forecast_step_indices`. Its useful value is model-, scheduler-,
+and route-specific rather than a portable default.
+
+Fork-qualified measurements and route-specific presets are tracked separately in
+[Fork-qualified cache profiles](qualified_cache_profiles).
 
 ## MagCache
 
