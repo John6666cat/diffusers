@@ -1211,15 +1211,21 @@ class StableDiffusionXLPipeline(
                 # [Neuron] pre-cast timestep to float32 on device. Neuron XLA does not support
                 # int64 ops; the compiled UNet graph requires a float32 timestep input on-device.
                 t_unet = t.to(torch.float32).to(device) if is_neuron_device else t
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t_unet,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "num_inference_steps": self._num_timesteps,
+                    "timestep": t,
+                }
+                with self.unet.cache_context("cond_uncond", **cache_context_kwargs):
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t_unet,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 # perform guidance
                 if self.do_classifier_free_guidance:

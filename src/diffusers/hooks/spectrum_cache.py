@@ -15,7 +15,7 @@
 import inspect
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -90,6 +90,11 @@ class SpectrumCacheConfig:
         tail_actual_steps (`int`, defaults to `0`):
             Number of final denoising steps forced to full compute. This is a generic quality guard; the default `0`
             preserves the source-faithful refresh schedule.
+        max_consecutive_forecast_steps (`int`, *optional*):
+            Maximum forecast-run length for the adaptive schedule. Longer runs are compiled before inference by
+            promoting the midpoint of each overlong run to real compute until the limit is satisfied. The default
+            `None` preserves every existing qualified schedule. This guard cannot be combined with an explicit
+            `forecast_step_indices` schedule.
         forecast_step_indices (`tuple[int, ...]`, *optional*):
             Explicit denoising-step indices to forecast. When provided, these indices replace the adaptive refresh
             schedule while preserving all forecaster settings. This is useful for route-qualified sparse schedules.
@@ -129,6 +134,7 @@ class SpectrumCacheConfig:
     coordinate_policy: str = "legacy_fixed_max"
     coordinate_max: float = 50.0
     tail_actual_steps: int = 0
+    max_consecutive_forecast_steps: int | None = None
     forecast_step_indices: tuple[int, ...] | None = None
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
@@ -169,6 +175,37 @@ class SpectrumCacheConfig:
             coordinate_policy="legacy_fixed_max",
             coordinate_max=50.0,
             tail_actual_steps=3,
+        )
+
+
+    @classmethod
+    def for_sdxl_variable(cls, num_inference_steps: int = 24) -> "SpectrumCacheConfig":
+        """Build the opt-in ordinary SDXL variable-step profile qualified by Gate E.
+
+        This profile retains the ordinary SDXL predictor coefficients while using
+        ``runtime_index_normalized`` coordinates and a measured max-three consecutive
+        forecast guard. The guard is compiled from the actual configured logical-step
+        count and only promotes real forwards; it never adds forecast positions.
+
+        Qualification covered ordinary SDXL Euler runs at 16/24/28/32/36/40 steps,
+        with 20 steps used as a schedule-identity control. Other schedulers, PAG,
+        conservative mode, distilled/few-step routes, and unmeasured step counts remain
+        separately qualified or experimental.
+
+        The historical :meth:`for_sdxl` profile remains unchanged and legacy-pinned.
+        """
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=6,
+            window_size=2.0,
+            flex_window=0.75,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.60,
+            coordinate_policy="runtime_index_normalized",
+            coordinate_max=50.0,
+            tail_actual_steps=3,
+            max_consecutive_forecast_steps=3,
         )
 
     @classmethod
@@ -273,6 +310,17 @@ class SpectrumCacheConfig:
             raise ValueError("tail_actual_steps must be >= 0")
         if self.tail_actual_steps > self.num_inference_steps:
             raise ValueError("tail_actual_steps must be <= num_inference_steps")
+        if self.max_consecutive_forecast_steps is not None:
+            if (
+                isinstance(self.max_consecutive_forecast_steps, bool)
+                or not isinstance(self.max_consecutive_forecast_steps, int)
+                or self.max_consecutive_forecast_steps < 1
+            ):
+                raise ValueError("max_consecutive_forecast_steps must be an integer >= 1 when provided")
+            if self.forecast_step_indices is not None:
+                raise ValueError(
+                    "max_consecutive_forecast_steps cannot be combined with forecast_step_indices"
+                )
         if self.forecast_step_indices is not None:
             indices = tuple(int(step) for step in self.forecast_step_indices)
             if len(set(indices)) != len(indices):
@@ -297,11 +345,45 @@ class SpectrumSchedule:
         self._explicit_forecast_steps = (
             frozenset(config.forecast_step_indices) if config.forecast_step_indices is not None else None
         )
+        self._guarded_forecast_steps = (
+            self._compile_guarded_forecast_steps()
+            if self._explicit_forecast_steps is None and config.max_consecutive_forecast_steps is not None
+            else None
+        )
         self.reset()
 
     def reset(self) -> None:
         self.cached_run_length = 0
         self.current_window = float(self.config.window_size)
+
+    def _compile_guarded_forecast_steps(self) -> frozenset[int]:
+        base_config = replace(self.config, max_consecutive_forecast_steps=None)
+        base_schedule = SpectrumSchedule(base_config)
+        compute_mask = [base_schedule.decide(step) for step in range(self.config.num_inference_steps)]
+        max_run = int(self.config.max_consecutive_forecast_steps)
+
+        while True:
+            start = None
+            overlong = None
+            for step, should_compute in enumerate(compute_mask):
+                if not should_compute and start is None:
+                    start = step
+                if should_compute and start is not None:
+                    if step - start > max_run:
+                        overlong = (start, step - 1)
+                        break
+                    start = None
+            if overlong is None and start is not None:
+                if len(compute_mask) - start > max_run:
+                    overlong = (start, len(compute_mask) - 1)
+
+            if overlong is None:
+                break
+
+            first, last = overlong
+            compute_mask[(first + last) // 2] = True
+
+        return frozenset(step for step, should_compute in enumerate(compute_mask) if not should_compute)
 
     def decide(self, step_index: int) -> bool:
         if self.config.tail_actual_steps and step_index >= self.config.num_inference_steps - self.config.tail_actual_steps:
@@ -310,6 +392,8 @@ class SpectrumSchedule:
 
         if self._explicit_forecast_steps is not None:
             return step_index not in self._explicit_forecast_steps
+        if self._guarded_forecast_steps is not None:
+            return step_index not in self._guarded_forecast_steps
 
         should_compute = True
         if step_index >= self.config.warmup_steps:
@@ -2344,7 +2428,15 @@ class SpectrumUNetDenoiserHook(ModelHook):
             finally:
                 state.bypass = False
 
-        state.start_step()
+        if state.config.coordinate_policy == "runtime_index_normalized":
+            context = self.state_manager.context
+            state.start_step(
+                logical_step_index=context.step_index,
+                runtime_num_inference_steps=context.num_inference_steps,
+                provenance_source=f"cache_context:{context.name}",
+            )
+        else:
+            state.start_step()
         if state.should_compute:
             return self.fn_ref.original_forward(*args, **kwargs)
 

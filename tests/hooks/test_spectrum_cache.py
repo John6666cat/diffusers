@@ -139,3 +139,49 @@ def test_spectrum_hunyuan_video15_profile_factory():
     assert (config.num_inference_steps, config.history_limit) == (50, 8)
     assert (config.degree, config.ridge_lambda, config.blend_w) == (4, 0.1, 0.5)
     assert config.forecast_step_indices == (20, 22, 24, 27, 32, 34, 36, 38, 40, 42)
+@pytest.mark.parametrize(
+    ("steps", "expected_compute"),
+    [
+        (16, [0, 1, 2, 3, 4, 5, 7, 9, 12, 13, 14, 15]),
+        (20, [0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 17, 18, 19]),
+        (24, [0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 18, 21, 22, 23]),
+        (28, [0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 18, 21, 25, 26, 27]),
+        (32, [0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 18, 21, 23, 26, 29, 30, 31]),
+        (36, [0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 18, 21, 23, 26, 29, 32, 33, 34, 35]),
+        (40, [0, 1, 2, 3, 4, 5, 7, 9, 12, 16, 18, 21, 23, 26, 29, 32, 34, 37, 38, 39]),
+    ],
+)
+def test_spectrum_sdxl_variable_profile_reproduces_gate_e_mc3_schedule(steps, expected_compute):
+    legacy = SpectrumCacheConfig.for_sdxl(num_inference_steps=steps)
+    config = SpectrumCacheConfig.for_sdxl_variable(num_inference_steps=steps)
+
+    assert legacy.coordinate_policy == "legacy_fixed_max"
+    assert legacy.max_consecutive_forecast_steps is None
+    assert config.coordinate_policy == "runtime_index_normalized"
+    assert config.max_consecutive_forecast_steps == 3
+    assert config.forecast_step_indices is None
+
+    schedule = SpectrumSchedule(config)
+    compute = [step for step in range(steps) if schedule.decide(step)]
+    assert compute == expected_compute
+
+    forecast = [step for step in range(steps) if step not in set(compute)]
+    run = 0
+    for step in range(steps):
+        if step in forecast:
+            run += 1
+            assert run <= 3
+        else:
+            run = 0
+
+
+def test_spectrum_max_consecutive_forecast_guard_validation():
+    with pytest.raises(ValueError, match="integer >= 1"):
+        SpectrumCacheConfig(max_consecutive_forecast_steps=0)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        SpectrumCacheConfig(
+            num_inference_steps=4,
+            forecast_step_indices=(1,),
+            max_consecutive_forecast_steps=3,
+        )

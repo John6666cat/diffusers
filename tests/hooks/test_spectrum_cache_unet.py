@@ -258,3 +258,34 @@ def test_spectrum_unet_forecast_failure_falls_back_and_latches(failure_kind):
         assert state.fallback_steps == []
 
     model.disable_cache()
+@torch.no_grad()
+def test_spectrum_unet_runtime_index_consumes_native_cache_context_provenance():
+    model = make_tiny_unet()
+    inputs = make_inputs()
+    second_inputs = dict(inputs)
+    second_inputs["sample"] = inputs["sample"] + 0.2
+
+    config = SpectrumCacheConfig(
+        num_inference_steps=2,
+        warmup_steps=1,
+        degree=1,
+        coordinate_policy="runtime_index_normalized",
+        forecast_step_indices=(1,),
+    )
+    model.enable_cache(config)
+
+    with model.cache_context("cond_uncond", step_index=0, num_inference_steps=2, timestep=torch.tensor(10)):
+        _ = model(**inputs).sample
+    with model.cache_context("cond_uncond", step_index=1, num_inference_steps=2, timestep=torch.tensor(9)):
+        forecast = model(**second_inputs).sample
+
+    state = model._diffusers_hook.get_hook(_SPECTRUM_DENOISER_HOOK).state_manager._state_cache["cond_uncond"]
+    summary = state.coordinate_summary()
+
+    assert torch.isfinite(forecast).all()
+    assert state.compute_steps == [0]
+    assert state.forecast_steps == [1]
+    assert summary["failure_latched"] is False
+    assert summary["provenance_source"] == "cache_context:cond_uncond"
+    assert summary["runtime_num_inference_steps"] == 2
+    assert summary["last_logical_step_index"] == 1
