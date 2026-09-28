@@ -269,6 +269,36 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_qwen_image_variable(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
+        """Build the opt-in Qwen-Image variable-step profile.
+
+        The profile preserves the historical conservative 20-step Qwen geometry while using
+        native runtime ``i/N`` provenance and ``runtime_horizon_normalized`` coordinates.
+        Qualification anchors cover Qwen-Image-2512 T2I at 16/20/24/30/40 steps and the
+        Qwen-Image-Edit-2511 single-reference EditPlus route at 16/20/40 steps. The public
+        factory is intentionally bounded to 16..40 steps; values outside that interval remain
+        unqualified.
+        """
+        if not 16 <= num_inference_steps <= 40:
+            raise ValueError("for_qwen_image_variable requires 16 <= num_inference_steps <= 40")
+
+        warmup_steps = max(1, math.floor(0.30 * num_inference_steps + 0.5))
+        tail_actual_steps = max(1, math.floor(0.20 * num_inference_steps + 0.5))
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=warmup_steps,
+            window_size=2.0,
+            flex_window=0.25,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=20.0,
+            tail_actual_steps=tail_actual_steps,
+        )
+
+    @classmethod
     def for_hunyuan_video15(cls) -> "SpectrumCacheConfig":
         """Build the qualified HunyuanVideo 1.5 480p T2V 50-step SPECTRUM profile.
 
@@ -828,7 +858,10 @@ class SpectrumState(BaseState):
                 f"route-owned logical step {self.step_index} outside configured inference-step range "
                 f"{self.config.num_inference_steps}"
             )
-        elif self.config.coordinate_policy == "runtime_index_normalized":
+        elif self.config.coordinate_policy in {
+            "runtime_index_normalized",
+            "runtime_horizon_normalized",
+        }:
             self._validate_coordinate_provenance(
                 logical_step_index=logical_step_index,
                 runtime_num_inference_steps=runtime_num_inference_steps,
@@ -1452,7 +1485,12 @@ class SpectrumHeadBlockHook(ModelHook):
             raise RuntimeError("SPECTRUM head-block metadata is unavailable.")
 
         hidden_states, encoder_hidden_states = _get_block_inputs(self._metadata, args, kwargs)
-        state.start_step()
+        context = self.state_manager.context
+        state.start_step(
+            logical_step_index=context.step_index,
+            runtime_num_inference_steps=context.num_inference_steps,
+            provenance_source="cache_context",
+        )
         if state.should_compute:
             return self.fn_ref.original_forward(*args, **kwargs)
 

@@ -254,3 +254,175 @@ def test_spectrum_qwenimage_rejects_unqualified_architecture_at_enable():
         assert "Qwen-Image-2512 T2I and Qwen-Image-Edit-2511 transformer architectures" in str(error)
     else:
         raise AssertionError("Expected unqualified Qwen-Image architecture to be rejected.")
+
+
+
+def make_runtime_index_config(num_inference_steps):
+    return SpectrumCacheConfig(
+        num_inference_steps=num_inference_steps,
+        warmup_steps=3,
+        window_size=2.0,
+        flex_window=0.0,
+        degree=2,
+        ridge_lambda=0.1,
+        blend_w=0.5,
+        history_limit=12,
+        coordinate_policy="runtime_index_normalized",
+        coordinate_max=50.0,
+        tail_actual_steps=1,
+    )
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_t2i_runtime_index_uses_native_cache_context_provenance():
+    num_inference_steps = 8
+    model = make_model()
+    model.enable_cache(make_runtime_index_config(num_inference_steps))
+    for step in range(num_inference_steps):
+        with model.cache_context("cond", step_index=step, num_inference_steps=num_inference_steps):
+            output = model(**make_inputs(step))
+        assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    summary = root.state_manager._state_cache["cond"].summary()
+    coordinate = summary["coordinate"]
+    assert coordinate["coordinate_policy"] == "runtime_index_normalized"
+    assert coordinate["provenance_source"] == "cache_context"
+    assert coordinate["runtime_num_inference_steps"] == num_inference_steps
+    assert coordinate["last_logical_step_index"] == num_inference_steps - 1
+    assert coordinate["failure_latched"] is False
+    assert summary["prediction_call_count"] > 0
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_edit_runtime_index_uses_native_cache_context_provenance():
+    num_inference_steps = 8
+    model = make_model(zero_cond_t=True)
+    model.enable_cache(make_runtime_index_config(num_inference_steps))
+    for step in range(num_inference_steps):
+        with model.cache_context("cond", step_index=step, num_inference_steps=num_inference_steps):
+            output = model(**make_inputs(step, edit=True, references=1))
+        assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    assert root.route == "edit"
+    summary = root.state_manager._state_cache["cond"].summary()
+    coordinate = summary["coordinate"]
+    assert coordinate["provenance_source"] == "cache_context"
+    assert coordinate["runtime_num_inference_steps"] == num_inference_steps
+    assert coordinate["last_logical_step_index"] == num_inference_steps - 1
+    assert coordinate["failure_latched"] is False
+    assert summary["prediction_call_count"] > 0
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_runtime_index_cond_uncond_have_independent_provenance():
+    num_inference_steps = 8
+    model = make_model()
+    model.enable_cache(make_runtime_index_config(num_inference_steps))
+    for step in range(num_inference_steps):
+        for label in ("cond", "uncond"):
+            with model.cache_context(label, step_index=step, num_inference_steps=num_inference_steps):
+                output = model(**make_inputs(step))
+            assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    assert set(root.state_manager._state_cache) == {"cond", "uncond"}
+    for label in ("cond", "uncond"):
+        coordinate = root.state_manager._state_cache[label].summary()["coordinate"]
+        assert coordinate["provenance_source"] == "cache_context"
+        assert coordinate["runtime_num_inference_steps"] == num_inference_steps
+        assert coordinate["last_logical_step_index"] == num_inference_steps - 1
+        assert coordinate["failure_latched"] is False
+
+
+
+def make_runtime_horizon_config(num_inference_steps):
+    return SpectrumCacheConfig(
+        num_inference_steps=num_inference_steps,
+        warmup_steps=3,
+        window_size=2.0,
+        flex_window=0.0,
+        degree=2,
+        ridge_lambda=0.1,
+        blend_w=0.5,
+        history_limit=12,
+        coordinate_policy="runtime_horizon_normalized",
+        coordinate_max=50.0,
+        tail_actual_steps=1,
+    )
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_t2i_runtime_horizon_uses_native_cache_context_provenance():
+    num_inference_steps = 8
+    model = make_model()
+    model.enable_cache(make_runtime_horizon_config(num_inference_steps))
+    for step in range(num_inference_steps):
+        with model.cache_context("cond", step_index=step, num_inference_steps=num_inference_steps):
+            output = model(**make_inputs(step))
+        assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    summary = root.state_manager._state_cache["cond"].summary()
+    coordinate = summary["coordinate"]
+    assert coordinate["coordinate_policy"] == "runtime_horizon_normalized"
+    assert coordinate["provenance_source"] == "cache_context"
+    assert coordinate["runtime_num_inference_steps"] == num_inference_steps
+    assert coordinate["last_logical_step_index"] == num_inference_steps - 1
+    assert coordinate["failure_latched"] is False
+    assert summary["prediction_call_count"] > 0
+
+
+@torch.no_grad()
+def test_spectrum_qwenimage_runtime_horizon_missing_provenance_fails_closed():
+    model = make_model()
+    model.enable_cache(make_runtime_horizon_config(8))
+    with model.cache_context("cond"):
+        output = model(**make_inputs(0))
+    assert_finite_sample(output)
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    summary = root.state_manager._state_cache["cond"].summary()
+    coordinate = summary["coordinate"]
+    assert coordinate["failure_latched"] is True
+    assert coordinate["failures"]
+    assert summary["prediction_call_count"] == 0
+
+
+def test_spectrum_qwenimage_variable_factory_preserves_20_step_selected6_identity():
+    from diffusers.hooks.spectrum_cache import SpectrumSchedule
+
+    config = SpectrumCacheConfig.for_qwen_image_variable(20)
+    assert config.warmup_steps == 6
+    assert config.tail_actual_steps == 4
+    assert config.window_size == 2.0
+    assert config.flex_window == 0.25
+    assert config.degree == 4
+    assert config.ridge_lambda == 0.1
+    assert config.blend_w == 0.5
+    assert config.history_limit == 8
+    assert config.coordinate_policy == "runtime_horizon_normalized"
+    assert config.coordinate_max == 20.0
+
+    schedule = SpectrumSchedule(config)
+    forecast = [step for step in range(20) if not schedule.decide(step)]
+    assert forecast == [6, 8, 10, 12, 14, 15]
+
+
+def test_spectrum_qwenimage_variable_factory_scales_protected_regions_and_bounds_range():
+    expected = {16: (5, 3), 20: (6, 4), 24: (7, 5), 30: (9, 6), 40: (12, 8)}
+    for num_steps, (warmup, tail) in expected.items():
+        config = SpectrumCacheConfig.for_qwen_image_variable(num_steps)
+        assert config.num_inference_steps == num_steps
+        assert config.warmup_steps == warmup
+        assert config.tail_actual_steps == tail
+        assert config.coordinate_policy == "runtime_horizon_normalized"
+
+    for num_steps in (15, 41):
+        try:
+            SpectrumCacheConfig.for_qwen_image_variable(num_steps)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected bounded-range rejection for {num_steps}")
