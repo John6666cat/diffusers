@@ -299,6 +299,46 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_wan21_13b_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
+        """Build the opt-in Wan2.1 T2V 1.3B variable-step SPECTRUM profile.
+
+        The profile preserves the historical 50-step ``mid19_keep10`` geometry while
+        scaling only the protected early and tail regions. The interior forecasts two
+        of every three logical steps and uses native CacheContext ``i/N`` provenance
+        with ``runtime_horizon_normalized`` coordinates.
+
+        Qualification anchors cover the pinned Wan2.1 T2V 1.3B text-only route at
+        40/45/50/55/60 steps. The public factory is intentionally bounded to 40..60;
+        values outside that measured interval remain unqualified.
+        """
+        if not 40 <= num_inference_steps <= 60:
+            raise ValueError("for_wan21_13b_variable requires 40 <= num_inference_steps <= 60")
+
+        early_actual_steps = max(1, math.floor(0.22 * num_inference_steps + 0.5))
+        tail_actual_steps = max(1, math.floor(0.20 * num_inference_steps + 0.5))
+        interior_end = num_inference_steps - tail_actual_steps
+        forecast_step_indices = tuple(
+            step
+            for step in range(early_actual_steps, interior_end)
+            if (step - early_actual_steps) % 3 != 1
+        )
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=early_actual_steps,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=100,
+            predictor_backend="dense",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=50.0,
+            tail_actual_steps=tail_actual_steps,
+            forecast_step_indices=forecast_step_indices,
+        )
+
+    @classmethod
     def for_hunyuan_video15(cls) -> "SpectrumCacheConfig":
         """Build the qualified HunyuanVideo 1.5 480p T2V 50-step SPECTRUM profile.
 

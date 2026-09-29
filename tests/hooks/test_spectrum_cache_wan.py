@@ -209,3 +209,66 @@ def test_spectrum_wan_rejects_image_conditioned_architecture_at_enable():
         assert "text-only Wan2.1 T2V 1.3B route" in str(error)
     else:
         raise AssertionError("Expected image-conditioned Wan architecture to be rejected.")
+
+
+
+def test_spectrum_wan21_13b_variable_factory_preserves_measured_schedule_geometry_and_bounds():
+    expected = {
+        40: (9, 8, (9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30)),
+        45: (10, 9, (10, 12, 13, 15, 16, 18, 19, 21, 22, 24, 25, 27, 28, 30, 31, 33, 34)),
+        50: (11, 10, (11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38)),
+        55: (12, 11, (12, 14, 15, 17, 18, 20, 21, 23, 24, 26, 27, 29, 30, 32, 33, 35, 36, 38, 39, 41, 42)),
+        60: (13, 12, (13, 15, 16, 18, 19, 21, 22, 24, 25, 27, 28, 30, 31, 33, 34, 36, 37, 39, 40, 42, 43, 45, 46)),
+    }
+    for steps, (warmup, tail, forecast) in expected.items():
+        config = SpectrumCacheConfig.for_wan21_13b_variable(steps)
+        assert config.num_inference_steps == steps
+        assert config.warmup_steps == warmup
+        assert config.tail_actual_steps == tail
+        assert config.forecast_step_indices == forecast
+        assert config.coordinate_policy == "runtime_horizon_normalized"
+        assert config.coordinate_max == 50.0
+        assert config.history_limit == 100
+        assert config.predictor_backend == "dense"
+
+    for steps in (39, 61):
+        try:
+            SpectrumCacheConfig.for_wan21_13b_variable(steps)
+        except ValueError as error:
+            assert "40 <= num_inference_steps <= 60" in str(error)
+        else:
+            raise AssertionError(f"expected bounded-range rejection for {steps}")
+
+
+@torch.no_grad()
+def test_spectrum_wan21_13b_variable_factory_uses_native_cond_uncond_runtime_provenance():
+    num_inference_steps = 40
+    model = make_model()
+    config = SpectrumCacheConfig.for_wan21_13b_variable(num_inference_steps)
+    model.enable_cache(config)
+
+    for step in range(num_inference_steps):
+        for label in ("cond", "uncond"):
+            inputs = make_inputs()
+            inputs["timestep"] = torch.tensor([1.0 - step / num_inference_steps])
+            with model.cache_context(
+                label,
+                step_index=step,
+                num_inference_steps=num_inference_steps,
+            ):
+                output = model(**inputs).sample
+            assert torch.isfinite(output).all()
+
+    root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+    assert set(root.state_manager._state_cache) == {"cond", "uncond"}
+    for label in ("cond", "uncond"):
+        summary = root.state_manager._state_cache[label].summary()
+        coordinate = summary["coordinate"]
+        assert coordinate["coordinate_policy"] == "runtime_horizon_normalized"
+        assert coordinate["provenance_source"] == "cache_context"
+        assert coordinate["runtime_num_inference_steps"] == num_inference_steps
+        assert coordinate["last_logical_step_index"] == num_inference_steps - 1
+        assert coordinate["failure_latched"] is False
+        assert summary["guard_latched"] is False
+        assert summary["prediction_failure_latched"] is False
+        assert summary["prediction_call_count"] == len(config.forecast_step_indices)

@@ -176,6 +176,59 @@ Long-temporal checks retained 121 frames and 50 steps while reducing only spatia
 > [!WARNING]
 > These are fork-specific research profiles, not portable defaults. They were qualified with the fixed ratio curve above, the pinned HunyuanVideo 1.5 checkpoint, sequential CFG, the project NF4/BF16 representation, and the tested scheduler/step count. The generic sequential-CFG calibration guidance above recommends the first conditional array in most cases; changing this Hunyuan profile's qualified ratio policy, checkpoint, scheduler, guidance topology, precision/quantization, attention backend, adapters, or denoising-step count requires requalification. A full 480x848 / 121-frame Cartesian confirmation was not required for this research closure.
 
+## Wan2.1 T2V 1.3B variable-step SPECTRUM profile
+
+This fork qualifies an opt-in variable-step SPECTRUM profile for the pinned
+`Wan-AI/Wan2.1-T2V-1.3B-Diffusers` revision
+`0fad780a534b6463e45facd96134c9f345acfa5b` on the text-only T2V route. Wan's
+native denoising loop supplies separate `cache_context("cond")` and
+`cache_context("uncond")` lanes with logical `step_index` and runtime step-count
+provenance.
+
+```python
+from diffusers import SpectrumCacheConfig
+
+num_inference_steps = 50
+config = SpectrumCacheConfig.for_wan21_13b_variable(num_inference_steps)
+pipe.transformer.enable_cache(config)
+video = pipe(
+    prompt_embeds=prompt_embeds,
+    negative_prompt_embeds=negative_prompt_embeds,
+    num_inference_steps=num_inference_steps,
+).frames[0]
+```
+
+The factory is intentionally bounded to `40 <= num_inference_steps <= 60` and uses:
+
+- `coordinate_policy="runtime_horizon_normalized"` (`2*i/N - 1`);
+- protected early real steps `round(0.22*N)`;
+- protected tail real steps `round(0.20*N)`;
+- an explicit interior schedule that forecasts two of every three steps;
+- `degree=4`, `ridge_lambda=0.1`, `blend_w=0.5`, `history_limit=100`;
+- the dense predictor backend used by the qualification run.
+
+At N=50 this reproduces the historical `mid19_keep10` forecast positions exactly:
+`[11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38]`.
+
+Qualification anchors covered N=40/45/50/55/60, three fixed prompts, 192x320,
+81 frames, sequential CFG, the project NF4/FP16-compute runtime representation,
+and fixed exact-source UMT5 conditioning. Across all 15 measured latent comparisons,
+mean cosine was about `0.997870`, worst cosine `0.996628`, mean normalized RMSE
+`0.06207`, and mean measured wall-time speedup `1.583x` (worst `1.520x`). The N=45/55
+bounded confirmation also decoded full videos; its mean video PSNR was about
+`36.17 dB`, with worst full-video PSNR `29.85 dB`. Start/end latent canaries remained exact,
+and no SPECTRUM guard, coordinate, or prediction fallback latched.
+
+`for_wan21_13b_variable()` is an explicit opt-in profile. It does not change the
+historical generic SPECTRUM defaults or the separately qualified Wan MagCache profiles.
+
+> [!WARNING]
+> This qualification is route- and environment-specific. It does not establish Wan 14B,
+> Wan2.2, I2V/VACE/image-conditioned routes, arbitrary step counts outside 40..60,
+> alternate schedulers/guidance topology, LoRA/adapters, non-empty attention kwargs,
+> different precision/quantization, or different conditioning as qualified. Revalidate
+> those changes separately.
+
 ## Wan2.1 T2V 1.3B MagCache profiles
 
 The project bounded-reopened native MagCache for the pinned `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` revision `0fad780a534b6463e45facd96134c9f345acfa5b`. Wan already exposes separate `cache_context("cond")` and `cache_context("uncond")` scopes, and the qualified MagCache run followed the sequential-CFG guidance above by using the first, conditional calibration array.
