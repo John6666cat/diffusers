@@ -530,9 +530,14 @@ class ZImagePipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMix
                 latent_model_input = latent_model_input.unsqueeze(2)
                 latent_model_input_list = list(latent_model_input.unbind(dim=0))
 
-                model_out_list = self.transformer(
-                    latent_model_input_list, timestep_model_input, prompt_embeds_model_input, return_dict=False
-                )[0]
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "num_inference_steps": self._num_timesteps,
+                }
+                with self.transformer.cache_context("cond_uncond", **cache_context_kwargs):
+                    model_out_list = self.transformer(
+                        latent_model_input_list, timestep_model_input, prompt_embeds_model_input, return_dict=False
+                    )[0]
 
                 if apply_cfg:
                     # Perform CFG

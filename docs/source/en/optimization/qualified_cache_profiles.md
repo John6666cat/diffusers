@@ -282,6 +282,63 @@ In the final same-run 192x320 / 81-frame / 50-step L4/NF4 confirmation, the exis
 > [!WARNING]
 > These measurements are environment- and route-specific. The profiles are qualified only for the pinned Wan2.1 1.3B text-only T2V route, 50-step sequential CFG, corrected zero-tail conditioning contract, and the tested NF4/FP16-compute representation. Recalibrate and revalidate for Wan 14B, Wan2.2, I2V/VACE or image conditioning, a different scheduler or step count, LoRA/adapters, attention kwargs, precision/quantization, or a changed guidance topology.
 
+## Z-Image Base variable-step SPECTRUM profile
+
+This fork qualifies an opt-in variable-step SPECTRUM profile for the pinned
+`Tongyi-MAI/Z-Image` revision `aa9e0836a9ca3bd891d531de8bdc682140edf325`
+on the standard Z-Image Base text-to-image route. The qualification used the
+serialized private NF4 runtime
+`John6666/_spectrum_test_model@0458754d0a978a92cccf83c1f23576cda693e307`.
+
+The pipeline now supplies native fused-CFG cache provenance through
+`cache_context("cond_uncond", step_index=i, num_inference_steps=N)` around the
+transformer call. The opt-in profile uses that runtime horizon directly:
+
+```python
+from diffusers import SpectrumCacheConfig
+
+num_inference_steps = 28
+config = SpectrumCacheConfig.for_zimage_base_variable(num_inference_steps)
+pipe.transformer.enable_cache(config)
+image = pipe(prompt, num_inference_steps=num_inference_steps).images[0]
+```
+
+The factory is intentionally bounded to `20 <= num_inference_steps <= 40` and
+preserves the historical 28-step `aggressive8` geometry as its identity anchor:
+
+- `early(N) = round_half_up(9*N/28)` protected real steps;
+- `tail(N) = round_half_up(4*N/28)` protected real steps;
+- forecast every other logical step in the measured interior;
+- `degree=3`, `ridge_lambda=0.1`, `blend_w=0.5`, `history_limit=28`;
+- `coordinate_policy="runtime_horizon_normalized"` (`2*i/N - 1`);
+- `coordinate_max=28.0` retained for the historical profile's coefficient geometry;
+- dense predictor backend.
+
+At N=28 the factory reproduces the historical forecast positions exactly:
+`[9, 11, 13, 15, 17, 19, 21, 23]`. The historical fixed 28-step profile remains
+unchanged and separate.
+
+Promotion qualification covered N=20/24/28/32/36/40 across the historical
+four-case suite (wide spatial composition, square bilingual typography,
+portrait/person, and landscape/interior), with matched starting latents and
+full decoded-image comparison. Across the 24 candidate cells, mean measured
+speedup was about `1.354x` and the minimum was `1.334x`. Mean latent cosine was
+about `0.98352`, worst latent cosine `0.96855`, mean decoded-image PSNR
+`26.37 dB`, and worst decoded-image PSNR `22.98 dB`. The sealed N=28 baseline
+and candidate latent hashes reproduced the prior broad run exactly for all four
+cases. No SPECTRUM guard, prediction, or coordinate-provenance failure latched.
+
+`for_zimage_base_variable()` is an explicit opt-in profile. It does not change
+the historical fixed Z-Image Base profile or the separately qualified
+SPECTRUM + FirstBlockCache composition profile below.
+
+> [!WARNING]
+> This qualification is route- and environment-specific. It does not establish
+> Z-Image Turbo, img2img, inpaint, Omni/nested-image, ControlNet, SigLIP,
+> image-noise-mask, alternate patch geometry, arbitrary step counts outside
+> 20..40, alternate schedulers/CFG topology, LoRA/adapters, or different
+> precision/quantization as qualified. Revalidate those changes separately.
+
 ## Z-Image Base SPECTRUM + FirstBlockCache conservative profile
 
 The project qualified a conservative nested-cache profile for the pinned

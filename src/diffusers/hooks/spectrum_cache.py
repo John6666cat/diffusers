@@ -299,6 +299,43 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_zimage_base_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """Build the opt-in Z-Image Base variable-step SPECTRUM profile.
+
+        The historical 28-step ``aggressive8`` geometry is the identity anchor. The
+        protected early and tail regions scale from 9/28 and 4/28 using round-half-up,
+        while the measured interior forecasts every other logical step. Native Z-Image
+        ``CacheContext`` provenance supplies the logical index and runtime horizon for
+        ``runtime_horizon_normalized`` coordinates.
+
+        Qualification anchors cover the pinned Z-Image Base route at
+        20/24/28/32/36/40 steps. The public factory is intentionally bounded to 20..40;
+        values outside that measured interval remain unqualified.
+        """
+        if not 20 <= num_inference_steps <= 40:
+            raise ValueError("for_zimage_base_variable requires 20 <= num_inference_steps <= 40")
+
+        early_actual_steps = max(1, math.floor(9 * num_inference_steps / 28 + 0.5))
+        tail_actual_steps = max(1, math.floor(4 * num_inference_steps / 28 + 0.5))
+        interior_end = num_inference_steps - tail_actual_steps
+        forecast_step_indices = tuple(range(early_actual_steps, interior_end, 2))
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=early_actual_steps,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=3,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=28,
+            predictor_backend="dense",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=28.0,
+            tail_actual_steps=tail_actual_steps,
+            forecast_step_indices=forecast_step_indices,
+        )
+
+    @classmethod
     def for_wan21_13b_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
         """Build the opt-in Wan2.1 T2V 1.3B variable-step SPECTRUM profile.
 
