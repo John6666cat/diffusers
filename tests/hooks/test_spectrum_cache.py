@@ -185,3 +185,43 @@ def test_spectrum_max_consecutive_forecast_guard_validation():
             forecast_step_indices=(1,),
             max_consecutive_forecast_steps=3,
         )
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected_forecast", "expected_predictor", "expected_body_calls"),
+    [
+        (20, (8, 10, 12, 13, 15, 16), (100, 4, 0.55), 14),
+        (24, (6, 8, 10, 11, 13, 14, 15, 17, 18, 20), (100, 4, 0.55), 14),
+        (28, (6, 8, 10, 11, 13, 15, 17, 19, 20, 22, 23, 24), (100, 4, 0.55), 16),
+        (32, (6, 8, 10, 11, 13, 14, 15, 17, 19, 20, 22, 23, 24, 25, 27, 28), (100, 4, 0.55), 16),
+        (36, (6, 8, 10, 11, 13, 15, 17, 18, 20, 22, 23, 25, 27, 29, 30, 31), (100, 4, 0.55), 20),
+        (40, (6, 8, 10, 11, 13, 15, 17, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 31, 33, 34, 35, 36), (4, 3, 0.65), 18),
+    ],
+)
+def test_spectrum_sd15_variable_euler_profile_reproduces_locked_operating_table(
+    steps, expected_forecast, expected_predictor, expected_body_calls
+):
+    config = SpectrumCacheConfig.for_sd15_variable(num_inference_steps=steps)
+
+    assert config.coordinate_policy == "legacy_fixed_max"
+    assert config.coordinate_max == 50.0
+    assert config.tail_actual_steps == 3
+    assert config.max_consecutive_forecast_steps is None
+    assert config.forecast_step_indices == expected_forecast
+    assert (config.history_limit, config.degree, config.blend_w) == expected_predictor
+    assert config.ridge_lambda == 0.05
+
+    schedule = SpectrumSchedule(config)
+    compute = [step for step in range(steps) if schedule.decide(step)]
+    forecast = [step for step in range(steps) if step not in set(compute)]
+
+    assert forecast == list(expected_forecast)
+    assert len(compute) == expected_body_calls
+    assert compute[:6] == list(range(6))
+    assert compute[-3:] == list(range(steps - 3, steps))
+
+
+@pytest.mark.parametrize("steps", [16, 18, 21, 30, 44])
+def test_spectrum_sd15_variable_euler_profile_rejects_unqualified_step_counts(steps):
+    with pytest.raises(ValueError, match="qualified only for Euler runs"):
+        SpectrumCacheConfig.for_sd15_variable(num_inference_steps=steps)

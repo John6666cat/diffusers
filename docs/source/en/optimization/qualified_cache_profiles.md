@@ -59,6 +59,63 @@ measured regression was `-0.345157 dB`.
 > unmeasured step counts, or few-step/distilled routes. Revalidate when changing the checkpoint, scheduler, guidance
 > topology, precision/quantization, attention backend, adapters, conditioning path, or denoising-step regime.
 
+
+## SD1.5 ordinary variable-step Euler SPECTRUM profile
+
+This fork qualifies an opt-in variable-step SPECTRUM profile for ordinary Stable Diffusion 1.5
+text-to-image inference with the Euler scheduler. The historical `for_sd15()` profile remains
+unchanged.
+
+Stable Diffusion now supplies native fused-CFG cache provenance around each UNet denoiser call.
+The cache context uses the logical call index and the pipeline's actual denoiser-call horizon,
+rather than assuming the user-requested scheduler step count. This keeps cache provenance exact
+for schedulers whose timestep list may contain a different number of UNet calls.
+
+```python
+from diffusers import EulerDiscreteScheduler, SpectrumCacheConfig
+
+num_inference_steps = 32
+pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+config = SpectrumCacheConfig.for_sd15_variable(num_inference_steps)
+pipe.unet.enable_cache(config)
+
+image = pipe(
+    prompt,
+    num_inference_steps=num_inference_steps,
+).images[0]
+```
+
+The factory is intentionally discrete rather than interpolated. It is qualified only for
+`20/24/28/32/36/40` denoiser calls and preserves:
+
+- `coordinate_policy="legacy_fixed_max"` with `coordinate_max=50.0`;
+- `warmup_steps=6`;
+- `tail_actual_steps=3`;
+- `ridge_lambda=0.05`;
+- explicit path-aware forecast positions locked independently before promotion qualification.
+
+For 20/24/28/32/36 calls the predictor keeps the historical SD1.5 settings
+`history_limit=100`, `degree=4`, `blend_w=0.55`. The independently selected 40-call operating
+point uses `history_limit=4`, `degree=3`, `blend_w=0.65`.
+
+The promotion qualification used 144 fresh cells: 24 prompt families across
+20/24/28/32/36/40 calls. Relative to the historical SPECTRUM profile, the locked operating
+profile measured mean image-PSNR delta `+0.9556 dB`, median `+0.2302 dB`, and a 75.69% PSNR
+win rate. Mean MAE delta was `-0.8268` with an 83.33% MAE win rate. Every step-count subgroup
+had positive mean PSNR delta and no structural failure occurred.
+
+This is a quality-oriented acceleration profile, not a same-body-call-budget replacement.
+In the qualification environment the locked operating profile averaged about 1.216 s,
+the historical SPECTRUM profile about 1.097 s, and the uncached baseline about 2.032 s.
+
+> [!WARNING]
+> This qualification is specific to the measured ordinary SD1.5 text-to-image route with the
+> Euler scheduler and exactly 20/24/28/32/36/40 denoiser calls. It does not establish PNDM,
+> DDIM or other schedulers, arbitrary step counts, distilled/few-step routes, ControlNet,
+> T2I-Adapter, IP-Adapter, LoRA/non-default PEFT scale, alternate precision/quantization,
+> changed attention backends, or other conditioning topologies as qualified. Revalidate those
+> changes separately.
+
 ## FLUX.2 Klein Base 4B SPECTRUM profile
 
 The retained FLUX.2 Klein Base 4B profile is qualified for

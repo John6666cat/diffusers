@@ -234,6 +234,58 @@ class SpectrumCacheConfig:
             tail_actual_steps=3,
         )
 
+
+    @classmethod
+    def for_sd15_variable(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
+        """Build the opt-in ordinary SD1.5 variable-step Euler profile.
+
+        This profile uses a locked path-aware forecast schedule selected offline and
+        independently promotion-qualified on the pinned ordinary SD1.5 Euler route.
+        The historical ``legacy_fixed_max`` predictor coordinate is preserved.
+
+        Qualification covers exactly 20/24/28/32/36/40 denoiser calls. The 40-step
+        profile uses a shorter history and lower-degree predictor selected by the
+        locked operating table; the other qualified step counts retain the historical
+        SD1.5 predictor coefficients.
+
+        Other schedulers, step counts, distilled/few-step routes, and special
+        conditioning paths remain separately qualified or experimental. The historical
+        :meth:`for_sd15` profile remains unchanged and legacy-pinned.
+        """
+        forecast_steps_by_count = {
+            20: (8, 10, 12, 13, 15, 16),
+            24: (6, 8, 10, 11, 13, 14, 15, 17, 18, 20),
+            28: (6, 8, 10, 11, 13, 15, 17, 19, 20, 22, 23, 24),
+            32: (6, 8, 10, 11, 13, 14, 15, 17, 19, 20, 22, 23, 24, 25, 27, 28),
+            36: (6, 8, 10, 11, 13, 15, 17, 18, 20, 22, 23, 25, 27, 29, 30, 31),
+            40: (6, 8, 10, 11, 13, 15, 17, 18, 19, 20, 22, 23, 24, 25, 27, 28, 29, 31, 33, 34, 35, 36),
+        }
+        if num_inference_steps not in forecast_steps_by_count:
+            raise ValueError(
+                "for_sd15_variable is qualified only for Euler runs with "
+                "num_inference_steps in {20, 24, 28, 32, 36, 40}"
+            )
+
+        predictor = (
+            {"history_limit": 4, "degree": 3, "blend_w": 0.65}
+            if num_inference_steps == 40
+            else {"history_limit": 100, "degree": 4, "blend_w": 0.55}
+        )
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=6,
+            window_size=2.0,
+            flex_window=0.75,
+            degree=predictor["degree"],
+            ridge_lambda=0.05,
+            blend_w=predictor["blend_w"],
+            history_limit=predictor["history_limit"],
+            coordinate_policy="legacy_fixed_max",
+            coordinate_max=50.0,
+            tail_actual_steps=3,
+            forecast_step_indices=forecast_steps_by_count[num_inference_steps],
+        )
+
     @classmethod
     def for_anima_variable(cls, num_inference_steps: int = 30) -> "SpectrumCacheConfig":
         """Build the opt-in ordinary Anima variable-step profile.

@@ -364,6 +364,35 @@ class TestStableDiffusionPipeline(StableDiffusionPipelineTesterConfig, PipelineT
         # fmt: on
         assert_tensors_close(image[0, -1, -3:, -3:].flatten(), expected_slice, atol=1e-2)
 
+    def test_stable_diffusion_cache_context_uses_actual_denoiser_call_horizon(self, monkeypatch):
+        requested_steps = 2
+
+        def run_case(scheduler_factory, expected_calls):
+            sd_pipe = self.get_pipeline()
+            sd_pipe.scheduler = scheduler_factory(sd_pipe)
+            observed = []
+            original_cache_context = sd_pipe.unet.cache_context
+
+            def recording_cache_context(name, **kwargs):
+                observed.append({"name": name, **kwargs})
+                return original_cache_context(name, **kwargs)
+
+            monkeypatch.setattr(sd_pipe.unet, "cache_context", recording_cache_context)
+            inputs = self.get_dummy_inputs()
+            inputs["num_inference_steps"] = requested_steps
+            sd_pipe(**inputs)
+
+            assert len(sd_pipe.scheduler.timesteps) == expected_calls
+            assert sd_pipe.num_timesteps == expected_calls
+            assert len(observed) == expected_calls
+            assert [entry["name"] for entry in observed] == ["cond_uncond"] * expected_calls
+            assert [entry["step_index"] for entry in observed] == list(range(expected_calls))
+            assert {entry["num_inference_steps"] for entry in observed} == {expected_calls}
+            assert [int(entry["timestep"]) for entry in observed] == [int(t) for t in sd_pipe.scheduler.timesteps]
+
+        run_case(lambda pipe: EulerDiscreteScheduler.from_config(pipe.scheduler.config), requested_steps)
+        run_case(lambda pipe: PNDMScheduler(skip_prk_steps=True), requested_steps + 1)
+
     def test_stable_diffusion_negative_prompt(self):
         # Run on CPU: the expected slice below is CPU-specific.
         components = self.get_dummy_components()
