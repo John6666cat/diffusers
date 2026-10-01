@@ -643,26 +643,38 @@ class Krea2Pipeline(DiffusionPipeline, Krea2LoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = (t / self.scheduler.config.num_train_timesteps).expand(latents.shape[0]).to(latents.dtype)
 
-                noise_pred = self.transformer(
-                    hidden_states=latents,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep,
-                    position_ids=position_ids,
-                    encoder_attention_mask=prompt_embeds_mask,
-                    attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-
-                if self.do_classifier_free_guidance:
-                    neg_noise_pred = self.transformer(
+                with self.transformer.cache_context(
+                    "krea",
+                    step_index=i,
+                    num_inference_steps=len(timesteps),
+                    timestep=t,
+                ):
+                    noise_pred = self.transformer(
                         hidden_states=latents,
-                        encoder_hidden_states=negative_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
                         timestep=timestep,
                         position_ids=position_ids,
-                        encoder_attention_mask=negative_prompt_embeds_mask,
+                        encoder_attention_mask=prompt_embeds_mask,
                         attention_kwargs=self.attention_kwargs,
                         return_dict=False,
                     )[0]
+
+                if self.do_classifier_free_guidance:
+                    with self.transformer.cache_context(
+                        "krea",
+                        step_index=i,
+                        num_inference_steps=len(timesteps),
+                        timestep=t,
+                    ):
+                        neg_noise_pred = self.transformer(
+                            hidden_states=latents,
+                            encoder_hidden_states=negative_prompt_embeds,
+                            timestep=timestep,
+                            position_ids=position_ids,
+                            encoder_attention_mask=negative_prompt_embeds_mask,
+                            attention_kwargs=self.attention_kwargs,
+                            return_dict=False,
+                        )[0]
                     noise_pred = noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
                 # compute the previous noisy sample x_t -> x_t-1

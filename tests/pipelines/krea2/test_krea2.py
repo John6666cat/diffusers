@@ -185,6 +185,42 @@ class TestKrea2Pipeline(Krea2PipelineTesterConfig, PipelineTesterMixin):
             self.get_dummy_inputs = original_get_dummy_inputs
 
 
+
+    def test_krea2_native_cache_context_uses_shared_cfg_context_and_actual_horizon(self):
+        from unittest.mock import patch
+
+        pipe = self.get_pipeline()
+        inputs = self.get_dummy_inputs()
+        calls = []
+        original = pipe.transformer.cache_context
+
+        def recording_cache_context(name, *, step_index=None, num_inference_steps=None, timestep=None):
+            calls.append(
+                {
+                    "name": name,
+                    "step_index": step_index,
+                    "num_inference_steps": num_inference_steps,
+                    "timestep_is_none": timestep is None,
+                }
+            )
+            return original(
+                name,
+                step_index=step_index,
+                num_inference_steps=num_inference_steps,
+                timestep=timestep,
+            )
+
+        with patch.object(pipe.transformer, "cache_context", side_effect=recording_cache_context):
+            image = pipe(**inputs).images
+
+        assert image.shape[0] == 1
+        assert calls == [
+            {"name": "krea", "step_index": 0, "num_inference_steps": 2, "timestep_is_none": False},
+            {"name": "krea", "step_index": 0, "num_inference_steps": 2, "timestep_is_none": False},
+            {"name": "krea", "step_index": 1, "num_inference_steps": 2, "timestep_is_none": False},
+            {"name": "krea", "step_index": 1, "num_inference_steps": 2, "timestep_is_none": False},
+        ]
+
 class TestKrea2PipelineMemory(Krea2PipelineTesterConfig, MemoryTesterMixin):
     """Memory optimization tests (CPU offload, group offload, layerwise casting) for the Krea 2 pipeline."""
 

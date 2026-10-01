@@ -116,6 +116,37 @@ the historical SPECTRUM profile about 1.097 s, and the uncached baseline about 2
 > changed attention backends, or other conditioning topologies as qualified. Revalidate those
 > changes separately.
 
+## Krea 2 Raw variable-step SPECTRUM profile
+
+This fork qualifies an opt-in variable-step profile for Krea 2 Raw text-to-image inference with classifier-free guidance. The Krea pipeline supplies the same native `cache_context("krea")` identity to both sequential CFG transformer calls for a logical denoising step, together with the actual runtime step index and horizon.
+
+```python
+from diffusers import SpectrumCacheConfig
+
+num_inference_steps = 40
+config = SpectrumCacheConfig.for_krea2_raw_variable(num_inference_steps)
+pipe.transformer.enable_cache(config)
+image = pipe(
+    prompt,
+    negative_prompt="",
+    num_inference_steps=num_inference_steps,
+    guidance_scale=3.5,
+).images[0]
+```
+
+The factory is intentionally discrete and accepts only `28/40/52` denoising steps. It uses `coordinate_policy="runtime_horizon_normalized"`, `degree=4`, `ridge_lambda=0.1`, `blend_w=0.5`, `history_limit=8`, dense prediction, and explicit paired-CFG route identity. The locked forecast schedules are:
+
+- 28 steps: `(4, 16, 23)`;
+- 40 steps: `(5, 8, 21, 23, 24, 27, 32, 34)`;
+- 52 steps: `(7, 10, 21, 28, 30, 32, 35, 37, 42, 44)`.
+
+The sealed 1024x1024 qualification used guidance scale 3.5 and a project-controlled NF4/BF16 conversion of `unsloth/Krea-2-Raw` revision `62982f4e78c5f52ec16ec4aea2e8481950b73784`. Across two fresh prompts at each supported step count, all six cells cleared the predeclared image-cosine `>=0.95` and latent-cosine `>=0.93` gates. Worst measured image/latent cosine was `0.978650/0.986398` at 28 steps, `0.971481/0.980962` at 40 steps, and `0.968469/0.978702` at 52 steps. Mean reported speedups were about `1.090x`, `1.241x`, and `1.228x` respectively; speed was report-only.
+
+The historical Krea behavior remains unchanged unless `for_krea2_raw_variable()` is selected.
+
+> [!WARNING]
+> This qualification is specific to Krea 2 Raw, the measured 1024x1024 CFG route, the pinned source representation above, guidance scale 3.5, and exactly 28/40/52 denoising steps. It does not establish Krea 2 Turbo, arbitrary step counts, other resolutions or sampling recipes, different precision/quantization, changed attention backends, adapters, or altered conditioning topology as qualified. Revalidate those changes separately.
+
 ## FLUX.2 Klein Base 4B SPECTRUM profile
 
 The retained FLUX.2 Klein Base 4B profile is qualified for

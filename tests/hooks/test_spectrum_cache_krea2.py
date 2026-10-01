@@ -374,3 +374,164 @@ def test_spectrum_krea2_raw_prediction_failure_latches_both_lanes_and_resets():
     assert state.prediction_failure_latched is False
     assert state.predict_failures == []
     assert state.fallback_steps == []
+
+
+def _krea2_selected_state_cls(config):
+    model = make_model()
+    model.enable_cache(config)
+    try:
+        root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+        return root.state_manager._state_cls
+    finally:
+        model.disable_cache()
+
+
+def test_spectrum_krea2_raw_dual_lane_runtime_coordinate_provenance_accepts_repeated_outer_step():
+    config = SpectrumCacheConfig(
+        num_inference_steps=3,
+        forecast_step_indices=(2,),
+        degree=1,
+        history_limit=3,
+        coordinate_policy="runtime_index_normalized",
+        coordinate_max=3.0,
+    )
+    state = SpectrumKrea2RawState(config)
+    positive = torch.ones(1, 2, 3)
+    negative = torch.full((1, 2, 3), 2.0)
+
+    for step in range(3):
+        for lane, feature in (("positive", positive + step), ("negative", negative + step)):
+            state.prepare_call(lane)
+            state.start_step(
+                logical_step_index=step,
+                runtime_num_inference_steps=3,
+                provenance_source="cache_context:krea",
+            )
+            if state.should_compute:
+                state.record_real_feature(feature)
+
+    summary = state.summary()
+    assert summary["coordinate"]["failure_latched"] is False
+    assert summary["coordinate"]["runtime_num_inference_steps"] == 3
+    assert summary["coordinate"]["last_logical_step_index"] == 2
+    assert summary["compute_steps"] == [0, 1]
+    assert summary["forecast_steps"] == [2]
+
+
+def test_spectrum_krea2_explicit_paired_cfg_topology_selects_raw_state_independent_of_step_count():
+    for steps, forecast in ((20, (7,)), (28, (7, 21)), (40, (7, 21, 30))):
+        config = SpectrumCacheConfig(
+            num_inference_steps=steps,
+            forecast_step_indices=forecast,
+            denoiser_call_topology="paired_cfg",
+        )
+        assert _krea2_selected_state_cls(config) is SpectrumKrea2RawState
+
+
+def test_spectrum_krea2_explicit_single_topology_overrides_legacy_52_step_raw_heuristic():
+    config = SpectrumCacheConfig(
+        num_inference_steps=52,
+        forecast_step_indices=(7, 21, 30, 35, 42, 44),
+        denoiser_call_topology="single",
+    )
+    assert _krea2_selected_state_cls(config).__name__ == "SpectrumKrea2State"
+
+
+def test_spectrum_krea2_auto_topology_preserves_historical_route_identity():
+    raw = SpectrumCacheConfig(
+        num_inference_steps=52,
+        forecast_step_indices=(7, 21, 30, 35, 42, 44),
+    )
+    turbo = make_config()
+    assert _krea2_selected_state_cls(raw) is SpectrumKrea2RawState
+    assert _krea2_selected_state_cls(turbo).__name__ == "SpectrumKrea2State"
+
+
+def test_spectrum_krea2_paired_cfg_requires_explicit_schedule_at_any_step_count():
+    model = make_model()
+    try:
+        model.enable_cache(
+            SpectrumCacheConfig(
+                num_inference_steps=28,
+                denoiser_call_topology="paired_cfg",
+            )
+        )
+    except ValueError as error:
+        assert "paired-CFG route requires explicit forecast_step_indices" in str(error)
+    else:
+        raise AssertionError("Expected paired-CFG Krea 2 route without explicit schedule to fail.")
+
+
+def test_spectrum_denoiser_call_topology_validation():
+    try:
+        SpectrumCacheConfig(denoiser_call_topology="mystery")
+    except ValueError as error:
+        assert "denoiser_call_topology" in str(error)
+    else:
+        raise AssertionError("Expected invalid denoiser_call_topology to fail.")
+
+
+def test_spectrum_krea2_raw_runtime_horizon_provenance_accepts_repeated_outer_step():
+    config = SpectrumCacheConfig(
+        num_inference_steps=3,
+        forecast_step_indices=(2,),
+        degree=1,
+        history_limit=3,
+        coordinate_policy="runtime_horizon_normalized",
+        coordinate_max=3.0,
+        denoiser_call_topology="paired_cfg",
+    )
+    state = SpectrumKrea2RawState(config)
+    positive = torch.ones(1, 2, 3)
+    negative = torch.full((1, 2, 3), 2.0)
+
+    for step in range(3):
+        for lane, feature in (("positive", positive + step), ("negative", negative + step)):
+            state.prepare_call(lane)
+            state.start_step(
+                logical_step_index=step,
+                runtime_num_inference_steps=3,
+                provenance_source="cache_context",
+            )
+            if state.should_compute:
+                state.record_real_feature(feature)
+
+    summary = state.summary()
+    assert summary["coordinate"]["failure_latched"] is False
+    assert summary["coordinate"]["runtime_num_inference_steps"] == 3
+    assert summary["coordinate"]["last_logical_step_index"] == 2
+    assert summary["compute_steps"] == [0, 1]
+    assert summary["forecast_steps"] == [2]
+
+
+def test_spectrum_krea2_raw_variable_factory_locked_operating_table():
+    expected = {
+        28: (4, 16, 23),
+        40: (5, 8, 21, 23, 24, 27, 32, 34),
+        52: (7, 10, 21, 28, 30, 32, 35, 37, 42, 44),
+    }
+    for steps, schedule in expected.items():
+        config = SpectrumCacheConfig.for_krea2_raw_variable(steps)
+        assert config.num_inference_steps == steps
+        assert config.forecast_step_indices == schedule
+        assert config.warmup_steps == 0
+        assert config.window_size == 2.0
+        assert config.flex_window == 0.0
+        assert config.degree == 4
+        assert config.ridge_lambda == 0.1
+        assert config.blend_w == 0.5
+        assert config.history_limit == 8
+        assert config.predictor_backend == "dense"
+        assert config.coordinate_policy == "runtime_horizon_normalized"
+        assert config.coordinate_max == 100.0
+        assert config.tail_actual_steps == 0
+        assert config.denoiser_call_topology == "paired_cfg"
+        assert _krea2_selected_state_cls(config) is SpectrumKrea2RawState
+
+    for steps in (20, 30, 51, 60):
+        try:
+            SpectrumCacheConfig.for_krea2_raw_variable(steps)
+        except ValueError as error:
+            assert "{28, 40, 52}" in str(error)
+        else:
+            raise AssertionError(f"Expected unqualified Krea Raw step count {steps} to be rejected")

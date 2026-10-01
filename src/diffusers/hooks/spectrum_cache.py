@@ -84,8 +84,8 @@ class SpectrumCacheConfig:
             Coordinate mapping used by the spectral predictor. `"legacy_fixed_max"` preserves the historical
             `coordinate_max` mapping. `"runtime_index_normalized"` maps logical denoising-step indices over the
             configured runtime step count so index 0 maps to -1 and index `N-1` maps to +1.
-            `"runtime_horizon_normalized"` maps index `i` as `2*i/N - 1`; it is currently qualified only through
-            the opt-in ordinary Anima variable-step profile.
+            `"runtime_horizon_normalized"` maps index `i` as `2*i/N - 1`; opt-in factories that select it carry
+            their own route-specific qualification bounds.
         coordinate_max (`float`, defaults to `50.0`):
             Maximum coordinate used by `"legacy_fixed_max"`. Existing qualified profiles remain pinned to their
             historical value until separately requalified.
@@ -100,6 +100,12 @@ class SpectrumCacheConfig:
         forecast_step_indices (`tuple[int, ...]`, *optional*):
             Explicit denoising-step indices to forecast. When provided, these indices replace the adaptive refresh
             schedule while preserving all forecaster settings. This is useful for route-qualified sparse schedules.
+        denoiser_call_topology (`str`, defaults to `"auto"`):
+            Denoiser-call topology used by route-specific adapters. `"single"` means one denoiser forward per logical
+            denoising step. `"paired_cfg"` means two sequential CFG forwards share one logical step and one cache
+            context. `"auto"` preserves historical route inference for backward compatibility. The explicit topology
+            marker is currently consumed by the Krea 2 adapter so variable-step Raw qualification does not depend on a
+            fixed step count.
         allow_unet_controlnet_residuals (`bool`, defaults to `False`):
             Explicitly allow classic UNet ControlNet residual pairs (`down_block_additional_residuals` together with
             `mid_block_additional_residual`) to use SPECTRUM. The default remains fail-closed.
@@ -138,6 +144,7 @@ class SpectrumCacheConfig:
     tail_actual_steps: int = 0
     max_consecutive_forecast_steps: int | None = None
     forecast_step_indices: tuple[int, ...] | None = None
+    denoiser_call_topology: str = "auto"
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
@@ -351,6 +358,50 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_krea2_raw_variable(cls, num_inference_steps: int = 52) -> "SpectrumCacheConfig":
+        """Build the opt-in Krea 2 Raw variable-step CFG profile.
+
+        The profile uses native pipeline ``CacheContext`` provenance, explicit paired-CFG
+        route identity, ``runtime_horizon_normalized`` coordinates, and a locked sparse
+        forecast schedule selected by independent 1024 qualification.
+
+        Qualification covers exactly 28/40/52 Krea 2 Raw denoising steps at 1024x1024
+        with CFG. N=28 uses the qualified conservative schedule; N=40 and N=52 use the
+        qualified aggressive schedules. Other step counts, Turbo/distilled routes,
+        different sampling recipes, and other model representations remain separately
+        qualified or experimental.
+
+        The historical Krea behavior remains unchanged unless this factory is selected.
+        """
+        forecast_steps_by_count = {
+            28: (4, 16, 23),
+            40: (5, 8, 21, 23, 24, 27, 32, 34),
+            52: (7, 10, 21, 28, 30, 32, 35, 37, 42, 44),
+        }
+        if num_inference_steps not in forecast_steps_by_count:
+            raise ValueError(
+                "for_krea2_raw_variable is qualified only for Krea 2 Raw runs with "
+                "num_inference_steps in {28, 40, 52}"
+            )
+
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=0,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="dense",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=100.0,
+            tail_actual_steps=0,
+            forecast_step_indices=forecast_steps_by_count[num_inference_steps],
+            denoiser_call_topology="paired_cfg",
+        )
+
+    @classmethod
     def for_zimage_base_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
         """Build the opt-in Z-Image Base variable-step SPECTRUM profile.
 
@@ -521,6 +572,8 @@ class SpectrumCacheConfig:
                 raise ValueError(
                     "max_consecutive_forecast_steps cannot be combined with forecast_step_indices"
                 )
+        if self.denoiser_call_topology not in {"auto", "single", "paired_cfg"}:
+            raise ValueError('denoiser_call_topology must be "auto", "single", or "paired_cfg"')
         if self.forecast_step_indices is not None:
             indices = tuple(int(step) for step in self.forecast_step_indices)
             if len(set(indices)) != len(indices):
@@ -1167,7 +1220,7 @@ class SpectrumKrea2RawState(SpectrumWanState):
         if self.current_lane is None:
             raise RuntimeError("SPECTRUM Krea 2 Raw call has no active CFG lane.")
 
-        if self.config.coordinate_policy == "runtime_index_normalized":
+        if self.config.coordinate_policy in {"runtime_index_normalized", "runtime_horizon_normalized"}:
             self._validate_coordinate_provenance(
                 logical_step_index=logical_step_index,
                 runtime_num_inference_steps=runtime_num_inference_steps,
@@ -2866,10 +2919,19 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         if len(blocks) != 28:
             raise ValueError("SPECTRUM Krea 2 support requires exactly 28 transformer blocks.")
 
-        if config.num_inference_steps == 52:
+        if config.denoiser_call_topology == "paired_cfg":
+            use_paired_cfg_state = True
+        elif config.denoiser_call_topology == "single":
+            use_paired_cfg_state = False
+        else:
+            # Historical compatibility only. New variable-step Krea Raw profiles must
+            # select ``paired_cfg`` explicitly instead of relying on a 52-step heuristic.
+            use_paired_cfg_state = config.num_inference_steps == 52
+
+        if use_paired_cfg_state:
             if config.forecast_step_indices is None:
                 raise ValueError(
-                    "The qualified Krea 2 Raw 52-step CFG route requires explicit forecast_step_indices."
+                    "The Krea 2 Raw paired-CFG route requires explicit forecast_step_indices."
                 )
             state_cls = SpectrumKrea2RawState
         else:
