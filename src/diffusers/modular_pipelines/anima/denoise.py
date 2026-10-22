@@ -200,6 +200,10 @@ class AnimaDenoiseLoopWrapper(LoopSequentialPipelineBlocks):
     def __call__(self, components: AnimaModularPipeline, state: PipelineState) -> PipelineState:
         block_state = self.get_block_state(state)
 
+        # A cache_context ends one denoiser call; this resets the prior generation's history.
+        if hasattr(components.transformer, "_reset_stateful_cache"):
+            components.transformer._reset_stateful_cache()
+
         num_warmup_steps = len(block_state.timesteps) - block_state.num_inference_steps * components.scheduler.order
 
         with self.progress_bar(total=block_state.num_inference_steps) as progress_bar:

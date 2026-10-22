@@ -1593,10 +1593,17 @@ class SpectrumCosmosState(BaseState):
 class SpectrumCosmosStateManager(StateManager):
     """Context-partitioned Cosmos state with a legacy no-context fallback bucket."""
 
-    _LEGACY_KEY = "__legacy_cosmos__"
+    _LEGACY_KEY = object()
 
     def get_state(self):
-        name = self._context.name if self._context is not None else self._LEGACY_KEY
+        if self._context is not None:
+            name = self._context.name
+            if not isinstance(name, str):
+                raise TypeError("Cosmos SPECTRUM native CacheContext name must be a string.")
+            if not name.strip():
+                raise ValueError("Cosmos SPECTRUM native CacheContext name must be non-empty.")
+        else:
+            name = self._LEGACY_KEY
         if name not in self._state_cache:
             self._state_cache[name] = self._state_cls(*self._init_args, **self._init_kwargs)
         return self._state_cache[name]
@@ -2368,8 +2375,17 @@ class SpectrumCosmosDenoiserHook(ModelHook):
     def _runtime_state(self, config: SpectrumCacheConfig) -> dict[str, Any]:
         context = self.state_manager._context
         if context is not None and context.step_index is not None and context.num_inference_steps is not None:
-            label = str(context.name)
-            if not label:
+            if (
+                isinstance(context.step_index, bool)
+                or not isinstance(context.step_index, int)
+                or isinstance(context.num_inference_steps, bool)
+                or not isinstance(context.num_inference_steps, int)
+            ):
+                raise TypeError("Cosmos SPECTRUM native CacheContext step_index and num_inference_steps must be integers.")
+            if not isinstance(context.name, str):
+                raise TypeError("Cosmos SPECTRUM native CacheContext name must be a string.")
+            label = context.name
+            if not label.strip():
                 raise ValueError("Cosmos SPECTRUM native CacheContext name must be non-empty.")
             return {
                 "step": int(context.step_index),
@@ -2401,6 +2417,11 @@ class SpectrumCosmosDenoiserHook(ModelHook):
         missing = [name for name in required if name not in runtime]
         if missing:
             raise ValueError(f"cosmos_runtime_state_callback is missing required keys: {missing}")
+        for field in ("step", "num_inference_steps", "num_conditions"):
+            if type(runtime[field]) is not int:
+                raise TypeError(f"Legacy Cosmos runtime-state {field} must be a Python integer.")
+        if runtime["num_conditions"] < 1:
+            raise ValueError("Legacy Cosmos num_conditions must be >= 1.")
         label = str(runtime["label"])
         if label not in {"cond", "uncond"}:
             raise ValueError(f"Legacy Cosmos runtime-state label must be 'cond' or 'uncond', got {label!r}.")
@@ -2462,10 +2483,11 @@ class SpectrumCosmosDenoiserHook(ModelHook):
             state.latch(step, "tuple/image-context encoder_hidden_states path is not qualified")
 
         signature = {
+            "timestep": _spectrum_tensor_signature(timestep),
             "encoder": _spectrum_tensor_signature(encoder_hidden_states),
             "attention_mask": _spectrum_tensor_signature(attention_mask),
             "padding_mask": _spectrum_tensor_signature(padding_mask),
-            "input_shape": tuple(hidden_states.shape),
+            "input": _spectrum_tensor_signature(hidden_states),
         }
         state.prepare_call(
             step=step,
