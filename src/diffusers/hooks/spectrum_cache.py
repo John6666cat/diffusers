@@ -2458,6 +2458,19 @@ class SpectrumCosmosDenoiserHook(ModelHook):
 
         from ..models.modeling_outputs import Transformer2DModelOutput
 
+        def _i03_call_original():
+            return self.fn_ref.original_forward(
+                hidden_states=hidden_states,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                block_controlnet_hidden_states=block_controlnet_hidden_states,
+                attention_mask=attention_mask,
+                fps=fps,
+                condition_mask=condition_mask,
+                padding_mask=padding_mask,
+                return_dict=return_dict,
+            )
+
         state: SpectrumCosmosState = self.state_manager.get_state()
         runtime = self._runtime_state(state.config)
         step = int(runtime["step"])
@@ -2502,34 +2515,14 @@ class SpectrumCosmosDenoiserHook(ModelHook):
         if state.guard_latched:
             state.bypass = True
             try:
-                output = self.fn_ref.original_forward(
-                    hidden_states=hidden_states,
-                    timestep=timestep,
-                    encoder_hidden_states=encoder_hidden_states,
-                    block_controlnet_hidden_states=block_controlnet_hidden_states,
-                    attention_mask=attention_mask,
-                    fps=fps,
-                    condition_mask=condition_mask,
-                    padding_mask=padding_mask,
-                    return_dict=return_dict,
-                )
+                output = _i03_call_original()
             finally:
                 state.bypass = False
             self._record(state, predicted=False)
             return output
 
         if state.should_compute or not state.can_predict():
-            output = self.fn_ref.original_forward(
-                hidden_states=hidden_states,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                block_controlnet_hidden_states=block_controlnet_hidden_states,
-                attention_mask=attention_mask,
-                fps=fps,
-                condition_mask=condition_mask,
-                padding_mask=padding_mask,
-                return_dict=return_dict,
-            )
+            output = _i03_call_original()
             self._record(state, predicted=False)
             return output
 
@@ -2544,17 +2537,7 @@ class SpectrumCosmosDenoiserHook(ModelHook):
             )
             state.latch(step, "forecast failure; fail closed")
             state.should_compute = True
-            output = self.fn_ref.original_forward(
-                hidden_states=hidden_states,
-                timestep=timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                block_controlnet_hidden_states=block_controlnet_hidden_states,
-                attention_mask=attention_mask,
-                fps=fps,
-                condition_mask=condition_mask,
-                padding_mask=padding_mask,
-                return_dict=return_dict,
-            )
+            output = _i03_call_original()
             self._record(state, predicted=False, fallback_reason=fallback_reason)
             return output
 
