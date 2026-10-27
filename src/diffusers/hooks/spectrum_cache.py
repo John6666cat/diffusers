@@ -145,6 +145,7 @@ class SpectrumCacheConfig:
     max_consecutive_forecast_steps: int | None = None
     forecast_step_indices: tuple[int, ...] | None = None
     denoiser_call_topology: str = "auto"
+    sdxl_euler_post_grid_strict: bool = False
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
@@ -188,7 +189,9 @@ class SpectrumCacheConfig:
 
 
     @classmethod
-    def for_sdxl_variable(cls, num_inference_steps: int = 24) -> "SpectrumCacheConfig":
+    def for_sdxl_variable(
+        cls, num_inference_steps: int = 24, *, strict_post_grid: bool = False
+    ) -> "SpectrumCacheConfig":
         """Build the opt-in ordinary SDXL variable-step profile qualified by Gate E.
 
         This profile retains the ordinary SDXL predictor coefficients while using
@@ -202,6 +205,8 @@ class SpectrumCacheConfig:
         separately qualified or experimental.
 
         The historical :meth:`for_sdxl` profile remains unchanged and legacy-pinned.
+        ``strict_post_grid`` is an opt-in SDXL text2img Euler ingress+grid guard;
+        the default leaves existing source behavior unchanged.
         """
         return cls(
             num_inference_steps=num_inference_steps,
@@ -215,6 +220,7 @@ class SpectrumCacheConfig:
             coordinate_max=50.0,
             tail_actual_steps=3,
             max_consecutive_forecast_steps=3,
+            sdxl_euler_post_grid_strict=strict_post_grid,
         )
 
     @classmethod
