@@ -1,4 +1,4 @@
-__version__ = "0.42.1"
+__version__ = "0.42.1.dev0"
 
 from typing import TYPE_CHECKING
 
@@ -217,6 +217,7 @@ else:
             "MagCacheConfig",
             "PyramidAttentionBroadcastConfig",
             "SeaCacheConfig",
+            "SpectrumCacheConfig",
             "SmoothedEnergyGuidanceConfig",
             "TaylorSeerCacheConfig",
             "TextKVCacheConfig",
@@ -226,6 +227,7 @@ else:
             "apply_mag_cache",
             "apply_pyramid_attention_broadcast",
             "apply_sea_cache",
+            "apply_spectrum_cache",
             "apply_taylorseer_cache",
             "apply_text_kv_cache",
         ]
@@ -1141,6 +1143,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             MagCacheConfig,
             PyramidAttentionBroadcastConfig,
             SeaCacheConfig,
+            SpectrumCacheConfig,
             SmoothedEnergyGuidanceConfig,
             TaylorSeerCacheConfig,
             TextKVCacheConfig,
@@ -1150,6 +1153,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             apply_mag_cache,
             apply_pyramid_attention_broadcast,
             apply_sea_cache,
+            apply_spectrum_cache,
             apply_taylorseer_cache,
             apply_text_kv_cache,
         )
