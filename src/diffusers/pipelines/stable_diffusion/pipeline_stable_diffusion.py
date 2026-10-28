@@ -1028,6 +1028,10 @@ class StableDiffusionPipeline(
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        # A cache_context ends one denoiser call, not a generation.
+        # Discard the previous generation's state before the new denoising loop.
+        if hasattr(self.unet, "_reset_stateful_cache"):
+            self.unet._reset_stateful_cache()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
