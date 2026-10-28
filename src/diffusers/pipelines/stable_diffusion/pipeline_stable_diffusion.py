@@ -1028,6 +1028,10 @@ class StableDiffusionPipeline(
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        # A cache_context ends one denoiser call, not a generation.
+        # Discard the previous generation's state before the new denoising loop.
+        if hasattr(self.unet, "_reset_stateful_cache"):
+            self.unet._reset_stateful_cache()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1039,15 +1043,21 @@ class StableDiffusionPipeline(
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "num_inference_steps": self._num_timesteps,
+                    "timestep": t,
+                }
+                with self.unet.cache_context("cond_uncond", **cache_context_kwargs):
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 # perform guidance
                 if self.do_classifier_free_guidance:

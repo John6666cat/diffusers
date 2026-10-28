@@ -48,6 +48,7 @@ from ...utils import (
 from ...utils.torch_utils import get_module_execution_device, randn_tensor
 from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from .pipeline_output import StableDiffusionXLPipelineOutput
+from ._spectrum_euler_gate import _spectrum_config, _spectrum_sdxl_euler_lifecycle, _spectrum_sdxl_euler_maybe_bypass
 
 
 if is_invisible_watermark_available():
@@ -821,6 +822,7 @@ class StableDiffusionXLPipeline(
         return self._interrupt
 
     @torch.no_grad()
+    @_spectrum_sdxl_euler_lifecycle
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
@@ -1053,6 +1055,27 @@ class StableDiffusionXLPipeline(
             callback_on_step_end_tensor_inputs,
         )
 
+        # Capture entry arguments before prompt encoding and scheduler setup.
+        _spectrum_requested_steps = num_inference_steps
+        _spectrum_plain_request = False
+        if _spectrum_config(self.unet) is not None:
+            _spectrum_plain_request = (
+                type(prompt) is str and type(negative_prompt) is str
+                and prompt_2 is None and negative_prompt_2 is None
+                and all(v is None for v in (timesteps, sigmas, denoising_end, prompt_embeds,
+                    negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds,
+                    ip_adapter_image, ip_adapter_image_embeds, cross_attention_kwargs, clip_skip))
+                and callback_on_step_end is None and callback is None and callback_steps is None
+                and not kwargs
+                and latents is not None and tuple(latents.shape) == (1, 4, 128, 128)
+                and latents.dtype == torch.float16 and latents.device.type == "cuda"
+                and guidance_rescale == 0.0 and eta == 0.0
+                and height == 1024 and width == 1024 and guidance_scale == 5.0
+                and num_images_per_prompt == 1 and output_type == "pil" and return_dict is True
+                and original_size == (1024, 1024) and target_size == (1024, 1024)
+                and negative_original_size is None and negative_target_size is None
+                and crops_coords_top_left == (0, 0) and negative_crops_coords_top_left == (0, 0)
+            )
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
         self._clip_skip = clip_skip
@@ -1193,6 +1216,14 @@ class StableDiffusionXLPipeline(
             ).to(device=device, dtype=latents.dtype)
 
         self._num_timesteps = len(timesteps)
+        # A cache context ends a UNet call, not the whole generation.
+        # Discard cache history left by an interrupted previous generation.
+        if hasattr(self.unet, "_reset_stateful_cache"):
+            self.unet._reset_stateful_cache()
+        _spectrum_sdxl_euler_maybe_bypass(
+            self, timesteps, num_inference_steps,
+            requested_steps=_spectrum_requested_steps, plain_request=_spectrum_plain_request,
+        )
         if hasattr(self.scheduler, "set_begin_index"):
             self.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1211,15 +1242,21 @@ class StableDiffusionXLPipeline(
                 # [Neuron] pre-cast timestep to float32 on device. Neuron XLA does not support
                 # int64 ops; the compiled UNet graph requires a float32 timestep input on-device.
                 t_unet = t.to(torch.float32).to(device) if is_neuron_device else t
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t_unet,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                )[0]
+                cache_context_kwargs = {
+                    "step_index": i,
+                    "num_inference_steps": self._num_timesteps,
+                    "timestep": t,
+                }
+                with self.unet.cache_context("cond_uncond", **cache_context_kwargs):
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t_unet,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
 
                 # perform guidance
                 if self.do_classifier_free_guidance:

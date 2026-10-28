@@ -27,6 +27,7 @@ from ...utils import (
     logging,
 )
 from ...utils.torch_utils import maybe_adjust_dtype_for_device
+from ..cache_utils import CacheMixin
 from ..activations import get_activation
 from ..attention import AttentionMixin
 from ..attention_processor import (
@@ -74,7 +75,7 @@ class UNet2DConditionOutput(BaseOutput):
 
 
 class UNet2DConditionModel(
-    ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModelMixin, UNet2DConditionLoadersMixin, PeftAdapterMixin
+    ModelMixin, AttentionMixin, ConfigMixin, FromOriginalModelMixin, UNet2DConditionLoadersMixin, PeftAdapterMixin, CacheMixin
 ):
     r"""
     A conditional 2D UNet model that takes a noisy sample, conditional state, and a timestep and returns a sample
