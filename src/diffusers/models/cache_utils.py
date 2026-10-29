@@ -143,6 +143,7 @@ class CacheMixin:
         )
         from ..hooks.spectrum_cache import (
             _SPECTRUM_DENOISER_HOOK,
+            _SPECTRUM_FLUX3_FEATURE_HOOK,
             _SPECTRUM_UNET_FEATURE_HOOK,
             _SPECTRUM_COSMOS_FEATURE_HOOK,
         )
@@ -177,6 +178,7 @@ class CacheMixin:
             registry.remove_hook(_SPECTRUM_DENOISER_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_UNET_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_COSMOS_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_FLUX3_FEATURE_HOOK, recurse=True)
         elif isinstance(self._cache_config, TaylorSeerCacheConfig):
             registry.remove_hook(_TAYLORSEER_CACHE_HOOK, recurse=True)
         else:

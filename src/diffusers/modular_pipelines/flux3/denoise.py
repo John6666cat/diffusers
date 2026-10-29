@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -126,13 +127,23 @@ class Flux3LoopDenoiser(ModularPipelineBlocks):
             components.guider.prepare_models(components.transformer)
             cond_kwargs = {input_name: getattr(guider_state_batch, input_name) for input_name in guider_inputs.keys()}
 
-            guider_state_batch.noise_pred = components.transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                return_dict=False,
-                **transformer_kwargs,
-                **cond_kwargs,
-            )[0]
+            # Keep CFG branches in separate histories while sharing a logical scheduler step.
+            context_name = getattr(guider_state_batch, components.guider._identifier_key)
+            cache_context = (
+                components.transformer.cache_context(
+                    context_name, step_index=i, num_inference_steps=block_state.num_inference_steps, timestep=t
+                )
+                if hasattr(components.transformer, "cache_context")
+                else nullcontext()
+            )
+            with cache_context:
+                guider_state_batch.noise_pred = components.transformer(
+                    hidden_states=latents,
+                    timestep=timestep,
+                    return_dict=False,
+                    **transformer_kwargs,
+                    **cond_kwargs,
+                )[0]
             components.guider.cleanup_models(components.transformer)
 
         block_state.noise_pred = components.guider(guider_state)[0]
@@ -293,6 +304,10 @@ class Flux3DenoiseLoopWrapper(LoopSequentialPipelineBlocks):
         block_state.num_warmup_steps = max(
             len(block_state.timesteps) - block_state.num_inference_steps * components.scheduler.order, 0
         )
+
+        # Generations must not reuse state, including after an interrupted previous call.
+        if hasattr(components.transformer, "_reset_stateful_cache"):
+            components.transformer._reset_stateful_cache()
 
         with self.progress_bar(total=block_state.num_inference_steps) as progress_bar:
             for i, t in enumerate(block_state.timesteps):
