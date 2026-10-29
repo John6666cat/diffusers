@@ -30,6 +30,7 @@ logger = logging.get_logger(__name__)
 _SPECTRUM_DENOISER_HOOK = "spectrum_cache_denoiser"
 _SPECTRUM_UNET_FEATURE_HOOK = "spectrum_cache_unet_feature"
 _SPECTRUM_COSMOS_FEATURE_HOOK = "spectrum_cache_cosmos_feature"
+_SPECTRUM_FLUX3_FEATURE_HOOK = "spectrum_cache_flux3_feature"
 _UNET_RESIDUAL_ARGUMENTS = (
     "down_block_additional_residuals",
     "mid_block_additional_residual",
@@ -1596,15 +1597,180 @@ class SpectrumUNetFeatureHook(ModelHook):
             state.record_real_feature(feature)
         return args, kwargs
 
+
+class SpectrumFlux3DenoiserHook(ModelHook):
+    """Base FLUX.3 image-only forecast at the pre-norm_out image-token feature boundary.
+
+    Uses native per-guider CacheContext and the existing per-label schedule/forecaster.
+    Image-conditioned, distilled, LoRA-scaled, training and context-less calls compute normally.
+    """
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        image_cond_hidden_states: torch.Tensor | None = None,
+        image_cond_ids: torch.Tensor | None = None,
+        target_timestep: torch.Tensor | None = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        return_dict: bool = True,
+    ):
+        kwargs = dict(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+            image_cond_hidden_states=image_cond_hidden_states,
+            image_cond_ids=image_cond_ids,
+            target_timestep=target_timestep,
+            attention_kwargs=attention_kwargs,
+            return_dict=return_dict,
+        )
+
+        def original():
+            return self.fn_ref.original_forward(**kwargs)
+
+        context = self.state_manager._context
+        if context is None or context.step_index is None or context.num_inference_steps is None:
+            return original()
+        if (type(context.step_index) is not int or type(context.num_inference_steps) is not int
+                or not isinstance(context.name, str) or not context.name.strip()):
+            return original()
+
+        state: SpectrumCosmosState = self.state_manager.get_state()
+        step = context.step_index
+        if (torch.is_grad_enabled() or module.training or image_cond_hidden_states is not None
+                or image_cond_ids is not None or target_timestep is not None or attention_kwargs
+                or getattr(module, "peft_config", None)):
+            state.latch(step, "FLUX.3 unsupported generation path or training")
+        if context.num_inference_steps != state.config.num_inference_steps:
+            state.latch(step, "FLUX.3 inference step count changed")
+
+        state.prepare_call(
+            step=step,
+            label=context.name,
+            num_conditions=1,
+            dynamic_conditioning=False,
+            signature={
+                "latent": _spectrum_tensor_signature(hidden_states),
+                "encoder": _spectrum_tensor_identity(encoder_hidden_states),
+                "timestep": _spectrum_tensor_signature(timestep),
+                "image_ids": _spectrum_tensor_identity(img_ids),
+                "text_ids": _spectrum_tensor_identity(txt_ids),
+            },
+            runtime_num_inference_steps=context.num_inference_steps,
+            runtime_source="cache_context",
+        )
+
+        if state.guard_latched:
+            state.bypass = True
+            try:
+                result = original()
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False)
+            return result
+        if state.should_compute or not state.can_predict():
+            result = original()
+            self._record(state, predicted=False)
+            return result
+
+        try:
+            predicted = state.predict()
+            if predicted.shape != (hidden_states.shape[0], hidden_states.shape[1], module.inner_dim):
+                raise ValueError("FLUX.3 forecast feature shape mismatch")
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("non-finite FLUX.3 forecast")
+        except Exception as error:
+            state.latch(step, f"FLUX.3 forecast failed: {type(error).__name__}: {error}")
+            state.should_compute = True
+            state.bypass = True
+            try:
+                result = original()
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False)
+            return result
+
+        # Preserve the upstream final timestep-modulated projection; skip only transformer blocks.
+        dtype = hidden_states.dtype
+        image_temb = module.time_proj(timestep.to(dtype) * 1000)
+        image_temb = module.timestep_embedder(image_temb.to(dtype))[:, None, :]
+        image_temb = image_temb.expand(hidden_states.shape[0], hidden_states.shape[1], -1)
+        predicted = module.norm_out(predicted, image_temb)
+        output = module.proj_out(predicted)
+        self._record(state, predicted=True)
+        if not return_dict:
+            return (output,)
+        from ..models.modeling_outputs import Transformer2DModelOutput
+
+        return Transformer2DModelOutput(sample=output)
+
+    @staticmethod
+    def _record(state: SpectrumCosmosState, *, predicted: bool) -> None:
+        state.records.append({"logical_step": state.current_step, "guider_label": state.current_label,
+                              "predicted_body_used": predicted})
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
+class SpectrumFlux3FeatureHook(ModelHook):
+    """Capture the actual image-token feature immediately before the final normalization."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+
+    def pre_forward(self, module: torch.nn.Module, *args, **kwargs):
+        if self.state_manager._context is None:
+            return args, kwargs
+        state: SpectrumCosmosState = self.state_manager.get_state()
+        if not state.bypass and state.should_compute and not state.guard_latched:
+            feature = args[0] if args else kwargs.get("hidden_states")
+            if feature is None:
+                raise RuntimeError("FLUX.3 norm_out did not receive image features")
+            state.record_real_feature(feature)
+        return args, kwargs
+
+
+
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
-    """Install opt-in SPECTRUM on Anima/Cosmos or SDXL/SD1.5 UNet.
+    """Install opt-in SPECTRUM on supported focused family models.
 
     Other historical family adapters are retained only in the archived research source.
     """
     from ..models.transformers.transformer_cosmos import CosmosTransformer3DModel
+    from ..models.transformers.transformer_flux3 import Flux3Transformer2DModel
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped = unwrap_module(module)
+    if isinstance(unwrapped, Flux3Transformer2DModel):
+        if unwrapped.config.flow_map:
+            raise ValueError("SPECTRUM FLUX.3 supports only the undistilled Base transformer")
+        if config.coordinate_policy not in {"runtime_index_normalized", "runtime_horizon_normalized"}:
+            raise ValueError("SPECTRUM FLUX.3 requires runtime-normalized native step coordinates")
+        state_manager = SpectrumCosmosStateManager(SpectrumCosmosState, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumFlux3DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK
+        )
+        HookRegistry.check_if_exists_or_initialize(unwrapped.norm_out).register_hook(
+            SpectrumFlux3FeatureHook(state_manager), _SPECTRUM_FLUX3_FEATURE_HOOK
+        )
+        return
+
     if isinstance(unwrapped, CosmosTransformer3DModel):
         if (unwrapped.config.use_crossattn_projection or unwrapped.config.img_context_dim_in
                 or unwrapped.config.controlnet_block_every_n is not None):
@@ -1630,5 +1796,5 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    raise ValueError("SPECTRUM focused 0.42.1 candidate supports Anima/Cosmos and SDXL/SD1.5 UNet only: "
+    raise ValueError("SPECTRUM focused 0.42.1 source supports FLUX.3 Base, Anima/Cosmos and SDXL/SD1.5 UNet only: "
                      f"got {type(unwrapped).__name__}.")
