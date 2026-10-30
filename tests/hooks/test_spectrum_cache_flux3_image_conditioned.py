@@ -128,7 +128,7 @@ def test_distilled_still_rejected_explicitly():
         num_attention_heads=2, attention_head_dim=16, joint_attention_dim=32,
         timestep_channels=32, axes_dims_rope=(4, 4, 4, 4), flow_map=True,
     ).eval()
-    with pytest.raises(ValueError,match='undistilled Base'):
+    with pytest.raises(ValueError,match='distilled requires explicit opt-in'):
         model.enable_cache(_config(allow=True))
     assert not model.is_cache_enabled
 

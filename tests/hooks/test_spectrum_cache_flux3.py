@@ -188,7 +188,7 @@ def test_reset_erases_interrupted_history():
 
 def test_unsupported_config_is_not_silently_enabled():
     model = _tiny_base(flow_map=True)
-    with pytest.raises(ValueError, match="undistilled Base"):
+    with pytest.raises(ValueError, match="distilled requires explicit opt-in"):
         model.enable_cache(_config())
     assert not model.is_cache_enabled
     model = _tiny_base()

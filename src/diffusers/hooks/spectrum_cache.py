@@ -113,6 +113,9 @@ class SpectrumCacheConfig:
         allow_flux3_image_conditioned (`bool`, defaults to `False`):
             Opt in to experimental pre-encoded reference-image tokens on the FLUX.3 Base path. The default
             preserves bypass of every image-conditioned denoising call. Not valid for distilled flow-map models.
+        allow_flux3_distilled (`bool`, defaults to `False`):
+            Experimental step-distilled FLUX.3 T2I opt-in only. Requires native step context and
+            target_timestep, and preserves target-step output modulation. Default is disabled.
         cosmos_runtime_state_callback (`Callable`, *optional*):
             Legacy runtime-state fallback for the Anima / `CosmosTransformer3DModel` adapter when the pipeline does
             not provide a complete native `CacheContext`. Native contexts are preferred. The legacy callback must
@@ -147,6 +150,7 @@ class SpectrumCacheConfig:
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
     allow_flux3_image_conditioned: bool = False
+    allow_flux3_distilled: bool = False
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
 
     @classmethod
@@ -1655,10 +1659,14 @@ class SpectrumFlux3DenoiserHook(ModelHook):
 
         state: SpectrumCosmosState = self.state_manager.get_state()
         step = context.step_index
+        is_distilled = bool(module.config.flow_map)
         has_image_conditioning = image_cond_hidden_states is not None or image_cond_ids is not None
-        if (torch.is_grad_enabled() or module.training
-                or (has_image_conditioning and not state.config.allow_flux3_image_conditioned)
-                or target_timestep is not None or attention_kwargs
+        unsupported_conditioning = (
+            has_image_conditioning if is_distilled else
+            (has_image_conditioning and not state.config.allow_flux3_image_conditioned)
+        )
+        if (torch.is_grad_enabled() or module.training or unsupported_conditioning
+                or (target_timestep is None) == is_distilled or attention_kwargs
                 or getattr(module, "peft_config", None)):
             state.latch(step, "FLUX.3 unsupported generation path or training")
         if context.num_inference_steps != state.config.num_inference_steps:
@@ -1673,6 +1681,7 @@ class SpectrumFlux3DenoiserHook(ModelHook):
                 "latent": _spectrum_tensor_signature(hidden_states),
                 "encoder": _spectrum_tensor_identity(encoder_hidden_states),
                 "timestep": _spectrum_tensor_signature(timestep),
+                "target_timestep": _spectrum_tensor_signature(target_timestep),
                 "image_ids": _spectrum_tensor_identity(img_ids),
                 "text_ids": _spectrum_tensor_identity(txt_ids),
                 "reference_tokens": _spectrum_tensor_identity(image_cond_hidden_states),
@@ -1718,6 +1727,12 @@ class SpectrumFlux3DenoiserHook(ModelHook):
         dtype = hidden_states.dtype
         image_temb = module.time_proj(timestep.to(dtype) * 1000)
         image_temb = module.timestep_embedder(image_temb.to(dtype))[:, None, :]
+        if is_distilled:
+            # Match Flux3Transformer2DModel.forward: the flow-map target timestep
+            # modulates the output head as well as the transformer blocks.
+            target_temb = module.time_proj(target_timestep.to(dtype) * 1000)
+            target_temb = module.target_timestep_embedder(target_temb.to(dtype))[:, None, :]
+            image_temb = image_temb + target_temb
         image_temb = image_temb.expand(hidden_states.shape[0], hidden_states.shape[1], -1)
         predicted = module.norm_out(predicted, image_temb)
         output = module.proj_out(predicted)
@@ -1769,8 +1784,8 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     unwrapped = unwrap_module(module)
     if isinstance(unwrapped, Flux3Transformer2DModel):
-        if unwrapped.config.flow_map:
-            raise ValueError("SPECTRUM FLUX.3 supports only the undistilled Base transformer")
+        if unwrapped.config.flow_map and not config.allow_flux3_distilled:
+            raise ValueError("SPECTRUM FLUX.3 distilled requires explicit opt-in")
         if config.coordinate_policy not in {"runtime_index_normalized", "runtime_horizon_normalized"}:
             raise ValueError("SPECTRUM FLUX.3 requires runtime-normalized native step coordinates")
         state_manager = SpectrumCosmosStateManager(SpectrumCosmosState, init_args=(config,))
