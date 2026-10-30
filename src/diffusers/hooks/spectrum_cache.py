@@ -114,8 +114,12 @@ class SpectrumCacheConfig:
             Opt in to experimental pre-encoded reference-image tokens on the FLUX.3 Base path. The default
             preserves bypass of every image-conditioned denoising call. Not valid for distilled flow-map models.
         allow_flux3_distilled (`bool`, defaults to `False`):
-            Experimental step-distilled FLUX.3 T2I opt-in only. Requires native step context and
+            Experimental step-distilled FLUX.3 T2I opt-in. Requires native step context and
             target_timestep, and preserves target-step output modulation. Default is disabled.
+        allow_flux3_distilled_image_conditioned (`bool`, defaults to `False`):
+            Separately opt in to experimental distilled reference-image conditioning. Requires
+            `allow_flux3_distilled=True`; without it, distilled models remain disabled. The
+            default keeps every distilled I2I call on the original full-compute path.
         cosmos_runtime_state_callback (`Callable`, *optional*):
             Legacy runtime-state fallback for the Anima / `CosmosTransformer3DModel` adapter when the pipeline does
             not provide a complete native `CacheContext`. Native contexts are preferred. The legacy callback must
@@ -151,6 +155,7 @@ class SpectrumCacheConfig:
     allow_unet_ip_adapter_image_embeds: bool = False
     allow_flux3_image_conditioned: bool = False
     allow_flux3_distilled: bool = False
+    allow_flux3_distilled_image_conditioned: bool = False
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
 
     @classmethod
@@ -1610,8 +1615,9 @@ class SpectrumFlux3DenoiserHook(ModelHook):
     """Base FLUX.3 image-only forecast at the pre-norm_out image-token feature boundary.
 
     Uses native per-guider CacheContext and the existing per-label schedule/forecaster.
-    Distilled, LoRA-scaled, training and context-less calls compute normally. Image conditioning
-    requires a separate explicit opt-in and stable reference-token identities across the denoising run.
+    Training, unsupported LoRA scaling and context-less calls compute normally. Base and
+    distilled image conditioning each require a separate explicit opt-in and stable
+    reference-token identities across the denoising run.
     """
 
     _is_stateful = True
@@ -1661,10 +1667,11 @@ class SpectrumFlux3DenoiserHook(ModelHook):
         step = context.step_index
         is_distilled = bool(module.config.flow_map)
         has_image_conditioning = image_cond_hidden_states is not None or image_cond_ids is not None
-        unsupported_conditioning = (
-            has_image_conditioning if is_distilled else
-            (has_image_conditioning and not state.config.allow_flux3_image_conditioned)
+        allow_reference = (
+            state.config.allow_flux3_distilled_image_conditioned if is_distilled
+            else state.config.allow_flux3_image_conditioned
         )
+        unsupported_conditioning = has_image_conditioning and not allow_reference
         if (torch.is_grad_enabled() or module.training or unsupported_conditioning
                 or (target_timestep is None) == is_distilled or attention_kwargs
                 or getattr(module, "peft_config", None)):
