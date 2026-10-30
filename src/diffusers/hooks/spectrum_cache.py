@@ -110,6 +110,9 @@ class SpectrumCacheConfig:
             Explicitly allow IP-Adapter image embeddings carried in `added_cond_kwargs["image_embeds"]` to use SPECTRUM.
             The default remains fail-closed. Mixed special conditioning paths remain fail-closed even when their
             individual opt-ins are enabled. Autograd and non-default PEFT scale also remain fail-closed.
+        allow_flux3_image_conditioned (`bool`, defaults to `False`):
+            Opt in to experimental pre-encoded reference-image tokens on the FLUX.3 Base path. The default
+            preserves bypass of every image-conditioned denoising call. Not valid for distilled flow-map models.
         cosmos_runtime_state_callback (`Callable`, *optional*):
             Legacy runtime-state fallback for the Anima / `CosmosTransformer3DModel` adapter when the pipeline does
             not provide a complete native `CacheContext`. Native contexts are preferred. The legacy callback must
@@ -143,6 +146,7 @@ class SpectrumCacheConfig:
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
+    allow_flux3_image_conditioned: bool = False
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
 
     @classmethod
@@ -1602,7 +1606,8 @@ class SpectrumFlux3DenoiserHook(ModelHook):
     """Base FLUX.3 image-only forecast at the pre-norm_out image-token feature boundary.
 
     Uses native per-guider CacheContext and the existing per-label schedule/forecaster.
-    Image-conditioned, distilled, LoRA-scaled, training and context-less calls compute normally.
+    Distilled, LoRA-scaled, training and context-less calls compute normally. Image conditioning
+    requires a separate explicit opt-in and stable reference-token identities across the denoising run.
     """
 
     _is_stateful = True
@@ -1650,8 +1655,10 @@ class SpectrumFlux3DenoiserHook(ModelHook):
 
         state: SpectrumCosmosState = self.state_manager.get_state()
         step = context.step_index
-        if (torch.is_grad_enabled() or module.training or image_cond_hidden_states is not None
-                or image_cond_ids is not None or target_timestep is not None or attention_kwargs
+        has_image_conditioning = image_cond_hidden_states is not None or image_cond_ids is not None
+        if (torch.is_grad_enabled() or module.training
+                or (has_image_conditioning and not state.config.allow_flux3_image_conditioned)
+                or target_timestep is not None or attention_kwargs
                 or getattr(module, "peft_config", None)):
             state.latch(step, "FLUX.3 unsupported generation path or training")
         if context.num_inference_steps != state.config.num_inference_steps:
@@ -1668,6 +1675,10 @@ class SpectrumFlux3DenoiserHook(ModelHook):
                 "timestep": _spectrum_tensor_signature(timestep),
                 "image_ids": _spectrum_tensor_identity(img_ids),
                 "text_ids": _spectrum_tensor_identity(txt_ids),
+                "reference_tokens": _spectrum_tensor_identity(image_cond_hidden_states),
+                "reference_token_version": image_cond_hidden_states._version if torch.is_tensor(image_cond_hidden_states) else None,
+                "reference_ids": _spectrum_tensor_identity(image_cond_ids),
+                "reference_ids_version": image_cond_ids._version if torch.is_tensor(image_cond_ids) else None,
             },
             runtime_num_inference_steps=context.num_inference_steps,
             runtime_source="cache_context",
