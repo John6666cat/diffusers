@@ -211,14 +211,24 @@ class Flux3DistilledLoopDenoiser(ModularPipelineBlocks):
         timestep = (t / 1000).expand(batch_size).to(latents.dtype)
         target_timestep = (next_t / 1000).expand(batch_size).to(latents.dtype)
 
-        block_state.noise_pred = components.transformer(
-            hidden_states=latents,
-            encoder_hidden_states=prompt_embeds,
-            timestep=timestep,
-            target_timestep=target_timestep,
-            return_dict=False,
-            **transformer_kwargs,
-        )[0]
+        # Distilled uses a single denoiser call per step (no CFG). Supply the
+        # native cache context so experimental Spectrum cannot confuse steps.
+        cache_context = (
+            components.transformer.cache_context(
+                "distilled", step_index=i, num_inference_steps=block_state.num_inference_steps, timestep=t
+            )
+            if hasattr(components.transformer, "cache_context")
+            else nullcontext()
+        )
+        with cache_context:
+            block_state.noise_pred = components.transformer(
+                hidden_states=latents,
+                encoder_hidden_states=prompt_embeds,
+                timestep=timestep,
+                target_timestep=target_timestep,
+                return_dict=False,
+                **transformer_kwargs,
+            )[0]
 
         return components, block_state
 
