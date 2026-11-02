@@ -22,12 +22,15 @@ import torch
 
 from ..utils import logging
 from ..utils.torch_utils import unwrap_module
+from ._helpers import TransformerBlockMetadata, TransformerBlockRegistry
 from .hooks import BaseState, HookRegistry, ModelHook, StateManager
 
 
 logger = logging.get_logger(__name__)
 
 _SPECTRUM_DENOISER_HOOK = "spectrum_cache_denoiser"
+_SPECTRUM_QWEN_HEAD_BLOCK_HOOK = "spectrum_cache_qwen_head_block"
+_SPECTRUM_QWEN_BLOCK_HOOK = "spectrum_cache_qwen_block"
 _SPECTRUM_UNET_FEATURE_HOOK = "spectrum_cache_unet_feature"
 _SPECTRUM_COSMOS_FEATURE_HOOK = "spectrum_cache_cosmos_feature"
 _SPECTRUM_FLUX3_FEATURE_HOOK = "spectrum_cache_flux3_feature"
@@ -336,6 +339,32 @@ class SpectrumCacheConfig:
             history_limit=100,
             coordinate_policy="runtime_horizon_normalized",
             coordinate_max=50.0,
+            tail_actual_steps=tail_actual_steps,
+        )
+
+    @classmethod
+    def for_qwen_image_variable(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
+        """Construct a bounded Qwen-Image variable-step cache profile.
+
+        Supports Qwen-Image-2512 text-to-image and single-reference
+        Qwen-Image-Edit-2511 with 16 to 40 denoising steps.
+        """
+        if not 16 <= num_inference_steps <= 40:
+            raise ValueError("for_qwen_image_variable requires 16 <= num_inference_steps <= 40")
+
+        warmup_steps = max(1, math.floor(0.30 * num_inference_steps + 0.5))
+        tail_actual_steps = max(1, math.floor(0.20 * num_inference_steps + 0.5))
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=warmup_steps,
+            window_size=2.0,
+            flex_window=0.25,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=20.0,
             tail_actual_steps=tail_actual_steps,
         )
 
@@ -905,6 +934,45 @@ class SpectrumState(BaseState):
         if self.coordinate_failure_latched:
             raise RuntimeError("SPECTRUM coordinate provenance is fail-closed for this run.")
         return self.forecaster.predict(self.step_index)
+
+
+class SpectrumQwenImageState(SpectrumState):
+    """Per-guidance-lane history and fail-closed state for Qwen image generation."""
+
+    def reset(self) -> None:
+        super().reset()
+        self.guard_latched = False
+        self.guard_latched_at: int | None = None
+        self.guard_reasons: list[dict[str, Any]] = []
+        self.signature: dict[str, Any] | None = None
+        self.records: list[dict[str, Any]] = []
+
+    def latch(self, reason: str) -> None:
+        logical_step = max(int(self.step_index) + 1, 0)
+        if not self.guard_latched:
+            self.guard_latched = True
+            self.guard_latched_at = logical_step
+        record = {"step": logical_step, "reason": str(reason)}
+        if record not in self.guard_reasons:
+            self.guard_reasons.append(record)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "coordinate": self.coordinate_summary(),
+            "guard_latched": self.guard_latched,
+            "guard_latched_at": self.guard_latched_at,
+            "guard_reasons": list(self.guard_reasons),
+            "prediction_failure_latched": self.prediction_failure_latched,
+            "predict_failures": list(self.predict_failures),
+            "fallback_steps": list(self.fallback_steps),
+            "prediction_call_count": sum(record["predicted_body_used"] for record in self.records),
+            "full_call_count": sum(not record["predicted_body_used"] for record in self.records),
+            "compute_steps": list(self.compute_steps),
+            "forecast_steps": list(self.forecast_steps),
+            "peak_history_bytes": self.peak_history_bytes,
+            "records": list(self.records),
+        }
+
 
 def _spectrum_tensor_signature(value: Any) -> Any:
     if value is None:
@@ -1778,6 +1846,244 @@ class SpectrumFlux3FeatureHook(ModelHook):
 
 
 
+def _qwen_block_inputs(
+    metadata: TransformerBlockMetadata, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    hidden_states = metadata._get_parameter_from_args_kwargs(metadata.hidden_states_argument_name, args, kwargs)
+    encoder_hidden_states = None
+    if metadata.return_encoder_hidden_states_index is not None:
+        encoder_hidden_states = metadata._get_parameter_from_args_kwargs(
+            metadata.encoder_hidden_states_argument_name, args, kwargs
+        )
+    return hidden_states, encoder_hidden_states
+
+
+def _qwen_block_output(
+    metadata: TransformerBlockMetadata, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = [None, None]
+    output[metadata.return_hidden_states_index] = hidden_states
+    output[metadata.return_encoder_hidden_states_index] = encoder_hidden_states
+    return tuple(output)
+
+
+class SpectrumQwenHeadBlockHook(ModelHook):
+    """Advance the Qwen denoising schedule and predict the image stream at its first block."""
+
+    def __init__(self, state_manager: StateManager):
+        super().__init__()
+        self.state_manager = state_manager
+        self._metadata: TransformerBlockMetadata | None = None
+
+    def initialize_hook(self, module: torch.nn.Module):
+        self._metadata = TransformerBlockRegistry.get(unwrap_module(module).__class__)
+        return module
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumQwenImageState = self.state_manager.get_state()
+        if state.bypass:
+            return self.fn_ref.original_forward(*args, **kwargs)
+        if self._metadata is None:
+            raise RuntimeError("SPECTRUM Qwen head-block metadata is unavailable.")
+
+        hidden_states, encoder_hidden_states = _qwen_block_inputs(self._metadata, args, kwargs)
+        context = self.state_manager.context
+        state.start_step(
+            logical_step_index=context.step_index,
+            runtime_num_inference_steps=context.num_inference_steps,
+            provenance_source="cache_context",
+        )
+        if state.should_compute:
+            return self.fn_ref.original_forward(*args, **kwargs)
+
+        try:
+            predicted = state.predict()
+            if not torch.is_tensor(predicted):
+                raise TypeError("SPECTRUM Qwen predictor returned a non-tensor.")
+            if predicted.shape != hidden_states.shape:
+                raise ValueError("SPECTRUM Qwen predicted image-feature shape mismatch.")
+            if not torch.isfinite(predicted).all():
+                raise FloatingPointError("SPECTRUM Qwen predicted non-finite image features.")
+        except Exception as error:
+            state.fail_closed_prediction(error)
+            return self.fn_ref.original_forward(*args, **kwargs)
+        return _qwen_block_output(self._metadata, predicted, encoder_hidden_states)
+
+
+class SpectrumQwenBlockHook(ModelHook):
+    """Skip remaining Qwen blocks on forecast steps; capture the last real image feature."""
+
+    def __init__(self, state_manager: StateManager, is_tail: bool = False):
+        super().__init__()
+        self.state_manager = state_manager
+        self.is_tail = is_tail
+        self._metadata: TransformerBlockMetadata | None = None
+
+    def initialize_hook(self, module: torch.nn.Module):
+        self._metadata = TransformerBlockRegistry.get(unwrap_module(module).__class__)
+        return module
+
+    def new_forward(self, module: torch.nn.Module, *args, **kwargs):
+        state: SpectrumQwenImageState = self.state_manager.get_state()
+        if state.bypass:
+            return self.fn_ref.original_forward(*args, **kwargs)
+        if self._metadata is None:
+            raise RuntimeError("SPECTRUM Qwen block metadata is unavailable.")
+
+        if state.should_compute:
+            output = self.fn_ref.original_forward(*args, **kwargs)
+            if self.is_tail:
+                feature = output[self._metadata.return_hidden_states_index]
+                state.record_real_feature(feature)
+            return output
+
+        hidden_states, encoder_hidden_states = _qwen_block_inputs(self._metadata, args, kwargs)
+        return _qwen_block_output(self._metadata, hidden_states, encoder_hidden_states)
+
+
+class SpectrumQwenImageDenoiserHook(ModelHook):
+    """Bounded fail-closed adapter for Qwen-Image T2I and single-reference Edit."""
+
+    _is_stateful = True
+
+    def __init__(self, state_manager: StateManager, route: str):
+        super().__init__()
+        if route not in {"t2i", "edit"}:
+            raise ValueError(f"Unsupported SPECTRUM Qwen-Image route: {route}.")
+        self.state_manager = state_manager
+        self.route = route
+
+    @staticmethod
+    def _structure_signature(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            return tuple(SpectrumQwenImageDenoiserHook._structure_signature(item) for item in value)
+        if torch.is_tensor(value):
+            return _spectrum_tensor_signature(value)
+        return value
+
+    @staticmethod
+    def _standard_t2i_shapes(img_shapes: Any, hidden_states: torch.Tensor) -> bool:
+        if not isinstance(img_shapes, (list, tuple)) or len(img_shapes) != hidden_states.shape[0]:
+            return False
+        for sample_shapes in img_shapes:
+            if not isinstance(sample_shapes, (list, tuple)) or len(sample_shapes) != 1:
+                return False
+            shape = sample_shapes[0]
+            if not isinstance(shape, (list, tuple)) or len(shape) != 3:
+                return False
+            if math.prod(int(value) for value in shape) != hidden_states.shape[1]:
+                return False
+        return True
+
+    @staticmethod
+    def _standard_edit_shapes(img_shapes: Any, hidden_states: torch.Tensor) -> bool:
+        if not isinstance(img_shapes, (list, tuple)) or len(img_shapes) != hidden_states.shape[0]:
+            return False
+        for sample_shapes in img_shapes:
+            if not isinstance(sample_shapes, (list, tuple)) or len(sample_shapes) != 2:
+                return False
+            target_shape, reference_shape = sample_shapes
+            if (
+                not isinstance(target_shape, (list, tuple))
+                or len(target_shape) != 3
+                or not isinstance(reference_shape, (list, tuple))
+                or len(reference_shape) != 3
+            ):
+                return False
+            if sum(
+                math.prod(int(value) for value in shape) for shape in (target_shape, reference_shape)
+            ) != hidden_states.shape[1]:
+                return False
+        return True
+
+    @staticmethod
+    def _record(state: SpectrumQwenImageState, predicted: bool, fallback_reason: str | None = None) -> None:
+        state.records.append(
+            {
+                "logical_step": max(int(state.step_index), 0),
+                "scheduled_full_compute": bool(state.should_compute),
+                "predicted_body_used": bool(predicted),
+                "guard_latched": bool(state.guard_latched),
+                "fallback_reason": fallback_reason,
+            }
+        )
+
+    def new_forward(
+        self,
+        module: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.Tensor = None,
+        img_shapes: list[tuple[int, int, int]] | None = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        controlnet_block_samples=None,
+        additional_t_cond=None,
+        return_dict: bool = True,
+    ):
+        state: SpectrumQwenImageState = self.state_manager.get_state()
+        signature = {
+            "hidden_states": _spectrum_tensor_signature(hidden_states),
+            "encoder_hidden_states": _spectrum_tensor_signature(encoder_hidden_states),
+            "encoder_hidden_states_mask": _spectrum_tensor_signature(encoder_hidden_states_mask),
+            "timestep": _spectrum_tensor_signature(timestep),
+            "img_shapes": self._structure_signature(img_shapes),
+        }
+        if state.signature is None:
+            state.signature = signature
+        elif state.signature != signature:
+            state.latch("context-local input signature changed")
+
+        if module.training or torch.is_grad_enabled():
+            state.latch(f"autograd/training is not qualified for Qwen-Image {self.route} SPECTRUM")
+        if self.route == "t2i":
+            if not self._standard_t2i_shapes(img_shapes, hidden_states):
+                state.latch("non-standard Qwen-Image T2I shape route is not qualified")
+        elif not self._standard_edit_shapes(img_shapes, hidden_states):
+            state.latch("Qwen-Image Edit requires exactly one reference latent per sample")
+        if timestep is None or not torch.is_tensor(timestep) or timestep.ndim != 1:
+            state.latch("non-1D Qwen-Image timestep route is not qualified")
+        if guidance is not None:
+            state.latch("guidance-distilled Qwen-Image input is not qualified")
+        if attention_kwargs:
+            state.latch("non-empty Qwen-Image attention_kwargs are not qualified")
+        if controlnet_block_samples is not None:
+            state.latch("ControlNet Qwen-Image route is not qualified")
+        if additional_t_cond is not None:
+            state.latch("additional Qwen-Image timestep conditioning is not qualified")
+
+        call_kwargs = {
+            "hidden_states": hidden_states,
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
+            "timestep": timestep,
+            "img_shapes": img_shapes,
+            "guidance": guidance,
+            "attention_kwargs": attention_kwargs,
+            "controlnet_block_samples": controlnet_block_samples,
+            "additional_t_cond": additional_t_cond,
+            "return_dict": return_dict,
+        }
+        if state.guard_latched:
+            state.bypass = True
+            reason = state.guard_reasons[-1]["reason"] if state.guard_reasons else "sticky fail-closed guard"
+            try:
+                output = self.fn_ref.original_forward(**call_kwargs)
+            finally:
+                state.bypass = False
+            self._record(state, predicted=False, fallback_reason=reason)
+            return output
+
+        output = self.fn_ref.original_forward(**call_kwargs)
+        self._record(state, predicted=not state.should_compute)
+        return output
+
+    def reset_state(self, module: torch.nn.Module):
+        self.state_manager.reset()
+        return module
+
+
 def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -> None:
     """Install opt-in SPECTRUM on supported focused family models.
 
@@ -1827,5 +2133,58 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    raise ValueError("SPECTRUM focused 0.42.1 source supports FLUX.3 Base, Anima/Cosmos and SDXL/SD1.5 UNet only: "
-                     f"got {type(unwrapped).__name__}.")
+    # Keep the Qwen import below existing-family dispatch to avoid new optional imports
+    # on the previously supported FLUX.3, Cosmos and UNet paths.
+    from ..models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
+
+    if isinstance(unwrapped, QwenImageTransformer2DModel):
+        if config.coordinate_policy != "runtime_horizon_normalized" or not 16 <= config.num_inference_steps <= 40:
+            raise ValueError("SPECTRUM Qwen-Image requires the bounded 16–40-step variable-step profile.")
+        common_signature = {
+            "patch_size": 2,
+            "in_channels": 64,
+            "out_channels": 16,
+            "num_layers": 60,
+            "attention_head_dim": 128,
+            "num_attention_heads": 24,
+            "joint_attention_dim": 3584,
+            "guidance_embeds": False,
+            "axes_dims_rope": (16, 56, 56),
+        }
+        observed_signature = {
+            key: tuple(getattr(unwrapped.config, key)) if key == "axes_dims_rope" else getattr(unwrapped.config, key)
+            for key in common_signature
+        }
+        if observed_signature != common_signature or (
+            getattr(unwrapped.config, "use_additional_t_cond", False)
+            or getattr(unwrapped.config, "use_layer3d_rope", False)
+        ):
+            raise ValueError(
+                "SPECTRUM Qwen-Image accepts only the Qwen-Image-2512 T2I and "
+                f"Qwen-Image-Edit-2511 architecture. Observed: {observed_signature}."
+            )
+        route = "edit" if getattr(unwrapped.config, "zero_cond_t", False) else "t2i"
+        blocks = list(unwrapped.transformer_blocks)
+        if len(blocks) != 60:
+            raise ValueError("SPECTRUM Qwen-Image requires exactly 60 transformer blocks.")
+
+        state_manager = StateManager(SpectrumQwenImageState, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumQwenImageDenoiserHook(state_manager, route), _SPECTRUM_DENOISER_HOOK
+        )
+        HookRegistry.check_if_exists_or_initialize(blocks[0]).register_hook(
+            SpectrumQwenHeadBlockHook(state_manager), _SPECTRUM_QWEN_HEAD_BLOCK_HOOK
+        )
+        for block in blocks[1:-1]:
+            HookRegistry.check_if_exists_or_initialize(block).register_hook(
+                SpectrumQwenBlockHook(state_manager), _SPECTRUM_QWEN_BLOCK_HOOK
+            )
+        HookRegistry.check_if_exists_or_initialize(blocks[-1]).register_hook(
+            SpectrumQwenBlockHook(state_manager, is_tail=True), _SPECTRUM_QWEN_BLOCK_HOOK
+        )
+        return
+
+    raise ValueError(
+        "SPECTRUM supports bounded Qwen-Image, FLUX.3 Base, "
+        f"Anima/Cosmos and SDXL/SD1.5 UNet only: got {type(unwrapped).__name__}."
+    )

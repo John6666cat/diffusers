@@ -146,6 +146,8 @@ class CacheMixin:
             _SPECTRUM_FLUX3_FEATURE_HOOK,
             _SPECTRUM_UNET_FEATURE_HOOK,
             _SPECTRUM_COSMOS_FEATURE_HOOK,
+            _SPECTRUM_QWEN_HEAD_BLOCK_HOOK,
+            _SPECTRUM_QWEN_BLOCK_HOOK,
         )
         from ..hooks.taylorseer_cache import _TAYLORSEER_CACHE_HOOK
         from ..hooks.text_kv_cache import _TEXT_KV_CACHE_BLOCK_HOOK, _TEXT_KV_CACHE_TRANSFORMER_HOOK
@@ -179,6 +181,8 @@ class CacheMixin:
             registry.remove_hook(_SPECTRUM_UNET_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_COSMOS_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_FLUX3_FEATURE_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_QWEN_HEAD_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_QWEN_BLOCK_HOOK, recurse=True)
         elif isinstance(self._cache_config, TaylorSeerCacheConfig):
             registry.remove_hook(_TAYLORSEER_CACHE_HOOK, recurse=True)
         else:
