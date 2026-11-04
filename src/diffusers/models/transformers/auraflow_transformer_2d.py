@@ -31,6 +31,7 @@ from ..attention_processor import (
 )
 from ..embeddings import TimestepEmbedding, Timesteps
 from ..modeling_outputs import Transformer2DModelOutput
+from ..cache_utils import CacheMixin
 from ..modeling_utils import ModelMixin
 from ..normalization import AdaLayerNormZero, FP32LayerNorm
 
@@ -275,7 +276,7 @@ class AuraFlowJointTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class AuraFlowTransformer2DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
+class AuraFlowTransformer2DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin):
     r"""
     A 2D Transformer model as introduced in AuraFlow (https://blog.fal.ai/auraflow/).
 

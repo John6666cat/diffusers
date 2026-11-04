@@ -143,6 +143,9 @@ class CacheMixin:
         )
         from ..hooks.spectrum_cache import (
             _SPECTRUM_DENOISER_HOOK,
+            _SPECTRUM_HEAD_BLOCK_HOOK,
+            _SPECTRUM_BLOCK_HOOK,
+            _SPECTRUM_FLUX2_FEATURE_HOOK,
             _SPECTRUM_FLUX3_FEATURE_HOOK,
             _SPECTRUM_UNET_FEATURE_HOOK,
             _SPECTRUM_COSMOS_FEATURE_HOOK,
@@ -178,6 +181,9 @@ class CacheMixin:
             registry.remove_hook(_SEA_CACHE_ROOT_HOOK, recurse=True)
         elif isinstance(self._cache_config, SpectrumCacheConfig):
             registry.remove_hook(_SPECTRUM_DENOISER_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_HEAD_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_BLOCK_HOOK, recurse=True)
+            registry.remove_hook(_SPECTRUM_FLUX2_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_UNET_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_COSMOS_FEATURE_HOOK, recurse=True)
             registry.remove_hook(_SPECTRUM_FLUX3_FEATURE_HOOK, recurse=True)
