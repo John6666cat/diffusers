@@ -612,48 +612,59 @@ class AuraFlowPipeline(DiffusionPipeline, AuraFlowLoraLoaderMixin):
         self.scheduler.set_begin_index(0)
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+        self.transformer._reset_stateful_cache()
+        try:
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
-                # aura use timestep value between 0 and 1, with t=1 as noise and t=0 as the image
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = torch.tensor([t / 1000]).expand(latent_model_input.shape[0])
-                timestep = timestep.to(latents.device, dtype=latents.dtype)
+                    # aura use timestep value between 0 and 1, with t=1 as noise and t=0 as the image
+                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                    timestep = torch.tensor([t / 1000]).expand(latent_model_input.shape[0])
+                    timestep = timestep.to(latents.device, dtype=latents.dtype)
 
-                # predict noise model_output
-                noise_pred = self.transformer(
-                    latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep,
-                    return_dict=False,
-                    attention_kwargs=self.attention_kwargs,
-                )[0]
+                    # predict noise model_output
+                    with self.transformer.cache_context(
+                        "cond_uncond" if do_classifier_free_guidance else "cond",
+                        step_index=i,
+                        num_inference_steps=num_inference_steps,
+                        timestep=t,
+                    ):
+                        noise_pred = self.transformer(
+                            latent_model_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timestep,
+                            return_dict=False,
+                            attention_kwargs=self.attention_kwargs,
+                        )[0]
 
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
 
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+                    if XLA_AVAILABLE:
+                        xm.mark_step()
+
+        finally:
+            self.transformer._reset_stateful_cache()
 
         if output_type == "latent":
             image = latents

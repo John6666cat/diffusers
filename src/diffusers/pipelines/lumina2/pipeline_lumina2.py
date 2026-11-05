@@ -662,71 +662,87 @@ class Lumina2Pipeline(DiffusionPipeline, Lumina2LoraLoaderMixin):
         self._num_timesteps = len(timesteps)
 
         # 6. Denoising loop
+        # Keep paired positive/negative calls in one cache history. Truncated or
+        # single-lane CFG must fail closed in the qualified SPECTRUM hook.
+        cache_context_name = (
+            "cond_uncond" if self.do_classifier_free_guidance and cfg_trunc_ratio >= 1.0 else "cond"
+        )
+        self.transformer._reset_stateful_cache()
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                # compute whether apply classifier-free truncation on this timestep
-                do_classifier_free_truncation = (i + 1) / num_inference_steps > cfg_trunc_ratio
-                # reverse the timestep since Lumina uses t=0 as the noise and t=1 as the image
-                current_timestep = 1 - t / self.scheduler.config.num_train_timesteps
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                current_timestep = current_timestep.expand(latents.shape[0])
+        try:
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    # compute whether apply classifier-free truncation on this timestep
+                    do_classifier_free_truncation = (i + 1) / num_inference_steps > cfg_trunc_ratio
+                    # reverse the timestep since Lumina uses t=0 as the noise and t=1 as the image
+                    current_timestep = 1 - t / self.scheduler.config.num_train_timesteps
+                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                    current_timestep = current_timestep.expand(latents.shape[0])
 
-                noise_pred_cond = self.transformer(
-                    hidden_states=latents,
-                    timestep=current_timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    encoder_attention_mask=prompt_attention_mask,
-                    return_dict=False,
-                    attention_kwargs=self.attention_kwargs,
-                )[0]
+                    with self.transformer.cache_context(
+                        cache_context_name, step_index=i, num_inference_steps=num_inference_steps, timestep=t
+                    ):
+                        noise_pred_cond = self.transformer(
+                            hidden_states=latents,
+                            timestep=current_timestep,
+                            encoder_hidden_states=prompt_embeds,
+                            encoder_attention_mask=prompt_attention_mask,
+                            return_dict=False,
+                            attention_kwargs=self.attention_kwargs,
+                        )[0]
 
-                # perform normalization-based guidance scale on a truncated timestep interval
-                if self.do_classifier_free_guidance and not do_classifier_free_truncation:
-                    noise_pred_uncond = self.transformer(
-                        hidden_states=latents,
-                        timestep=current_timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        encoder_attention_mask=negative_prompt_attention_mask,
-                        return_dict=False,
-                        attention_kwargs=self.attention_kwargs,
-                    )[0]
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                    # apply normalization after classifier-free guidance
-                    if cfg_normalization:
-                        cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
-                        noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                        noise_pred = noise_pred * (cond_norm / noise_norm)
-                else:
-                    noise_pred = noise_pred_cond
+                    # perform normalization-based guidance scale on a truncated timestep interval
+                    if self.do_classifier_free_guidance and not do_classifier_free_truncation:
+                        with self.transformer.cache_context(
+                            cache_context_name, step_index=i, num_inference_steps=num_inference_steps, timestep=t
+                        ):
+                            noise_pred_uncond = self.transformer(
+                                hidden_states=latents,
+                                timestep=current_timestep,
+                                encoder_hidden_states=negative_prompt_embeds,
+                                encoder_attention_mask=negative_prompt_attention_mask,
+                                return_dict=False,
+                                attention_kwargs=self.attention_kwargs,
+                            )[0]
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        # apply normalization after classifier-free guidance
+                        if cfg_normalization:
+                            cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
+                            noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                            noise_pred = noise_pred * (cond_norm / noise_norm)
+                    else:
+                        noise_pred = noise_pred_cond
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
-                noise_pred = -noise_pred
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents_dtype = latents.dtype
+                    noise_pred = -noise_pred
+                    latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-                if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                        latents = latents.to(latents_dtype)
+                    if latents.dtype != latents_dtype:
+                        if torch.backends.mps.is_available():
+                            # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
+                            latents = latents.to(latents_dtype)
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
 
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+                    if XLA_AVAILABLE:
+                        xm.mark_step()
+
+        finally:
+            self.transformer._reset_stateful_cache()
 
         if not output_type == "latent":
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor

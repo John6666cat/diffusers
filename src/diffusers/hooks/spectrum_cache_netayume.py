@@ -212,7 +212,19 @@ class SpectrumNetaYumeDenoiserHook(ModelHook):
         encoder_attention_mask = self._get_argument("encoder_attention_mask", args, kwargs)
         attention_kwargs = self._get_argument("attention_kwargs", args, kwargs)
 
+        context = self.state_manager.context
         state.prepare_call(_spectrum_tensor_identity(encoder_hidden_states))
+
+        # Low-level callers may omit step metadata. Native Pipeline contexts
+        # supply it; any step/CFG mismatch uses real forward.
+        if context.step_index is not None and (
+            context.name != "cond_uncond"
+            or type(context.step_index) is not int
+            or context.step_index != state.step_index
+            or type(context.num_inference_steps) is not int
+            or context.num_inference_steps != state.config.num_inference_steps
+        ):
+            state.latch("Neta Yume native CFG/step cache context is not qualified")
 
         if module.training or torch.is_grad_enabled():
             state.latch("autograd/training is not qualified for Neta Yume SPECTRUM")
