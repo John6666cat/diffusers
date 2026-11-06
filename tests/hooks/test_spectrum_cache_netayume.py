@@ -10,6 +10,11 @@ from diffusers.models.transformers.transformer_lumina2 import Lumina2Transformer
 
 CONTROL_FORECAST_STEPS = (15, 20, 23, 25, 27, 36)
 AGGRESSIVE_FORECAST_STEPS = (15, 18, 20, 22, 24, 26, 28, 30, 36)
+N30_FORECAST_STEPS = (
+    10, 11, 13, 14, 15, 16, 17, 19, 20, 21,
+    22, 23, 25, 26, 27, 28, 29, 31, 32, 33,
+    34, 35, 37, 38, 39, 40, 41, 43, 44, 45,
+)
 CACHE_KWARGS = dict(
     num_inference_steps=50,
     warmup_steps=0,
@@ -73,7 +78,7 @@ def test_netayume_lumina2_exposes_cache_mixin_api():
         assert hasattr(Lumina2Transformer2DModel, name)
 
 
-@pytest.mark.parametrize("forecast_steps", [CONTROL_FORECAST_STEPS, AGGRESSIVE_FORECAST_STEPS])
+@pytest.mark.parametrize("forecast_steps", [CONTROL_FORECAST_STEPS, AGGRESSIVE_FORECAST_STEPS, N30_FORECAST_STEPS])
 def test_netayume_dual_lane_schedule_and_shapes(forecast_steps):
     kwargs = dict(CACHE_KWARGS)
     kwargs["forecast_step_indices"] = forecast_steps
@@ -115,7 +120,7 @@ def test_netayume_dual_lane_schedule_and_shapes(forecast_steps):
     }
 
 
-@pytest.mark.parametrize("forecast_steps", [CONTROL_FORECAST_STEPS, AGGRESSIVE_FORECAST_STEPS])
+@pytest.mark.parametrize("forecast_steps", [CONTROL_FORECAST_STEPS, AGGRESSIVE_FORECAST_STEPS, N30_FORECAST_STEPS])
 def test_netayume_exact_profile_registers_on_tiny_topology(forecast_steps):
     model = _tiny_lumina2()
     kwargs = dict(CACHE_KWARGS)
@@ -126,10 +131,17 @@ def test_netayume_exact_profile_registers_on_tiny_topology(forecast_steps):
     assert not model.is_cache_enabled
 
 
-def test_netayume_rejects_unqualified_profile():
+@pytest.mark.parametrize(
+    "forecast_steps",
+    [
+        (15, 18, 20, 21, 23, 24, 26, 27, 29, 36),
+        tuple(i for i in range(7, 46) if i not in (13, 22, 31, 40)),  # N35 stays parked
+    ],
+)
+def test_netayume_rejects_unqualified_profile(forecast_steps):
     model = _tiny_lumina2()
     kwargs = dict(CACHE_KWARGS)
-    kwargs["forecast_step_indices"] = (15, 18, 20, 21, 23, 24, 26, 27, 29, 36)
+    kwargs["forecast_step_indices"] = forecast_steps
     with pytest.raises(ValueError, match="qualified Neta Yume schedules"):
         model.enable_cache(SpectrumCacheConfig(**kwargs))
 

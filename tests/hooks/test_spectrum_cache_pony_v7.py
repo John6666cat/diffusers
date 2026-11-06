@@ -27,7 +27,10 @@ def pony_cfg(**overrides):
     return SpectrumCacheConfig(**kwargs)
 
 
-@pytest.mark.parametrize("forecast_steps", [(20,), (17, 19, 21, 23)])
+@pytest.mark.parametrize(
+    "forecast_steps",
+    [(20,), (17, 19, 21, 23), (13, 15, 17, 19, 21, 23, 25, 27)],
+)
 def test_pony_v7_state_qualified_schedules(forecast_steps):
     state = SpectrumPonyV7State(pony_cfg(forecast_step_indices=forecast_steps))
     conditioning_id = (123, 0, (2, 256, 2048), "torch.bfloat16", "cuda:0")
@@ -107,10 +110,21 @@ def _tiny_qualified_auraflow():
     return model
 
 
-def test_pony_v7_rejects_unqualified_schedule():
+def test_pony_v7_accepts_p8_schedule():
+    model = _tiny_qualified_auraflow()
+    model.enable_cache(pony_cfg(forecast_step_indices=(13, 15, 17, 19, 21, 23, 25, 27)))
+    assert model.is_cache_enabled
+    model.disable_cache()
+    assert not model.is_cache_enabled
+
+
+@pytest.mark.parametrize(
+    "forecast_steps", [(17, 19, 21), (5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27)]
+)
+def test_pony_v7_rejects_unqualified_schedule(forecast_steps):
     model = _tiny_qualified_auraflow()
     with pytest.raises(ValueError, match="qualified Pony V7 schedules"):
-        model.enable_cache(pony_cfg(forecast_step_indices=(17, 19, 21)))
+        model.enable_cache(pony_cfg(forecast_step_indices=forecast_steps))
 
 
 def test_pony_v7_disable_cache_removes_single_block_hooks():

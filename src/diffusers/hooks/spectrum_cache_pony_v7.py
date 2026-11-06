@@ -310,6 +310,7 @@ def apply_spectrum_cache_pony_v7(module: torch.nn.Module, config: SpectrumCacheC
     qualified_schedules = (
         (20,),
         (17, 19, 21, 23),
+        (13, 15, 17, 19, 21, 23, 25, 27),  # explicit P8 opt-in
     )
     observed_steps = tuple(config.forecast_step_indices or ())
     qualified_steps = observed_steps if observed_steps in qualified_schedules else None

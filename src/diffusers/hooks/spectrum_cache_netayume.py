@@ -371,6 +371,11 @@ def apply_spectrum_cache_netayume(module: torch.nn.Module, config: SpectrumCache
     qualified_schedules = (
         (15, 20, 23, 25, 27, 36),
         (15, 18, 20, 22, 24, 26, 28, 30, 36),
+        (
+            10, 11, 13, 14, 15, 16, 17, 19, 20, 21,
+            22, 23, 25, 26, 27, 28, 29, 31, 32, 33,
+            34, 35, 37, 38, 39, 40, 41, 43, 44, 45,
+        ),
     )
     observed_steps = tuple(config.forecast_step_indices or ())
     qualified_steps = observed_steps if observed_steps in qualified_schedules else None
