@@ -312,6 +312,40 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_flux2_klein_base4b(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
+        """Build the opt-in 50-step FLUX.2 Klein Base 4B P35 research profile.
+
+        This preset reproduces the owner-reviewed Base 4B 50-step text-to-image
+        configuration: 35 forecast steps per CFG lane and 15 full evaluations.
+        The non-distilled model guard remains in the FLUX.2 adapter. Other step
+        counts, Klein sizes, image-conditioned routes, and product qualification
+        are outside this preset's research evidence.
+
+        Cache remains disabled until the caller explicitly enables it.
+        """
+        if num_inference_steps != 50:
+            raise ValueError("for_flux2_klein_base4b is supported only at 50 inference steps")
+
+        return cls(
+            num_inference_steps=50,
+            warmup_steps=0,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            coordinate_policy="legacy_fixed_max",
+            coordinate_max=50.0,
+            tail_actual_steps=0,
+            forecast_step_indices=(
+                6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21,
+                22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 34, 35, 36,
+                37, 38, 39, 40, 42, 43, 44, 45,
+            ),
+        )
+
+    @classmethod
     def for_anima_variable(cls, num_inference_steps: int = 30) -> "SpectrumCacheConfig":
         """Build the opt-in ordinary Anima variable-step profile.
 

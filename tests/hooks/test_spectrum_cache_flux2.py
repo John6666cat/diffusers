@@ -2,7 +2,49 @@
 import torch
 
 from diffusers import Flux2Transformer2DModel
-from diffusers.hooks.spectrum_cache import SpectrumCacheConfig
+from diffusers.hooks.spectrum_cache import SpectrumCacheConfig, SpectrumSchedule
+
+
+def test_spectrum_flux2_klein_base4b_p35_preset_matches_owner_gpu_profile():
+    cfg = SpectrumCacheConfig.for_flux2_klein_base4b()
+    expected_forecasts = (
+        6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21,
+        22, 23, 24, 26, 27, 28, 29, 30, 31, 32, 34, 35, 36,
+        37, 38, 39, 40, 42, 43, 44, 45,
+    )
+    assert cfg.num_inference_steps == 50
+    assert cfg.warmup_steps == 0
+    assert (cfg.window_size, cfg.flex_window) == (2.0, 0.0)
+    assert (cfg.degree, cfg.ridge_lambda, cfg.blend_w, cfg.history_limit) == (2, 0.1, 0.5, 8)
+    assert (cfg.coordinate_policy, cfg.coordinate_max, cfg.tail_actual_steps) == (
+        "legacy_fixed_max", 50.0, 0,
+    )
+    assert cfg.forecast_step_indices == expected_forecasts
+    schedule = SpectrumSchedule(cfg)
+    assert tuple(step for step in range(50) if not schedule.decide(step)) == expected_forecasts
+    assert len(expected_forecasts) == 35
+    assert sum(step not in expected_forecasts for step in range(50)) == 15
+
+
+def test_spectrum_flux2_klein_base4b_p35_is_explicit_and_50_step_only():
+    assert SpectrumCacheConfig().forecast_step_indices is None
+    for steps in (4, 20, 49, 51):
+        try:
+            SpectrumCacheConfig.for_flux2_klein_base4b(steps)
+        except ValueError as error:
+            assert "50 inference steps" in str(error)
+        else:
+            raise AssertionError(f"Unexpected P35 preset approval at {steps} steps")
+
+
+def test_spectrum_flux2_klein_base4b_p35_does_not_enable_distilled_route():
+    model = make_model(guidance_embeds=True)
+    try:
+        model.enable_cache(SpectrumCacheConfig.for_flux2_klein_base4b())
+    except ValueError as error:
+        assert "non-distilled Klein Base route" in str(error)
+    else:
+        raise AssertionError("P35 preset must not override the existing distilled-model guard")
 
 
 def make_model(guidance_embeds=False):
