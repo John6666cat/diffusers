@@ -312,6 +312,35 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_flux1_dev(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
+        """Build the opt-in 50-step FLUX.1-dev distributed-refresh profile.
+
+        The fixed schedule performs 17 full transformer evaluations and 33
+        feature forecasts. It was evaluated for FLUX.1-dev text-to-image with
+        guidance embeddings; other step counts and conditioning routes are not
+        covered by this preset. Cache remains disabled until explicitly enabled.
+        """
+        if num_inference_steps != 50:
+            raise ValueError("for_flux1_dev is supported only at 50 inference steps")
+
+        full_steps = {0, 1, 2, 3, 4, 6, 11, 15, 19, 24, 27, 30, 33, 37, 40, 44, 47}
+        return cls(
+            num_inference_steps=50,
+            warmup_steps=5,
+            window_size=2.0,
+            flex_window=3.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=100,
+            predictor_backend="dense",
+            coordinate_policy="legacy_fixed_max",
+            coordinate_max=50.0,
+            tail_actual_steps=0,
+            forecast_step_indices=tuple(step for step in range(50) if step not in full_steps),
+        )
+
+    @classmethod
     def for_flux2_klein_base4b(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
         """Build the opt-in 50-step FLUX.2 Klein Base 4B P35 research profile.
 
@@ -2398,6 +2427,37 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         HookRegistry.check_if_exists_or_initialize(unwrapped.conv_norm_out).register_hook(
             SpectrumUNetFeatureHook(state_manager), _SPECTRUM_UNET_FEATURE_HOOK
+        )
+        return
+
+    # FLUX.1-dev uses a fixed 50-step coordinate mapping for its image-feature cache.
+    from ..models.transformers.transformer_flux import FluxTransformer2DModel
+
+    if isinstance(unwrapped, FluxTransformer2DModel):
+        if not bool(getattr(unwrapped.config, "guidance_embeds", False)):
+            raise ValueError("SPECTRUM FLUX.1 requires FLUX.1-dev (guidance_embeds=True).")
+        if (
+            config.num_inference_steps != 50
+            or config.coordinate_policy != "legacy_fixed_max"
+            or config.coordinate_max != 50.0
+        ):
+            raise ValueError("SPECTRUM FLUX.1 requires 50 inference steps and legacy 50-coordinate mapping.")
+        if getattr(unwrapped, "norm_out", None) is None or getattr(unwrapped, "proj_out", None) is None:
+            raise ValueError("SPECTRUM FLUX.1 requires norm_out and proj_out.")
+
+        from .spectrum_flux1 import (
+            _SPECTRUM_FLUX1_FEATURE_HOOK,
+            SpectrumFlux1DenoiserHook,
+            SpectrumFlux1FeatureHook,
+            SpectrumFlux1State,
+        )
+
+        state_manager = StateManager(SpectrumFlux1State, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumFlux1DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK
+        )
+        HookRegistry.check_if_exists_or_initialize(unwrapped.norm_out).register_hook(
+            SpectrumFlux1FeatureHook(state_manager), _SPECTRUM_FLUX1_FEATURE_HOOK
         )
         return
 
