@@ -434,6 +434,47 @@ class SpectrumCacheConfig:
             tail_actual_steps=tail_actual_steps,
         )
 
+    @classmethod
+    def for_qwen_image21_variable(
+        cls, num_inference_steps: int = 20, *, forecast_fraction: float = 0.55
+    ) -> "SpectrumCacheConfig":
+        """Opt-in Qwen-Image 2.1 native-KV profile for 16–40 steps.
+
+        The 55% default is the visually selected research Source profile.
+        Other fractions, especially 60% or more, remain experimental.
+        """
+        if not 16 <= num_inference_steps <= 40:
+            raise ValueError("for_qwen_image21_variable requires 16 <= num_inference_steps <= 40")
+        if not 0.0 < forecast_fraction < 1.0:
+            raise ValueError("forecast_fraction must be between 0 and 1")
+        warmup_steps = max(5, round(0.18 * num_inference_steps))
+        tail_actual_steps = max(2, round(0.08 * num_inference_steps))
+        eligible = list(range(warmup_steps, num_inference_steps - tail_actual_steps))
+        desired = min(len(eligible), round(forecast_fraction * num_inference_steps))
+        anchors = len(eligible) - desired
+        real_positions = {
+            eligible[max(0, min(((j + 1) * (len(eligible) + 1)) // (anchors + 1) - 1, len(eligible) - 1))]
+            for j in range(anchors)
+        }
+        forecast_steps = tuple(step for step in eligible if step not in real_positions)
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=warmup_steps,
+            window_size=2.0,
+            flex_window=0.25,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="bounded",
+            predictor_cache_bytes=32 * 1024 * 1024,
+            predictor_chunk_size=131_072,
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=20.0,
+            tail_actual_steps=tail_actual_steps,
+            forecast_step_indices=forecast_steps,
+        )
+
     def __post_init__(self) -> None:
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")
@@ -2478,7 +2519,34 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    # Keep Qwen import after existing-family dispatch to avoid new optional imports.
+    # Qwen-Image 2.1 has a distinct native-KV joint-prefill/target-only body.
+    # Keep the adapter separate from historical Qwen-Image paths.
+    from ..models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
+
+    if isinstance(unwrapped, QwenImage21Transformer2DModel):
+        if (
+            not 16 <= config.num_inference_steps <= 40
+            or config.coordinate_policy != "runtime_horizon_normalized"
+            or config.forecast_step_indices is None
+        ):
+            raise ValueError("SPECTRUM Qwen-Image 2.1 requires an explicit 16–40-step native-KV profile.")
+        signature = {"patch_size": 1, "in_channels": 64, "out_channels": 64, "num_layers": 32}
+        if any(getattr(unwrapped.config, name, None) != value for name, value in signature.items()):
+            raise ValueError("SPECTRUM Qwen-Image 2.1 requires the standard 32-block architecture.")
+        if not bool(getattr(unwrapped.config, "causal_condition", False)):
+            raise ValueError("SPECTRUM Qwen-Image 2.1 requires causal_condition=True.")
+        if len(unwrapped.transformer_blocks) != 32:
+            raise ValueError("SPECTRUM Qwen-Image 2.1 requires exactly 32 transformer blocks.")
+
+        from .spectrum_qwenimage21 import SpectrumQwen21DenoiserHook, SpectrumQwen21State
+
+        state_manager = StateManager(SpectrumQwen21State, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumQwen21DenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK
+        )
+        return
+
+    # Keep original Qwen import after existing-family dispatch.
     from ..models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 
     if isinstance(unwrapped, QwenImageTransformer2DModel):
