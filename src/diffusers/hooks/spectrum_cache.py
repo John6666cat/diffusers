@@ -2519,6 +2519,63 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
+    # Experimental reentry of the historical 52-step Krea 2 Raw paired-CFG path.
+    # Keep its two-lane adapter isolated from the currently qualified families.
+    from ..models.transformers.transformer_krea2 import Krea2Transformer2DModel
+
+    if isinstance(unwrapped, Krea2Transformer2DModel):
+        if (
+            config.num_inference_steps != 52
+            or config.denoiser_call_topology != "paired_cfg"
+            or config.coordinate_policy != "runtime_horizon_normalized"
+            or config.forecast_step_indices is None
+        ):
+            raise ValueError("Research Krea 2 Raw requires explicit 52-step paired-CFG horizon-normalized profile.")
+
+        signature = {
+            "in_channels": 64,
+            "num_layers": 28,
+            "attention_head_dim": 128,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 12,
+            "intermediate_size": 16384,
+            "timestep_embed_dim": 256,
+            "text_hidden_dim": 2560,
+            "num_text_layers": 12,
+            "text_num_attention_heads": 20,
+            "text_num_key_value_heads": 20,
+            "text_intermediate_size": 6912,
+            "num_layerwise_text_blocks": 2,
+            "num_refiner_text_blocks": 2,
+            "axes_dims_rope": (32, 48, 48),
+            "rope_theta": 1000.0,
+            "norm_eps": 1e-5,
+        }
+        observed = {
+            name: tuple(getattr(unwrapped.config, name, ())) if name == "axes_dims_rope"
+            else getattr(unwrapped.config, name, None)
+            for name in signature
+        }
+        if observed != signature or len(unwrapped.transformer_blocks) != 28:
+            raise ValueError("Research Krea 2 Raw requires the historical standard 28-block architecture.")
+
+        from .spectrum_krea2 import (
+            SpectrumKrea2RawBlockHook,
+            SpectrumKrea2RawDenoiserHook,
+            SpectrumKrea2RawState,
+        )
+
+        manager = StateManager(SpectrumKrea2RawState, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumKrea2RawDenoiserHook(manager), _SPECTRUM_DENOISER_HOOK
+        )
+        for index, block in enumerate(unwrapped.transformer_blocks):
+            name = _SPECTRUM_HEAD_BLOCK_HOOK if index == 0 else _SPECTRUM_BLOCK_HOOK
+            HookRegistry.check_if_exists_or_initialize(block).register_hook(
+                SpectrumKrea2RawBlockHook(manager, head=index == 0, tail=index == 27), name
+            )
+        return
+
     # Qwen-Image 2.1 has a distinct native-KV joint-prefill/target-only body.
     # Keep the adapter separate from historical Qwen-Image paths.
     from ..models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
@@ -2614,6 +2671,6 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     raise ValueError(
         "SPECTRUM supports qualified FLUX.2 Klein Base, Neta Yume/Lumina2, Pony V7/AuraFlow, "
-        "bounded Qwen-Image, FLUX.3 Base, Anima/Cosmos and SDXL/SD1.5 UNet only: "
+        "experimental Krea 2 Raw, bounded Qwen-Image, FLUX.3 Base, Anima/Cosmos and SDXL/SD1.5 UNet only: "
         f"got {type(unwrapped).__name__}."
     )
