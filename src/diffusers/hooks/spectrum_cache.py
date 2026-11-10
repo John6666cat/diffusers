@@ -435,6 +435,63 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_zimage_turbo(cls) -> "SpectrumCacheConfig":
+        """Opt-in Z-Image Turbo research profile: P3_356, 8 forwards, 3 forecasts.
+
+        Qualified only for the owner's narrow NF4/BF16 0.42.1 visual probe;
+        P4 remains challenge-only. This is not a default cache setting.
+        """
+        return cls(
+            num_inference_steps=8,
+            warmup_steps=3,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="dense",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=8.0,
+            tail_actual_steps=1,
+            forecast_step_indices=(3, 5, 6),
+        )
+
+    @classmethod
+    def for_zimage_base_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """Opt-in Z-Image Base research P12 at 28 steps.
+
+        28-step P12 was visually selected in the owner's narrow NF4 0.42.1 probe.
+        Other 20–40-step counts keep the historical, not requalified schedule.
+        P13_355 remains challenge-only; cache is never enabled by default.
+        """
+        if not 20 <= num_inference_steps <= 40:
+            raise ValueError("for_zimage_base_variable requires 20 <= num_inference_steps <= 40")
+
+        early_actual_steps = max(1, math.floor(9 * num_inference_steps / 28 + 0.5))
+        tail_actual_steps = max(1, math.floor(4 * num_inference_steps / 28 + 0.5))
+        forecast_steps = (
+            (9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23)
+            if num_inference_steps == 28
+            else tuple(range(early_actual_steps, num_inference_steps - tail_actual_steps, 2))
+        )
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=early_actual_steps,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=3,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=28,
+            predictor_backend="dense",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=28.0,
+            tail_actual_steps=tail_actual_steps,
+            forecast_step_indices=forecast_steps,
+        )
+
+    @classmethod
     def for_qwen_image21_variable(
         cls, num_inference_steps: int = 20, *, forecast_fraction: float = 0.55
     ) -> "SpectrumCacheConfig":
@@ -2653,6 +2710,50 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
+    # Migrate the historically qualified Z-Image Base post-refiner block boundary.
+    from ..models.transformers.transformer_z_image import ZImageTransformer2DModel
+
+    if isinstance(unwrapped, ZImageTransformer2DModel):
+        if (
+            config.coordinate_policy != "runtime_horizon_normalized"
+            or not 20 <= config.num_inference_steps <= 40
+            or config.forecast_step_indices is None
+        ):
+            raise ValueError("Z-Image Base SPECTRUM requires the explicit 20–40-step variable-step profile.")
+        expected = {
+            "all_patch_size": (2,),
+            "all_f_patch_size": (1,),
+            "in_channels": 16,
+            "dim": 3840,
+            "n_layers": 30,
+            "n_refiner_layers": 2,
+            "n_heads": 30,
+            "n_kv_heads": 30,
+            "cap_feat_dim": 2560,
+            "siglip_feat_dim": None,
+        }
+        observed = {
+            name: tuple(getattr(unwrapped.config, name)) if name in {"all_patch_size", "all_f_patch_size"}
+            else getattr(unwrapped.config, name, None)
+            for name in expected
+        }
+        blocks = list(unwrapped.layers)
+        if observed != expected or len(blocks) != 30:
+            raise ValueError("Z-Image Base SPECTRUM requires the historical standard 30-block T2I architecture.")
+
+        from .spectrum_zimage import SpectrumZImageBlockHook, SpectrumZImageDenoiserHook, SpectrumZImageState
+
+        manager = StateManager(SpectrumZImageState, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumZImageDenoiserHook(manager), _SPECTRUM_DENOISER_HOOK
+        )
+        for index, block in enumerate(blocks):
+            HookRegistry.check_if_exists_or_initialize(block).register_hook(
+                SpectrumZImageBlockHook(manager, head=index == 0, tail=index == 29),
+                _SPECTRUM_HEAD_BLOCK_HOOK if index == 0 else _SPECTRUM_BLOCK_HOOK,
+            )
+        return
+
     from ..models.transformers.transformer_lumina2 import Lumina2Transformer2DModel
 
     if isinstance(unwrapped, Lumina2Transformer2DModel):
@@ -2671,6 +2772,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     raise ValueError(
         "SPECTRUM supports qualified FLUX.2 Klein Base, Neta Yume/Lumina2, Pony V7/AuraFlow, "
-        "experimental Krea 2 Raw, bounded Qwen-Image, FLUX.3 Base, Anima/Cosmos and SDXL/SD1.5 UNet only: "
+        "experimental Krea 2 Raw, bounded Qwen-Image, Z-Image Base, FLUX.3 Base, Anima/Cosmos "
+        "and SDXL/SD1.5 UNet only: "
         f"got {type(unwrapped).__name__}."
     )
