@@ -492,6 +492,38 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def _for_sd35_p13(cls) -> "SpectrumCacheConfig":
+        # Output-cut, 28-step profile. Prediction placement is part of the profile.
+        return cls(
+            num_inference_steps=28,
+            warmup_steps=5,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="chunked",
+            coordinate_policy="runtime_index_normalized",
+            tail_actual_steps=2,
+            forecast_step_indices=(5, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 24),
+        )
+
+    @classmethod
+    def for_sd35_large(cls) -> "SpectrumCacheConfig":
+        """Experimental SD3.5 Large 28-step output prediction, P13.
+
+        Explicit opt-in only. P14 is not part of this research profile.
+        """
+        return cls._for_sd35_p13()
+
+    @classmethod
+    def for_sd35_medium(cls) -> "SpectrumCacheConfig":
+        """Experimental SD3.5 Medium 28-step output prediction, P13.
+
+        Explicit opt-in only. Evaluation is limited to the observed settings.
+        """
+        return cls._for_sd35_p13()
+
+    @classmethod
     def for_qwen_image21_variable(
         cls, num_inference_steps: int = 20, *, forecast_fraction: float = 0.55
     ) -> "SpectrumCacheConfig":
