@@ -2742,16 +2742,20 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    # Migrate the historically qualified Z-Image Base post-refiner block boundary.
+    # Z-Image Base and Turbo share the post-refiner block boundary.
     from ..models.transformers.transformer_z_image import ZImageTransformer2DModel
 
     if isinstance(unwrapped, ZImageTransformer2DModel):
-        if (
-            config.coordinate_policy != "runtime_horizon_normalized"
-            or not 20 <= config.num_inference_steps <= 40
-            or config.forecast_step_indices is None
-        ):
-            raise ValueError("Z-Image Base SPECTRUM requires the explicit 20–40-step variable-step profile.")
+        base_profile = (
+            config.coordinate_policy == "runtime_horizon_normalized"
+            and 20 <= config.num_inference_steps <= 40
+            and config.forecast_step_indices is not None
+        )
+        turbo_profile = config == SpectrumCacheConfig.for_zimage_turbo()
+        if not (base_profile or turbo_profile):
+            raise ValueError(
+                "Z-Image SPECTRUM requires a 20–40-step Base profile or the exact 8-step Turbo P3_356 profile."
+            )
         expected = {
             "all_patch_size": (2,),
             "all_f_patch_size": (1,),
@@ -2771,7 +2775,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         }
         blocks = list(unwrapped.layers)
         if observed != expected or len(blocks) != 30:
-            raise ValueError("Z-Image Base SPECTRUM requires the historical standard 30-block T2I architecture.")
+            raise ValueError("Z-Image SPECTRUM requires the historical standard 30-block T2I architecture.")
 
         from .spectrum_zimage import SpectrumZImageBlockHook, SpectrumZImageDenoiserHook, SpectrumZImageState
 
@@ -2804,7 +2808,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     raise ValueError(
         "SPECTRUM supports qualified FLUX.2 Klein Base, Neta Yume/Lumina2, Pony V7/AuraFlow, "
-        "experimental Krea 2 Raw, bounded Qwen-Image, Z-Image Base, FLUX.3 Base, Anima/Cosmos "
+        "experimental Krea 2 Raw, bounded Qwen-Image, Z-Image Base/Turbo, FLUX.3 Base, Anima/Cosmos "
         "and SDXL/SD1.5 UNet only: "
         f"got {type(unwrapped).__name__}."
     )
