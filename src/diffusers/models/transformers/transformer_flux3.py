@@ -24,6 +24,7 @@ from ...utils import apply_lora_scale, logging
 from ...utils.torch_utils import maybe_adjust_dtype_for_device
 from ..attention import AttentionMixin, AttentionModuleMixin
 from ..attention_dispatch import dispatch_attention_fn
+from ..cache_utils import CacheMixin
 from ..embeddings import TimestepEmbedding, Timesteps, apply_rotary_emb, get_1d_rotary_pos_embed
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
@@ -338,7 +339,7 @@ class Flux3AdaLayerNorm(nn.Module):
         return self.norm(hidden_states) * (1 + scale) + shift
 
 
-class Flux3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, AttentionMixin):
+class Flux3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, AttentionMixin, CacheMixin):
     """
     The Transformer model introduced in FLUX.3 for text-to-image and image-to-image generation.
 

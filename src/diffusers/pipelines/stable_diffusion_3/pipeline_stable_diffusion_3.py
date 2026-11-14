@@ -805,6 +805,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         skip_layer_guidance_stop: float = 0.2,
         skip_layer_guidance_start: float = 0.01,
         mu: float | None = None,
+        spectrum_cache_config: Any | None = None,
     ) -> StableDiffusion3PipelineOutput | tuple:
         r"""
         Function invoked when calling the pipeline for generation.
@@ -915,6 +916,11 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 `skip_guidance_layers` from the fraction specified in `skip_layer_guidance_start`. Recommended value by
                 StabiltyAI for Stable Diffusion 3.5 Medium is 0.01.
             mu (`float`, *optional*): `mu` value used for `dynamic_shifting`.
+            spectrum_cache_config (`SpectrumCacheConfig`, *optional*):
+                Explicit experimental SPECTRUM transformer-output prediction configuration. For a 28-step SD3.5
+                Large or Medium text-to-image research run, use `SpectrumCacheConfig.for_sd35_large()` or
+                `SpectrumCacheConfig.for_sd35_medium()` from `diffusers.hooks.spectrum_cache`. The default `None`
+                preserves the original full-compute path. Other schedules and conditioning paths are not qualified.
 
         Examples:
 
@@ -1041,6 +1047,12 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
+        sd35_gate = None
+        if spectrum_cache_config is not None:
+            from ...hooks.spectrum_sd35 import SD35SpectrumGate
+
+            sd35_gate = SD35SpectrumGate(spectrum_cache_config)
+            sd35_gate.begin(timesteps=timesteps, do_classifier_free_guidance=self.do_classifier_free_guidance)
 
         # 6. Prepare image embeddings
         if (ip_adapter_image is not None and self.is_ip_adapter_active) or ip_adapter_image_embeds is not None:
@@ -1071,14 +1083,34 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 if timestep.device.type == "tpu":
                     timestep = timestep.clone()
 
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
+                if sd35_gate is None:
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_prompt_embeds,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                else:
+                    noise_pred = sd35_gate.predict_or_compute(
+                        step_index=i,
+                        timestep=t,
+                        model_input=latent_model_input,
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        guidance_scale=self.guidance_scale,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        skip_guidance_layers=skip_guidance_layers,
+                        forward=lambda: self.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=timestep,
+                            encoder_hidden_states=prompt_embeds,
+                            pooled_projections=pooled_prompt_embeds,
+                            joint_attention_kwargs=self.joint_attention_kwargs,
+                            return_dict=False,
+                        )[0],
+                    )
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1126,6 +1158,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     pooled_prompt_embeds = callback_outputs.pop("pooled_prompt_embeds", pooled_prompt_embeds)
+                    if sd35_gate is not None:
+                        sd35_gate.invalidate("callback executed")
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
