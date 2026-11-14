@@ -409,6 +409,68 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_wan21_13b_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
+        """Research reentry profile for text-only Wan2.1 T2V 1.3B.
+
+        Preserve the previously tested 50-step mid19/keep10 schedule. Scale the
+        protected early and tail regions to 40–60 steps, retaining two forecast
+        positions per three interior steps. This is not a Wan2.1 14B / Wan2.2
+        or a general video-quality qualification.
+        """
+        if not 40 <= num_inference_steps <= 60:
+            raise ValueError("for_wan21_13b_variable requires 40 <= num_inference_steps <= 60")
+        early = max(1, math.floor(0.22 * num_inference_steps + 0.5))
+        tail = max(1, math.floor(0.20 * num_inference_steps + 0.5))
+        forecast = tuple(
+            index for index in range(early, num_inference_steps - tail) if (index - early) % 3 != 1
+        )
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=early,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=100,
+            predictor_backend="dense",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=50.0,
+            tail_actual_steps=tail,
+            forecast_step_indices=forecast,
+        )
+
+    @classmethod
+    def for_wan21_13b_nfe12_nested(cls) -> "SpectrumCacheConfig":
+        """Opt-in Wan2.1 T2V 1.3B 50-step / NFE12 research-adopted profile.
+
+        The exact sparse layout was visually acceptable in two V20 holdouts;
+        this does not qualify other Wan variants or production video quality.
+        """
+        actual_steps = (0, 1, 2, 3, 7, 11, 18, 26, 34, 38, 42, 49)
+        return replace(
+            cls.for_wan21_13b_variable(50),
+            warmup_steps=4,
+            tail_actual_steps=1,
+            forecast_step_indices=tuple(i for i in range(50) if i not in actual_steps),
+        )
+
+    @classmethod
+    def for_wan21_13b_nfe11_add5(cls) -> "SpectrumCacheConfig":
+        """Opt-in Wan2.1 T2V 1.3B 50-step / NFE11 challenge profile.
+
+        The exact sparse layout was marginally visually acceptable in the
+        V20 holdouts; it is a research challenger, not the preferred profile.
+        """
+        actual_steps = (0, 1, 2, 3, 5, 11, 18, 26, 34, 42, 49)
+        return replace(
+            cls.for_wan21_13b_variable(50),
+            warmup_steps=4,
+            tail_actual_steps=1,
+            forecast_step_indices=tuple(i for i in range(50) if i not in actual_steps),
+        )
+
+    @classmethod
     def for_qwen_image_variable(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
         """Construct a bounded Qwen-Image variable-step cache profile.
 
@@ -2546,6 +2608,54 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         HookRegistry.check_if_exists_or_initialize(unwrapped.norm_out).register_hook(
             SpectrumCosmosFeatureHook(state_manager), _SPECTRUM_COSMOS_FEATURE_HOOK
         )
+        return
+
+    # Research reentry of the pinned text-only Wan2.1 T2V 1.3B path.
+    # Its block contract differs from the generic image-family adapters.
+    from ..models.transformers.transformer_wan import WanTransformer3DModel
+
+    if isinstance(unwrapped, WanTransformer3DModel):
+        if (
+            not 40 <= config.num_inference_steps <= 60
+            or config.coordinate_policy != "runtime_horizon_normalized"
+            or config.forecast_step_indices is None
+            or config.denoiser_call_topology == "paired_cfg"
+        ):
+            raise ValueError("Research Wan2.1 1.3B requires a 40–60-step explicit native-context schedule.")
+        expected = {
+            "num_layers": 30,
+            "num_attention_heads": 12,
+            "attention_head_dim": 128,
+            "ffn_dim": 8960,
+            "text_dim": 4096,
+            "in_channels": 16,
+            "out_channels": 16,
+            "patch_size": (1, 2, 2),
+        }
+        observed = {
+            name: tuple(getattr(unwrapped.config, name, ())) if name == "patch_size"
+            else getattr(unwrapped.config, name, None)
+            for name in expected
+        }
+        if observed != expected or len(unwrapped.blocks) != 30:
+            raise ValueError("Research Wan2.1 T2V 1.3B transformer architecture does not match the pinned route.")
+        if (
+            getattr(unwrapped.config, "image_dim", None) is not None
+            or getattr(unwrapped.config, "added_kv_proj_dim", None) is not None
+        ):
+            raise ValueError("Research Wan SPECTRUM permits text-only T2V, not I2V or special KV conditioning.")
+
+        from .spectrum_wan import SpectrumWanBlockHook, SpectrumWanDenoiserHook, SpectrumWanState
+
+        state_manager = StateManager(SpectrumWanState, init_args=(config,))
+        HookRegistry.check_if_exists_or_initialize(module).register_hook(
+            SpectrumWanDenoiserHook(state_manager), _SPECTRUM_DENOISER_HOOK
+        )
+        for index, block in enumerate(unwrapped.blocks):
+            HookRegistry.check_if_exists_or_initialize(block).register_hook(
+                SpectrumWanBlockHook(state_manager, head=index == 0, tail=index == 29),
+                _SPECTRUM_HEAD_BLOCK_HOOK if index == 0 else _SPECTRUM_BLOCK_HOOK,
+            )
         return
 
     if isinstance(unwrapped, UNet2DConditionModel):
