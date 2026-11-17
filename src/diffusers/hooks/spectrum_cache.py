@@ -75,6 +75,7 @@ class SpectrumCacheConfig:
             `"chunked"` materializes coefficients only in fixed chunks with near-zero retained coefficient state;
             `"bounded"` retains at most a bounded contiguous native coefficient slab and evaluates the uncached suffix
             in chunks, preserving the current low-precision coefficient-quantization boundary.
+            `"fp32_weighted"` is an experimental, opt-in history-weighted FP32 evaluation with a final dtype cast.
         predictor_cache_bytes (`int`, defaults to `67108864`):
             Maximum native coefficient bytes retained by the `"bounded"` backend.
         predictor_chunk_size (`int`, defaults to `1048576`):
@@ -626,6 +627,34 @@ class SpectrumCacheConfig:
             forecast_step_indices=forecast_steps,
         )
 
+    @classmethod
+    def for_moss_image_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
+        """Opt-in variable-step MOSS H1 + FP32 weighted predictor.
+
+        N50 uses the reference F28 schedule. Other N share the deterministic
+        schedule formula; N<18 is not eligible for this cache preset.
+        Calling this factory alone does not enable the cache.
+        """
+        from .spectrum_moss_variable_n import moss_variable_n_forecast_indices
+
+        steps = moss_variable_n_forecast_indices(num_inference_steps)
+        if not steps:
+            raise ValueError("MOSS variable-step cache requires N>=18; keep cache OFF at lower N")
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=8,
+            window_size=2.0,
+            flex_window=0.25,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.55,
+            history_limit=6,
+            predictor_backend="fp32_weighted",
+            coordinate_policy="runtime_index_normalized",
+            tail_actual_steps=2,
+            forecast_step_indices=steps,
+        )
+
     def __post_init__(self) -> None:
         if self.num_inference_steps < 1:
             raise ValueError("num_inference_steps must be >= 1")
@@ -643,8 +672,8 @@ class SpectrumCacheConfig:
             raise ValueError("blend_w must be in [0, 1]")
         if self.history_limit < 1:
             raise ValueError("history_limit must be >= 1")
-        if self.predictor_backend not in {"dense", "chunked", "bounded"}:
-            raise ValueError('predictor_backend must be "dense", "chunked", or "bounded"')
+        if self.predictor_backend not in {"dense", "chunked", "bounded", "fp32_weighted"}:
+            raise ValueError('predictor_backend must be "dense", "chunked", "bounded", or "fp32_weighted"')
         if self.predictor_cache_bytes < 0:
             raise ValueError("predictor_cache_bytes must be >= 0")
         if self.predictor_chunk_size < 1:
@@ -977,6 +1006,48 @@ class SpectrumForecaster:
         return predicted.reshape(self._shape)
 
     @torch.compiler.disable
+    def _predict_fp32_weighted(self, step: int) -> torch.Tensor:
+        """Evaluate blended history weights in FP32, rounding only the final result.
+
+        This opt-in route evaluates the FP32 predictor without
+        monkeypatching shared methods or retaining a full coefficient tensor.
+        """
+        self._fit_history_solver()
+        if self._history_design is None or self._history_chol is None or self._shape is None:
+            raise RuntimeError("SPECTRUM FP32 weighted history solver did not initialize")
+
+        feature = self.features[-1]
+        target = torch.tensor([step], device=feature.device, dtype=torch.float32)
+        target_design = self._design(self._tau(target)).to(torch.float32)
+        design_t = self._history_design.transpose(0, 1)
+        ridge_weights = (
+            target_design @ torch.cholesky_solve(design_t, self._history_chol)
+        ).reshape(-1)
+
+        local_weights = torch.zeros_like(ridge_weights)
+        if len(self.features) >= 2:
+            delta = max(float(self.steps[-1] - self.steps[-2]), 1e-8)
+            scale = float(step - self.steps[-1]) / delta
+            local_weights[-2] = -scale
+            local_weights[-1] = 1.0 + scale
+        else:
+            local_weights[-1] = 1.0
+        blend = float(self.config.blend_w)
+        weights = (1.0 - blend) * local_weights + blend * ridge_weights
+
+        flattened = [item.reshape(-1) for item in self.features]
+        output = torch.empty_like(feature.reshape(-1))
+        # Preserve chunk size and FP32 summation order to avoid changing
+        # rounding behavior; reduction-order changes need separate tests.
+        for start in range(0, feature.numel(), self._CHUNKED_COEFFICIENT_SIZE):
+            stop = min(start + self._CHUNKED_COEFFICIENT_SIZE, feature.numel())
+            accumulated = torch.zeros(stop - start, device=feature.device, dtype=torch.float32)
+            for weight, history in zip(weights.tolist(), flattened):
+                accumulated.add_(history[start:stop].to(torch.float32), alpha=float(weight))
+            output[start:stop] = accumulated.to(feature.dtype)
+        return output.reshape(self._shape)
+
+    @torch.compiler.disable
     def predict(self, step: int) -> torch.Tensor:
         if self.config.predictor_backend == "dense":
             predicted = self._predict_dense(step)
@@ -984,6 +1055,8 @@ class SpectrumForecaster:
             predicted = self._predict_chunked(step)
         elif self.config.predictor_backend == "bounded":
             predicted = self._predict_bounded(step)
+        elif self.config.predictor_backend == "fp32_weighted":
+            return self._predict_fp32_weighted(step)  # Blend already applied to FP32 history weights.
         else:
             raise RuntimeError(f"Unsupported SPECTRUM predictor backend: {self.config.predictor_backend}")
 
@@ -2583,6 +2656,15 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.unets.unet_2d_condition import UNet2DConditionModel
 
     unwrapped = unwrap_module(module)
+    # The official MOSS pipeline is an opt-in custom component, not a native
+    # Diffusers model class. Resolve it by its guarded architecture signature
+    # without importing third-party pipeline code into the core hook module.
+    if type(unwrapped).__name__ == "MOSSImageTransformer":
+        from .spectrum_moss import apply_spectrum_cache_moss
+
+        apply_spectrum_cache_moss(module, config)
+        return
+
     if isinstance(unwrapped, Flux3Transformer2DModel):
         if unwrapped.config.flow_map and not config.allow_flux3_distilled:
             raise ValueError("SPECTRUM FLUX.3 distilled requires explicit opt-in")
