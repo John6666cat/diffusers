@@ -376,6 +376,51 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_flux2_klein_base4b_variable(
+        cls, num_inference_steps: int = 50, *, predictor_backend: str = "dense"
+    ) -> "SpectrumCacheConfig":
+        """Build an experimental variable-N Klein Base 4B schedule from its 50-step P35 anchor.
+
+        The original 50-step factory remains unchanged. Other N values keep the
+        initial six and final four steps real, project the five interior real
+        anchors, and insert real steps into the longest gaps until at least 30%
+        of steps are real. Coordinates are runtime-horizon normalized. These are
+        research candidates, not GPU/Owner-qualified or distilled presets.
+        """
+        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
+            raise ValueError("Klein Base variable-N research requires integer N in [40, 60]")
+        if predictor_backend not in {"dense", "fp32_weighted"}:
+            raise ValueError("Klein Base variable-N research supports dense or fp32_weighted")
+
+        anchor = cls.for_flux2_klein_base4b()
+        if num_inference_steps == 50:
+            return replace(anchor, predictor_backend=predictor_backend)
+
+        # The five interior real anchors are 10, 18, 25, 33, 41 at N=50.
+        # Mapping 0..49 onto 0..N-1 has deterministic integer rounding.
+        projected_real = set(range(6))
+        projected_real.update(range(num_inference_steps - 4, num_inference_steps))
+        projected_real.update(
+            (step * (num_inference_steps - 1) + 24) // 49 for step in (10, 18, 25, 33, 41)
+        )
+        target_real_count = max(len(projected_real), math.ceil(num_inference_steps * 0.30))
+        while len(projected_real) < target_real_count:
+            real_steps = sorted(projected_real)
+            left, right = max(
+                zip(real_steps, real_steps[1:]), key=lambda pair: (pair[1] - pair[0], -pair[0])
+            )
+            projected_real.add((left + right) // 2)
+        return replace(
+            anchor,
+            num_inference_steps=num_inference_steps,
+            coordinate_policy="runtime_horizon_normalized",
+            forecast_step_indices=tuple(
+                step for step in range(num_inference_steps) if step not in projected_real
+            ),
+            predictor_backend=predictor_backend,
+        )
+
+    @classmethod
     def for_anima_variable(cls, num_inference_steps: int = 30) -> "SpectrumCacheConfig":
         """Build the opt-in ordinary Anima variable-step profile.
 

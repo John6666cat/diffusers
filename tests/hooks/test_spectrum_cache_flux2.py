@@ -37,6 +37,73 @@ def test_spectrum_flux2_klein_base4b_p35_is_explicit_and_50_step_only():
             raise AssertionError(f"Unexpected P35 preset approval at {steps} steps")
 
 
+def test_spectrum_flux2_klein_base4b_variable_anchor_and_schedule_preview():
+    original = SpectrumCacheConfig.for_flux2_klein_base4b()
+    assert SpectrumCacheConfig.for_flux2_klein_base4b_variable() == original
+    for steps, expected_forecasts in ((40, 25), (49, 34), (50, 35), (51, 35), (60, 42)):
+        config = SpectrumCacheConfig.for_flux2_klein_base4b_variable(steps)
+        forecast_steps = config.forecast_step_indices
+        assert config.num_inference_steps == steps
+        assert len(forecast_steps) == expected_forecasts
+        assert forecast_steps == tuple(sorted(set(forecast_steps)))
+        assert set(range(6)).isdisjoint(forecast_steps)
+        assert set(range(steps - 4, steps)).isdisjoint(forecast_steps)
+        assert sum(not SpectrumSchedule(config).decide(i) for i in range(steps)) == expected_forecasts
+        assert config.coordinate_policy == (
+            "legacy_fixed_max" if steps == 50 else "runtime_horizon_normalized"
+        )
+        assert (config.degree, config.ridge_lambda, config.blend_w, config.history_limit) == (
+            original.degree, original.ridge_lambda, original.blend_w, original.history_limit
+        )
+
+
+def test_spectrum_flux2_klein_base4b_variable_backend_is_independent_of_mask():
+    for steps in (40, 50, 60):
+        dense = SpectrumCacheConfig.for_flux2_klein_base4b_variable(steps)
+        fp32 = SpectrumCacheConfig.for_flux2_klein_base4b_variable(steps, predictor_backend="fp32_weighted")
+        assert dense.predictor_backend == "dense"
+        assert fp32.predictor_backend == "fp32_weighted"
+        assert dense.forecast_step_indices == fp32.forecast_step_indices
+        assert dense.coordinate_policy == fp32.coordinate_policy
+    for steps in (True, 0, 39, 61, 100):
+        try:
+            SpectrumCacheConfig.for_flux2_klein_base4b_variable(steps)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Variable-N research unexpectedly accepted {steps!r}")
+
+
+@torch.no_grad()
+def test_spectrum_flux2_klein_base4b_variable_native_cpu_actual_n_and_cleanup():
+    # A schedule preview does not establish that an actual model respects N.
+    # The tiny model exercises the adapter, forecast path and state lifetime.
+    for steps, backend in ((40, "dense"), (60, "fp32_weighted")):
+        model = make_model()
+        cfg = SpectrumCacheConfig.for_flux2_klein_base4b_variable(
+            steps, predictor_backend=backend
+        )
+        try:
+            model.enable_cache(cfg)
+            for index in range(steps):
+                inputs = make_inputs()
+                inputs["timestep"] = torch.tensor([1.0 - index / steps])
+                with model.cache_context("cond"):
+                    output = model(**inputs).sample
+                assert torch.isfinite(output).all()
+
+            root = model._diffusers_hook.get_hook("spectrum_cache_denoiser")
+            summary = root.state_manager._state_cache["cond"].summary()
+            assert summary["prediction_call_count"] == len(cfg.forecast_step_indices)
+            assert summary["full_call_count"] == steps - len(cfg.forecast_step_indices)
+            assert summary["forecast_steps"] == list(cfg.forecast_step_indices)
+            assert not summary["guard_latched"]
+            assert not summary["predict_failures"]
+        finally:
+            model.disable_cache()
+            assert not model.is_cache_enabled
+
+
 def test_spectrum_flux2_klein_base4b_p35_does_not_enable_distilled_route():
     model = make_model(guidance_embeds=True)
     try:
