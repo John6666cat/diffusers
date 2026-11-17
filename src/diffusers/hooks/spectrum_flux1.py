@@ -32,7 +32,7 @@ _SPECTRUM_FLUX1_FEATURE_HOOK = "spectrum_cache_flux1_feature"
 
 
 class SpectrumFlux1State(SpectrumFlux2State):
-    """Independent context-local state for the 50-step FLUX.1-dev route."""
+    """Independent context-local state for the FLUX.1-dev research route."""
 
 
 class SpectrumFlux1DenoiserHook(ModelHook):

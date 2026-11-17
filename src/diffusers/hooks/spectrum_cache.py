@@ -131,6 +131,9 @@ class SpectrumCacheConfig:
             not provide a complete native `CacheContext`. Native contexts are preferred. The legacy callback must
             return a mapping containing `step`, `num_inference_steps`, `num_conditions`, and `label` (`"cond"` or
             `"uncond"`), and may return `dynamic_conditioning=True` for sticky fail-closed behavior.
+        allow_flux1_variable_n (`bool`, defaults to `False`):
+            Research-only opt-in for the FLUX.1-dev 40–60-step variable-N factory. It does
+            not relax the historical 50-step route or qualify untested step counts.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -163,6 +166,7 @@ class SpectrumCacheConfig:
     allow_flux3_distilled: bool = False
     allow_flux3_distilled_image_conditioned: bool = False
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
+    allow_flux1_variable_n: bool = False
 
     @classmethod
 
@@ -339,6 +343,55 @@ class SpectrumCacheConfig:
             coordinate_max=50.0,
             tail_actual_steps=0,
             forecast_step_indices=tuple(step for step in range(50) if step not in full_steps),
+        )
+
+    @classmethod
+    def for_flux1_dev_variable(
+        cls, num_inference_steps: int = 50, *, predictor_backend: str = "dense"
+    ) -> "SpectrumCacheConfig":
+        """Experimental FLUX.1-dev variable-N schedule, isolated from the qualified N50/P33 factory.
+
+        N40–60 is an initial evaluation window, not an established image-quality range.
+        The N50 dense arm returns the exact historical configuration. Non-anchor steps
+        project the historical real-step positions onto i/N, retain its predictor history
+        settings, and conservatively cap forecast runs at four steps with a two-step real tail.
+        """
+        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
+            raise ValueError("Research FLUX.1-dev variable N requires an integer in [40, 60].")
+        if predictor_backend not in {"dense", "fp32_weighted"}:
+            raise ValueError("Research FLUX.1-dev variable N permits dense or fp32_weighted only.")
+
+        anchor = cls.for_flux1_dev()
+        if num_inference_steps == 50:
+            return replace(anchor, predictor_backend=predictor_backend)
+
+        original_real = tuple(step for step in range(50) if step not in anchor.forecast_step_indices)
+        real = {round(step * num_inference_steps / 50) for step in original_real}
+        real.update(range(anchor.warmup_steps))
+        real.update(range(num_inference_steps - 2, num_inference_steps))
+        min_real = math.ceil(num_inference_steps * len(original_real) / 50)
+
+        # Add real midpoints only where the projected mask is sparse, without
+        # guessing a horizon-dependent history length from the old negative studies.
+        while True:
+            ordered = sorted(real)
+            gaps = [(right - left - 1, left, right) for left, right in zip(ordered, ordered[1:])]
+            longest, left, right = max(gaps, default=(0, 0, 0))
+            if longest <= 4 and len(real) >= min_real:
+                break
+            if longest == 0:
+                break
+            real.add((left + right) // 2)
+
+        return replace(
+            anchor,
+            num_inference_steps=num_inference_steps,
+            predictor_backend=predictor_backend,
+            coordinate_policy="runtime_horizon_normalized",
+            tail_actual_steps=2,
+            denoiser_call_topology="single",
+            forecast_step_indices=tuple(step for step in range(num_inference_steps) if step not in real),
+            allow_flux1_variable_n=True,
         )
 
     @classmethod
@@ -2797,18 +2850,30 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    # FLUX.1-dev uses a fixed 50-step coordinate mapping for its image-feature cache.
+    # Keep the historical FLUX.1-dev N50 contract; variable-N is a separate research opt-in.
     from ..models.transformers.transformer_flux import FluxTransformer2DModel
 
     if isinstance(unwrapped, FluxTransformer2DModel):
         if not bool(getattr(unwrapped.config, "guidance_embeds", False)):
             raise ValueError("SPECTRUM FLUX.1 requires FLUX.1-dev (guidance_embeds=True).")
-        if (
-            config.num_inference_steps != 50
-            or config.coordinate_policy != "legacy_fixed_max"
-            or config.coordinate_max != 50.0
-        ):
-            raise ValueError("SPECTRUM FLUX.1 requires 50 inference steps and legacy 50-coordinate mapping.")
+        legacy_50 = (
+            config.num_inference_steps == 50
+            and config.coordinate_policy == "legacy_fixed_max"
+            and config.coordinate_max == 50.0
+        )
+        variable_opt_in = (
+            config.allow_flux1_variable_n is True
+            and type(config.num_inference_steps) is int
+            and 40 <= config.num_inference_steps <= 60
+            and config.predictor_backend in {"dense", "fp32_weighted"}
+            and config == SpectrumCacheConfig.for_flux1_dev_variable(
+                config.num_inference_steps, predictor_backend=config.predictor_backend
+            )
+        )
+        if not (legacy_50 or variable_opt_in):
+            if config.allow_flux1_variable_n is not True:
+                raise ValueError("SPECTRUM FLUX.1 requires 50 inference steps and legacy 50-coordinate mapping.")
+            raise ValueError("SPECTRUM FLUX.1 requires the legacy N50 profile or explicit variable-N research opt-in.")
         if getattr(unwrapped, "norm_out", None) is None or getattr(unwrapped, "proj_out", None) is None:
             raise ValueError("SPECTRUM FLUX.1 requires norm_out and proj_out.")
 
