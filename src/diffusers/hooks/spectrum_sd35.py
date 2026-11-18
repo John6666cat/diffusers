@@ -34,6 +34,13 @@ class SD35SpectrumGate:
             raise TypeError("SD3 SPECTRUM requires a SpectrumCacheConfig")
         if config.forecast_step_indices is None or config.tail_actual_steps < 2:
             raise ValueError("SD3 SPECTRUM requires explicit forecast steps and at least two real tail steps")
+        if config.allow_sd35_variable_n:
+            try:
+                expected = SpectrumCacheConfig._for_sd35_variable_n(config.num_inference_steps)
+            except ValueError as exc:
+                raise ValueError("SD3.5 variable-N research requires an exact staged profile") from exc
+            if config != expected:
+                raise ValueError("SD3.5 variable-N research requires an exact staged profile")
         self.config = config
         self.forecast_steps = frozenset(config.forecast_step_indices)
         self.final_real_steps = config.tail_actual_steps

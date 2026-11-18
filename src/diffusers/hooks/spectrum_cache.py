@@ -169,6 +169,8 @@ class SpectrumCacheConfig:
             Research-only opt-in for Neta Yume / Lumina2 N40–60 resampled masks.
         allow_pony_v7_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for Pony V7 / AuraFlow N24–40 resampled masks.
+        allow_sd35_variable_n (`bool`, defaults to `False`):
+            Research-only opt-in for SD3.5 Large/Medium N20–40 step profiles. The historical N28 P13 factory is unchanged.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -204,6 +206,7 @@ class SpectrumCacheConfig:
     allow_flux1_variable_n: bool = False
     allow_netayume_variable_n: bool = False
     allow_pony_v7_variable_n: bool = False
+    allow_sd35_variable_n: bool = False
 
     @classmethod
 
@@ -772,6 +775,55 @@ class SpectrumCacheConfig:
             tail_actual_steps=2,
             forecast_step_indices=(5, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 24),
         )
+
+    @classmethod
+    def _for_sd35_variable_n(cls, num_inference_steps: int) -> "SpectrumCacheConfig":
+        """Research-only N28/P13 midpoint retiming, with no more than two adjacent forecasts.
+
+        The original 28-step anchor is reproduced exactly. Every other N needs
+        native CPU and real-weight owner review before any limited Source decision.
+        """
+        if type(num_inference_steps) is not int or not 20 <= num_inference_steps <= 40:
+            raise ValueError("SD3.5 variable-N research requires integer N in [20, 40]")
+
+        n = num_inference_steps
+        warmup = max(4, math.ceil(5 * n / 28))
+        tail = max(2, math.ceil(2 * n / 28))
+        anchor = (5, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22, 24)
+        retimed = _spectrum_retime_qualified_mask(anchor, 28, n)
+        steps = []
+        for step in retimed:
+            if step < warmup or step >= n - tail:
+                continue
+            # Prevent resampling from creating a longer forecast run than P13's
+            # two-step runs. The original N28 mask is not modified.
+            if len(steps) >= 2 and steps[-2:] == [step - 2, step - 1]:
+                continue
+            steps.append(step)
+
+        return cls(
+            num_inference_steps=n,
+            warmup_steps=warmup,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="chunked",
+            coordinate_policy="runtime_index_normalized",
+            tail_actual_steps=tail,
+            forecast_step_indices=tuple(steps),
+            allow_sd35_variable_n=True,
+        )
+
+    @classmethod
+    def for_sd35_large_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """STAGED variable-N candidate for SD3.5 Large, explicitly opt-in only."""
+        return cls._for_sd35_variable_n(num_inference_steps)
+
+    @classmethod
+    def for_sd35_medium_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """STAGED variable-N candidate for SD3.5 Medium, explicitly opt-in only."""
+        return cls._for_sd35_variable_n(num_inference_steps)
 
     @classmethod
     def for_sd35_large(cls) -> "SpectrumCacheConfig":
