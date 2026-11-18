@@ -33,6 +33,7 @@ from .spectrum_cache import (
     _SPECTRUM_BLOCK_HOOK,
     _SPECTRUM_DENOISER_HOOK,
     _SPECTRUM_HEAD_BLOCK_HOOK,
+    _PONY_V7_QUALIFIED_SCHEDULES,
     _spectrum_tensor_identity,
 )
 
@@ -167,8 +168,11 @@ class SpectrumPonyV7DenoiserHook(ModelHook):
         context = self.state_manager.context
         state.prepare_call(_spectrum_tensor_identity(encoder_hidden_states))
 
+        if state.config.allow_pony_v7_variable_n is True and context.step_index is None:
+            state.latch("Pony V7 variable-N research requires native step/CFG cache context")
+
         # Low-level callers may omit step metadata. Native Pipeline contexts
-        # supply it; any step/CFG mismatch uses real forward.
+        # supply it; variable-N requires it, while legacy low-level calls remain supported.
         if context.step_index is not None and (
             context.name != "cond_uncond"
             or type(context.step_index) is not int
@@ -307,13 +311,8 @@ def apply_spectrum_cache_pony_v7(module: torch.nn.Module, config: SpectrumCacheC
             f"Expected {expected_signature}, got {observed_signature}."
         )
 
-    qualified_schedules = (
-        (20,),
-        (17, 19, 21, 23),
-        (13, 15, 17, 19, 21, 23, 25, 27),  # explicit P8 opt-in
-    )
     observed_steps = tuple(config.forecast_step_indices or ())
-    qualified_steps = observed_steps if observed_steps in qualified_schedules else None
+    qualified_steps = observed_steps if observed_steps in _PONY_V7_QUALIFIED_SCHEDULES else None
     profile_ok = (
         config.num_inference_steps == 30
         and tuple(config.forecast_step_indices or ()) == qualified_steps
@@ -327,9 +326,24 @@ def apply_spectrum_cache_pony_v7(module: torch.nn.Module, config: SpectrumCacheC
         and float(config.flex_window) == 0.0
         and int(config.tail_actual_steps) == 0
     )
-    if not profile_ok:
+    variable_profile_ok = False
+    if config.allow_pony_v7_variable_n is True:
+        for profile in ("p1", "p4", "p8"):
+            try:
+                expected = SpectrumCacheConfig.for_pony_v7_variable(
+                    config.num_inference_steps, profile=profile, predictor_backend=config.predictor_backend
+                )
+            except ValueError:
+                break
+            if config == expected:
+                variable_profile_ok = True
+                break
+    # An explicit research opt-in must not fall through to the more permissive
+    # historical guard at the anchor N.
+    profile_accepted = variable_profile_ok if config.allow_pony_v7_variable_n is True else profile_ok
+    if not profile_accepted:
         raise ValueError(
-            'The current Pony V7 native adapter accepts only the qualified Pony V7 schedules for the exact 30-step d2/window3/blend0.25 profile.'
+            'The current Pony V7 native adapter accepts only the qualified Pony V7 schedules for the exact 30-step d2/window3/blend0.25 profile or an explicit variable-N research profile.'
         )
 
     joint_blocks = list(unwrapped_module.joint_transformer_blocks)

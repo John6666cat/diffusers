@@ -46,6 +46,11 @@ _NETAYUME_QUALIFIED_SCHEDULES = (
         34, 35, 37, 38, 39, 40, 41, 43, 44, 45,
     ),
 )
+_PONY_V7_QUALIFIED_SCHEDULES = (
+    (20,),
+    (17, 19, 21, 23),
+    (13, 15, 17, 19, 21, 23, 25, 27),
+)
 
 
 def _spectrum_retime_qualified_mask(
@@ -162,6 +167,8 @@ class SpectrumCacheConfig:
             not relax the historical 50-step route or qualify untested step counts.
         allow_netayume_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for Neta Yume / Lumina2 N40–60 resampled masks.
+        allow_pony_v7_variable_n (`bool`, defaults to `False`):
+            Research-only opt-in for Pony V7 / AuraFlow N24–40 resampled masks.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -196,6 +203,7 @@ class SpectrumCacheConfig:
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
     allow_flux1_variable_n: bool = False
     allow_netayume_variable_n: bool = False
+    allow_pony_v7_variable_n: bool = False
 
     @classmethod
 
@@ -534,6 +542,40 @@ class SpectrumCacheConfig:
             denoiser_call_topology="paired_cfg",
             predictor_backend=predictor_backend,
             allow_netayume_variable_n=True,
+        )
+
+    @classmethod
+    def for_pony_v7_variable(
+        cls, num_inference_steps: int = 30, *, profile: str = "p8", predictor_backend: str = "dense"
+    ) -> "SpectrumCacheConfig":
+        """Experimental AuraFlow variable-N masks; N30 retains the P1/P4/P8 indices.
+
+        The historical 8-unit predictor coordinate horizon scales with N,
+        preserving the old N30 anchor convention.
+        """
+        if type(num_inference_steps) is not int or not 24 <= num_inference_steps <= 40:
+            raise ValueError("Pony V7 variable-N research requires integer N in [24, 40]")
+        if profile not in {"p1", "p4", "p8"}:
+            raise ValueError("Pony V7 variable-N profile must be p1, p4, or p8")
+        if predictor_backend not in {"dense", "fp32_weighted"}:
+            raise ValueError("Pony V7 variable-N research supports dense or fp32_weighted")
+        anchor = _PONY_V7_QUALIFIED_SCHEDULES[{"p1": 0, "p4": 1, "p8": 2}[profile]]
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=0,
+            window_size=3.0,
+            flex_window=0.0,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.25,
+            history_limit=8,
+            coordinate_policy="legacy_fixed_max",
+            coordinate_max=8.0 * num_inference_steps / 30,
+            tail_actual_steps=0,
+            forecast_step_indices=_spectrum_retime_qualified_mask(anchor, 30, num_inference_steps),
+            denoiser_call_topology="single",
+            predictor_backend=predictor_backend,
+            allow_pony_v7_variable_n=True,
         )
 
     @classmethod
