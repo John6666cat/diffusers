@@ -33,6 +33,7 @@ from .spectrum_cache import (
     _SPECTRUM_BLOCK_HOOK,
     _SPECTRUM_DENOISER_HOOK,
     _SPECTRUM_HEAD_BLOCK_HOOK,
+    _NETAYUME_QUALIFIED_SCHEDULES,
     _spectrum_tensor_identity,
 )
 
@@ -215,8 +216,11 @@ class SpectrumNetaYumeDenoiserHook(ModelHook):
         context = self.state_manager.context
         state.prepare_call(_spectrum_tensor_identity(encoder_hidden_states))
 
+        if state.config.allow_netayume_variable_n is True and context.step_index is None:
+            state.latch("Neta Yume variable-N research requires native step/CFG cache context")
+
         # Low-level callers may omit step metadata. Native Pipeline contexts
-        # supply it; any step/CFG mismatch uses real forward.
+        # supply it; variable-N requires it, while legacy low-level calls remain supported.
         if context.step_index is not None and (
             context.name != "cond_uncond"
             or type(context.step_index) is not int
@@ -368,17 +372,8 @@ def apply_spectrum_cache_netayume(module: torch.nn.Module, config: SpectrumCache
     if tuple(unwrapped_module.config.axes_lens) != (300, 512, 512):
         raise ValueError("Neta Yume SPECTRUM requires axes_lens=(300,512,512).")
 
-    qualified_schedules = (
-        (15, 20, 23, 25, 27, 36),
-        (15, 18, 20, 22, 24, 26, 28, 30, 36),
-        (
-            10, 11, 13, 14, 15, 16, 17, 19, 20, 21,
-            22, 23, 25, 26, 27, 28, 29, 31, 32, 33,
-            34, 35, 37, 38, 39, 40, 41, 43, 44, 45,
-        ),
-    )
     observed_steps = tuple(config.forecast_step_indices or ())
-    qualified_steps = observed_steps if observed_steps in qualified_schedules else None
+    qualified_steps = observed_steps if observed_steps in _NETAYUME_QUALIFIED_SCHEDULES else None
     profile_ok = (
         config.num_inference_steps == 50
         and tuple(config.forecast_step_indices or ()) == qualified_steps
@@ -392,10 +387,25 @@ def apply_spectrum_cache_netayume(module: torch.nn.Module, config: SpectrumCache
         and float(config.flex_window) == 0.0
         and int(config.tail_actual_steps) == 0
     )
-    if not profile_ok:
+    variable_profile_ok = False
+    if config.allow_netayume_variable_n is True:
+        for profile in ("p6", "p9", "p30"):
+            try:
+                expected = SpectrumCacheConfig.for_netayume_variable(
+                    config.num_inference_steps, profile=profile, predictor_backend=config.predictor_backend
+                )
+            except ValueError:
+                break
+            if config == expected:
+                variable_profile_ok = True
+                break
+    # An explicit research opt-in must not fall through to the more permissive
+    # historical guard at the anchor N.
+    profile_accepted = variable_profile_ok if config.allow_netayume_variable_n is True else profile_ok
+    if not profile_accepted:
         raise ValueError(
             "The current Neta Yume native adapter accepts only the qualified Neta Yume schedules for the exact "
-            "50-step d2/window3/blend0.5 profile."
+            "50-step d2/window3/blend0.5 profile or an explicit variable-N research profile."
         )
 
     blocks = list(unwrapped_module.layers)

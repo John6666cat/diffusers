@@ -37,6 +37,32 @@ _SPECTRUM_UNET_FEATURE_HOOK = "spectrum_cache_unet_feature"
 _SPECTRUM_COSMOS_FEATURE_HOOK = "spectrum_cache_cosmos_feature"
 _SPECTRUM_FLUX3_FEATURE_HOOK = "spectrum_cache_flux3_feature"
 _SPECTRUM_FLUX2_FEATURE_HOOK = "spectrum_cache_flux2_feature"
+_NETAYUME_QUALIFIED_SCHEDULES = (
+    (15, 20, 23, 25, 27, 36),
+    (15, 18, 20, 22, 24, 26, 28, 30, 36),
+    (
+        10, 11, 13, 14, 15, 16, 17, 19, 20, 21,
+        22, 23, 25, 26, 27, 28, 29, 31, 32, 33,
+        34, 35, 37, 38, 39, 40, 41, 43, 44, 45,
+    ),
+)
+
+
+def _spectrum_retime_qualified_mask(
+    anchor_steps: tuple[int, ...], anchor_n: int, num_inference_steps: int
+) -> tuple[int, ...]:
+    """Resample a qualified anchor decision mask by nearest denoising-step midpoint.
+
+    Integer midpoint mapping preserves the anchor bit-for-bit, with no dependence
+    on float rounding; non-anchor masks are only research candidates.
+    """
+    anchors = frozenset(anchor_steps)
+    return tuple(
+        step for step in range(num_inference_steps)
+        if ((2 * step + 1) * anchor_n) // (2 * num_inference_steps) in anchors
+    )
+
+
 _UNET_RESIDUAL_ARGUMENTS = (
     "down_block_additional_residuals",
     "mid_block_additional_residual",
@@ -134,6 +160,8 @@ class SpectrumCacheConfig:
         allow_flux1_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for the FLUX.1-dev 40–60-step variable-N factory. It does
             not relax the historical 50-step route or qualify untested step counts.
+        allow_netayume_variable_n (`bool`, defaults to `False`):
+            Research-only opt-in for Neta Yume / Lumina2 N40–60 resampled masks.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -167,6 +195,7 @@ class SpectrumCacheConfig:
     allow_flux3_distilled_image_conditioned: bool = False
     cosmos_runtime_state_callback: Callable[[], Mapping[str, Any]] | None = None
     allow_flux1_variable_n: bool = False
+    allow_netayume_variable_n: bool = False
 
     @classmethod
 
@@ -471,6 +500,40 @@ class SpectrumCacheConfig:
                 step for step in range(num_inference_steps) if step not in projected_real
             ),
             predictor_backend=predictor_backend,
+        )
+
+    @classmethod
+    def for_netayume_variable(
+        cls, num_inference_steps: int = 50, *, profile: str = "p30", predictor_backend: str = "dense"
+    ) -> "SpectrumCacheConfig":
+        """Experimental Lumina2 variable-N masks; N50 retains the historical forecast indices.
+
+        This is a research opt-in, not an assertion of semantic quality outside
+        the old N50/P6/P9/P30 profiles. The paired CFG lanes stay independent.
+        """
+        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
+            raise ValueError("Neta Yume variable-N research requires integer N in [40, 60]")
+        if profile not in {"p6", "p9", "p30"}:
+            raise ValueError("Neta Yume variable-N profile must be p6, p9, or p30")
+        if predictor_backend not in {"dense", "fp32_weighted"}:
+            raise ValueError("Neta Yume variable-N research supports dense or fp32_weighted")
+        anchor = _NETAYUME_QUALIFIED_SCHEDULES[{"p6": 0, "p9": 1, "p30": 2}[profile]]
+        return cls(
+            num_inference_steps=num_inference_steps,
+            warmup_steps=0,
+            window_size=3.0,
+            flex_window=0.0,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            coordinate_policy="legacy_fixed_max",
+            coordinate_max=float(num_inference_steps),
+            tail_actual_steps=0,
+            forecast_step_indices=_spectrum_retime_qualified_mask(anchor, 50, num_inference_steps),
+            denoiser_call_topology="paired_cfg",
+            predictor_backend=predictor_backend,
+            allow_netayume_variable_n=True,
         )
 
     @classmethod
