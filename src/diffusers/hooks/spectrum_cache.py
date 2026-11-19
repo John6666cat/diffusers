@@ -171,6 +171,9 @@ class SpectrumCacheConfig:
             Research-only opt-in for Pony V7 / AuraFlow N24–40 resampled masks.
         allow_sd35_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for SD3.5 Large/Medium N20–40 step profiles. The historical N28 P13 factory is unchanged.
+        allow_krea2_raw_variable_n (`bool`, defaults to `False`):
+            Research-only opt-in for Krea 2 Raw N40–60 paired-CFG profiles. The historical
+            N52 explicit-mask route remains unchanged.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -207,6 +210,7 @@ class SpectrumCacheConfig:
     allow_netayume_variable_n: bool = False
     allow_pony_v7_variable_n: bool = False
     allow_sd35_variable_n: bool = False
+    allow_krea2_raw_variable_n: bool = False
 
     @classmethod
 
@@ -354,6 +358,64 @@ class SpectrumCacheConfig:
             coordinate_max=50.0,
             tail_actual_steps=3,
             forecast_step_indices=forecast_steps_by_count[num_inference_steps],
+        )
+
+    @classmethod
+    def for_krea2_raw_variable(cls, num_inference_steps: int = 52) -> "SpectrumCacheConfig":
+        """Isolated Krea 2 Raw paired-CFG variable-N research profile.
+
+        N52/P32 exactly reproduces the existing owner-reviewed Source recipe,
+        including predictor settings, not only the explicit mask.
+        Other N40–60 profiles conservatively project its real-call positions,
+        keep the first seven and last two steps real, and cap forecast runs at
+        seven. These projected masks are CPU candidates, not visual qualifications.
+        """
+        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
+            raise ValueError("Krea 2 Raw variable N requires an integer in [40, 60].")
+
+        anchor_forecast = (
+            7, 8, 9, 10, 11, 13, 15, 16, 17, 19, 21, 23, 24, 25, 27, 28,
+            29, 30, 31, 32, 33, 35, 37, 39, 40, 41, 42, 43, 44, 45, 47, 49,
+        )
+        anchor = cls(
+            num_inference_steps=52,
+            warmup_steps=0,
+            window_size=2.0,
+            flex_window=0.0,
+            forecast_step_indices=anchor_forecast,
+            denoiser_call_topology="paired_cfg",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=100.0,
+            degree=4,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="dense",
+        )
+        if num_inference_steps == 52:
+            return anchor
+
+        anchor_real = tuple(step for step in range(52) if step not in anchor_forecast)
+        real = {round(step * num_inference_steps / 52) for step in anchor_real}
+        real.update(range(7))
+        real.update((num_inference_steps - 2, num_inference_steps - 1))
+        min_real = math.ceil(num_inference_steps * len(anchor_real) / 52)
+        while True:
+            ordered = sorted(real)
+            gaps = [(right - left - 1, left, right) for left, right in zip(ordered, ordered[1:])]
+            longest, left, right = max(gaps, default=(0, 0, 0))
+            if longest <= 7 and len(real) >= min_real:
+                break
+            if longest == 0:
+                break
+            real.add((left + right) // 2)
+
+        return replace(
+            anchor,
+            num_inference_steps=num_inference_steps,
+            tail_actual_steps=2,
+            forecast_step_indices=tuple(step for step in range(num_inference_steps) if step not in real),
+            allow_krea2_raw_variable_n=True,
         )
 
     @classmethod
@@ -3067,18 +3129,23 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    # Experimental reentry of the historical 52-step Krea 2 Raw paired-CFG path.
+    # Experimental Krea 2 Raw paired-CFG path; old N52 masks stay valid.
     # Keep its two-lane adapter isolated from the currently qualified families.
     from ..models.transformers.transformer_krea2 import Krea2Transformer2DModel
 
     if isinstance(unwrapped, Krea2Transformer2DModel):
         if (
-            config.num_inference_steps != 52
-            or config.denoiser_call_topology != "paired_cfg"
+            config.denoiser_call_topology != "paired_cfg"
             or config.coordinate_policy != "runtime_horizon_normalized"
             or config.forecast_step_indices is None
         ):
-            raise ValueError("Research Krea 2 Raw requires explicit 52-step paired-CFG horizon-normalized profile.")
+            raise ValueError("Research Krea 2 Raw requires an explicit paired-CFG horizon-normalized profile.")
+        if config.num_inference_steps != 52:
+            if (
+                not config.allow_krea2_raw_variable_n
+                or config != SpectrumCacheConfig.for_krea2_raw_variable(config.num_inference_steps)
+            ):
+                raise ValueError("Research Krea 2 Raw variable N requires the canonical opt-in N40–60 profile.")
 
         signature = {
             "in_channels": 64,
