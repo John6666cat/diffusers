@@ -65,8 +65,12 @@ def make_model():
             SpectrumCacheConfig.for_zimage_base_variable(28),
             (9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23),
         ),
+        (
+            SpectrumCacheConfig.for_zimage_base_variable(28, profile="p8_spread"),
+            (9, 11, 13, 15, 17, 19, 21, 23),
+        ),
     ],
-    ids=("turbo-8-p3_356", "base-28-p12"),
+    ids=("turbo-8-p3_356", "base-28-p12", "base-28-p8-spread"),
 )
 def test_enable_runs_qualified_schedule_and_disable(config, forecast_steps):
     model = make_model()
@@ -107,6 +111,19 @@ def test_base_variable_step_gate_preserved(steps):
     model.enable_cache(SpectrumCacheConfig.for_zimage_base_variable(steps))
     assert model.is_cache_enabled
     model.disable_cache()
+
+
+def test_base_p8_spread_is_n28_only_and_default_is_unchanged():
+    original = SpectrumCacheConfig.for_zimage_base_variable(28)
+    assert original == SpectrumCacheConfig.for_zimage_base_variable(28, profile="p12")
+    assert SpectrumCacheConfig.for_zimage_base_variable(28, profile="p8_spread").forecast_step_indices == (
+        9, 11, 13, 15, 17, 19, 21, 23
+    )
+    for n in (20, 27, 29, 40):
+        with pytest.raises(ValueError, match="only at N28"):
+            SpectrumCacheConfig.for_zimage_base_variable(n, profile="p8_spread")
+    with pytest.raises(ValueError, match="profile must be"):
+        SpectrumCacheConfig.for_zimage_base_variable(28, profile="p8_cluster")
 
 
 @pytest.mark.parametrize(

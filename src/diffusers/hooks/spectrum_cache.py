@@ -789,23 +789,34 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
-    def for_zimage_base_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
-        """Opt-in Z-Image Base research P12 at 28 steps.
+    def for_zimage_base_variable(
+        cls, num_inference_steps: int = 28, *, profile: str = "p12"
+    ) -> "SpectrumCacheConfig":
+        """Opt-in Z-Image Base research profiles; the historical P12 remains the default.
 
         28-step P12 was visually selected in the owner's narrow NF4 0.42.1 probe.
+        N28/P8_SPREAD is a separately selected, narrowly owner-reviewed research
+        alternative; the two original scenes do not establish general quality.
         Other 20–40-step counts keep the historical, not requalified schedule.
         P13_355 remains challenge-only; cache is never enabled by default.
         """
         if not 20 <= num_inference_steps <= 40:
             raise ValueError("for_zimage_base_variable requires 20 <= num_inference_steps <= 40")
+        if profile not in ("p12", "p8_spread"):
+            raise ValueError("Z-Image Base variable-N profile must be 'p12' or 'p8_spread'")
+        if profile == "p8_spread" and num_inference_steps != 28:
+            raise ValueError("Z-Image Base p8_spread is research-qualified only at N28")
 
         early_actual_steps = max(1, math.floor(9 * num_inference_steps / 28 + 0.5))
         tail_actual_steps = max(1, math.floor(4 * num_inference_steps / 28 + 0.5))
-        forecast_steps = (
-            (9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23)
-            if num_inference_steps == 28
-            else tuple(range(early_actual_steps, num_inference_steps - tail_actual_steps, 2))
-        )
+        if num_inference_steps == 28:
+            forecast_steps = (
+                (9, 11, 13, 15, 17, 19, 21, 23)
+                if profile == "p8_spread"
+                else (9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23)
+            )
+        else:
+            forecast_steps = tuple(range(early_actual_steps, num_inference_steps - tail_actual_steps, 2))
         return cls(
             num_inference_steps=num_inference_steps,
             warmup_steps=early_actual_steps,
