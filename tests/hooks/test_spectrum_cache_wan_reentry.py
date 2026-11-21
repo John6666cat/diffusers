@@ -189,3 +189,73 @@ def test_architecture_and_coordinate_gates():
     with pytest.raises(ValueError, match="explicit native-context"):
         model.enable_cache(replace(config, coordinate_policy="legacy_fixed_max"))
     assert not model.is_cache_enabled
+
+
+WAN_NFE12_ANCHORED_VARIABLE_SCHEDULES = (
+    (40, (0, 1, 2, 3, 6, 9, 14, 21, 27, 30, 34, 39)),
+    (50, (0, 1, 2, 3, 7, 11, 18, 26, 34, 38, 42, 49)),
+    (60, (0, 1, 2, 3, 5, 7, 10, 14, 19, 25, 32, 39, 46, 52, 59)),
+)
+
+
+@pytest.mark.parametrize("steps, real_steps", WAN_NFE12_ANCHORED_VARIABLE_SCHEDULES)
+def test_wan_nfe12_anchored_variable_reviewed_masks(steps, real_steps):
+    config = SpectrumCacheConfig.for_wan21_13b_nfe12_anchored_variable(steps)
+    fixed = SpectrumCacheConfig.for_wan21_13b_nfe12_nested()
+    assert config.warmup_steps == 4
+    assert config.tail_actual_steps == 1
+    assert config.coordinate_policy == fixed.coordinate_policy
+    assert config.predictor_backend == fixed.predictor_backend
+    assert (config.degree, config.ridge_lambda, config.blend_w) == (
+        fixed.degree, fixed.ridge_lambda, fixed.blend_w
+    )
+    assert tuple(i for i in range(steps) if SpectrumSchedule(config).decide(i)) == real_steps
+    assert config.forecast_step_indices == tuple(i for i in range(steps) if i not in real_steps)
+    if steps == 50:
+        assert config == fixed
+
+
+@pytest.mark.parametrize("steps", range(40, 61))
+def test_wan_nfe12_anchored_variable_full_integer_range(steps):
+    config = SpectrumCacheConfig.for_wan21_13b_nfe12_anchored_variable(steps)
+    real = tuple(i for i in range(steps) if i not in config.forecast_step_indices)
+    assert real[:4] == (0, 1, 2, 3) and real[-1] == steps - 1
+    assert len(real) == (12 if steps == 50 else max(12, (steps + 3) // 4))
+    assert len(set(real)) == len(real)
+    assert len(config.forecast_step_indices) + len(real) == steps
+
+
+@pytest.mark.parametrize("steps", (39, 61, 40.0, True, None))
+def test_wan_nfe12_anchored_variable_rejects_invalid_n(steps):
+    with pytest.raises(ValueError, match="requires integer N in"):
+        SpectrumCacheConfig.for_wan21_13b_nfe12_anchored_variable(steps)
+
+
+@pytest.mark.parametrize("steps, real_steps", WAN_NFE12_ANCHORED_VARIABLE_SCHEDULES)
+def test_wan_nfe12_anchored_variable_real_block_calls_both_lanes(steps, real_steps):
+    model = make_tiny_wan()
+    config = SpectrumCacheConfig.for_wan21_13b_nfe12_anchored_variable(steps)
+    model.enable_cache(config)
+    latent = torch.ones((1, 16, 1, 4, 4))
+    text = torch.ones((1, 5, 8))
+    with torch.no_grad():
+        for step in range(steps):
+            for lane in ("cond", "uncond"):
+                with model.cache_context(lane, step_index=step, num_inference_steps=steps):
+                    model(
+                        hidden_states=latent,
+                        timestep=torch.tensor([step], dtype=torch.float32),
+                        encoder_hidden_states=text,
+                        return_dict=False,
+                    )
+    root = HookRegistry.check_if_exists_or_initialize(model).get_hook("spectrum_cache_denoiser")
+    for lane in ("cond", "uncond"):
+        summary = root.state_manager._state_cache[lane].summary()
+        assert not summary["guard_latched"]
+        assert not summary["prediction_failure_latched"]
+        assert not summary["coordinate"]["failure_latched"]
+        assert summary["full_call_count"] == len(real_steps)
+        assert summary["prediction_call_count"] == steps - len(real_steps)
+    assert all(block.calls == 2 * len(real_steps) for block in model.blocks)
+    model.disable_cache()
+    assert not model.is_cache_enabled

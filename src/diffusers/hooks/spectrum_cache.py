@@ -725,6 +725,45 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_wan21_13b_nfe12_anchored_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
+        """Opt-in 40–60-step Wan2.1 T2V 1.3B profile based on the N50/NFE12 anchor.
+
+        N40 and N50 preserve the owner-reviewed layouts; N60 uses the
+        owner-preferred EARLY_15 layout. Other integer step counts retain the
+        staged deterministic retiming policy, without a video-quality claim.
+        This does not change the existing Wan factories or cache defaults.
+        """
+        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
+            raise ValueError("Wan NFE12 anchored variable profile requires integer N in [40, 60]")
+        if num_inference_steps == 50:
+            return cls.for_wan21_13b_nfe12_nested()
+
+        n = num_inference_steps
+        if n == 60:
+            real = (0, 1, 2, 3, 5, 7, 10, 14, 19, 25, 32, 39, 46, 52, 59)
+        else:
+            anchor = (0, 1, 2, 3, 7, 11, 18, 26, 34, 38, 42, 49)
+            real = {0, 1, 2, 3, n - 1}
+            for old_step in anchor[4:-1]:
+                mapped = (2 * old_step + 1) * n // 100
+                real.add(max(4, min(n - 2, mapped)))
+            minimum = max(len(anchor), math.ceil(n / 4))
+            while len(real) < minimum:
+                gaps = [(right - left, left, right) for left, right in zip(sorted(real), sorted(real)[1:])]
+                width, left, right = max(gaps, key=lambda gap: (gap[0], -gap[1]))
+                real.add((left + right) // 2)
+            real = tuple(sorted(real))
+
+        real_set = frozenset(real)
+        return replace(
+            cls.for_wan21_13b_nfe12_nested(),
+            num_inference_steps=n,
+            warmup_steps=4,
+            tail_actual_steps=1,
+            forecast_step_indices=tuple(i for i in range(n) if i not in real_set),
+        )
+
+    @classmethod
     def for_wan21_13b_nfe11_add5(cls) -> "SpectrumCacheConfig":
         """Opt-in Wan2.1 T2V 1.3B 50-step / NFE11 challenge profile.
 
