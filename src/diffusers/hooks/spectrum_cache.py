@@ -171,6 +171,13 @@ class SpectrumCacheConfig:
             Research-only opt-in for Pony V7 / AuraFlow N24–40 resampled masks.
         allow_sd35_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for SD3.5 Large/Medium N20–40 step profiles. The historical N28 P13 factory is unchanged.
+        allow_sd35_large_relayout_n (`bool`, defaults to `False`):
+            Explicit research-only SD3.5 Large relayout at six Owner-reviewed N values.
+            Does not change the P13 factory or cache default.
+        allow_sd35_medium_continuous_n (`bool`, defaults to `False`):
+            Explicit Medium positive-integer-N experimental route. Reviewed masks
+            exist at N12/16 (SPARSE preference), N28 (BASELINE) and N48 (exploratory).
+            Unreviewed N runs full REAL_COMPUTE with no forecast; no generalization.
         allow_krea2_raw_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for Krea 2 Raw N40–60 paired-CFG profiles. The historical
             N52 explicit-mask route remains unchanged.
@@ -220,6 +227,8 @@ class SpectrumCacheConfig:
     allow_netayume_variable_n: bool = False
     allow_pony_v7_variable_n: bool = False
     allow_sd35_variable_n: bool = False
+    allow_sd35_large_relayout_n: bool = False
+    allow_sd35_medium_continuous_n: bool = False
     allow_krea2_raw_variable_n: bool = False
     sd15_euler_continuous_n_candidate: bool = False
 
@@ -1038,6 +1047,101 @@ class SpectrumCacheConfig:
     def for_sd35_medium_variable(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
         """STAGED variable-N candidate for SD3.5 Medium, explicitly opt-in only."""
         return cls._for_sd35_variable_n(num_inference_steps)
+
+    @classmethod
+    def _for_sd35_large_relayout_n(cls, num_inference_steps: int) -> "SpectrumCacheConfig":
+        """Exact Large-only relayout observed at N20/24/28/32/40/48.
+
+        No extrapolation to other N, Medium, different weights or conditions.
+        The forecast budget follows the sparse reference; only positions shift.
+        """
+        if type(num_inference_steps) is not int or num_inference_steps not in (20, 24, 28, 32, 40, 48):
+            raise ValueError("SD3.5 Large relayout requires an Owner-reviewed integer N")
+        n = num_inference_steps
+        if n <= 40:
+            base = cls._for_sd35_variable_n(n)
+        else:
+            warmup = min(n, max(4, math.ceil(5 * n / 28)))
+            tail = min(n, max(2, math.ceil(2 * n / 28)))
+            base = cls(
+                num_inference_steps=n,
+                warmup_steps=warmup,
+                degree=2,
+                ridge_lambda=0.1,
+                blend_w=0.5,
+                history_limit=8,
+                predictor_backend="chunked",
+                coordinate_policy="runtime_index_normalized",
+                tail_actual_steps=tail,
+                forecast_step_indices=(),
+                allow_sd35_variable_n=True,
+            )
+
+        first = max(6, (5 * n + 27) // 28)
+        last = n - base.tail_actual_steps
+        candidates = tuple(range(first, last, 2))
+        quota = min(len(candidates), n // 3)
+
+        def spread(values: tuple[int, ...], count: int) -> tuple[int, ...]:
+            if count <= 0:
+                return ()
+            if count >= len(values):
+                return values
+            if count == 1:
+                return (values[len(values) // 2],)
+            return tuple(
+                values[(j * (len(values) - 1) + (count - 1) // 2) // (count - 1)]
+                for j in range(count)
+            )
+
+        sparse = spread(candidates, quota)
+        shifted = tuple(range(first + 1, last, 2))
+        indices = spread(shifted, len(sparse)) if len(shifted) >= len(sparse) else sparse
+        return replace(base, forecast_step_indices=indices, allow_sd35_large_relayout_n=True)
+
+    @classmethod
+    def for_sd35_large_relayout(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """Explicit opt-in; qualified only for the reviewed Large/NF4 research matrix."""
+        return cls._for_sd35_large_relayout_n(num_inference_steps)
+
+    @classmethod
+    def _for_sd35_medium_continuous_n(cls, num_inference_steps: int) -> "SpectrumCacheConfig":
+        """Opt-in integer-N Medium route with fail-closed unreviewed horizons.
+
+        The schedules at N12/16 reproduce low-N SPARSE, N28 preserves the
+        historical baseline, N48 reproduces the observed exploratory mask.
+        Other N are accepted as integer input but never forecast. This is
+        a conservative source capability, not an all-N quality qualification.
+        """
+        if type(num_inference_steps) is not int or num_inference_steps < 1:
+            raise ValueError("SD3.5 Medium continuous-N requires positive integer N")
+        n = num_inference_steps
+        if n == 28:
+            return replace(cls._for_sd35_variable_n(n), allow_sd35_medium_continuous_n=True)
+        reviewed_forecast = {
+            12: (6, 8),
+            16: (6, 8, 10, 12),
+            48: (9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43),
+        }
+        return cls(
+            num_inference_steps=n,
+            warmup_steps=min(n, max(4, (5 * n + 27) // 28)),
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=8,
+            predictor_backend="chunked",
+            coordinate_policy="runtime_index_normalized",
+            tail_actual_steps=min(n, max(2, (2 * n + 27) // 28)),
+            forecast_step_indices=reviewed_forecast.get(n, ()),
+            allow_sd35_variable_n=True,
+            allow_sd35_medium_continuous_n=True,
+        )
+
+    @classmethod
+    def for_sd35_medium_continuous_n(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """Explicit Medium integer-N opt-in. Unsupported N computes all steps."""
+        return cls._for_sd35_medium_continuous_n(num_inference_steps)
 
     @classmethod
     def for_sd35_large(cls) -> "SpectrumCacheConfig":
