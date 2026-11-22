@@ -78,7 +78,12 @@ def _spectrum_sdxl_euler_reasons(pipe, timesteps, effective_steps, *, requested_
         type(pipe.scheduler).__module__ != "diffusers.schedulers.scheduling_euler_discrete"
     ):
         reasons.append("unqualified_scheduler_type")
-    if type(requested_steps) is not int or requested_steps not in (24, 32):
+    # The old strict 24/32 profiles remain unchanged. The separate research
+    # opt-in accepts the runtime Euler N, not a baked-in validation range.
+    continuous_n = config.sdxl_euler_continuous_n_candidate
+    candidate_n = type(requested_steps) is int and requested_steps >= 1
+    legacy_n = type(requested_steps) is int and requested_steps in (24, 32)
+    if not (candidate_n if continuous_n else legacy_n):
         reasons.append("unqualified_step_count")
     if (effective_steps != requested_steps or len(timesteps) != requested_steps
             or getattr(pipe, "_num_timesteps", None) != requested_steps):
@@ -102,7 +107,13 @@ def _spectrum_sdxl_euler_reasons(pipe, timesteps, effective_steps, *, requested_
     if torch.is_grad_enabled():
         reasons.append("autograd_enabled")
     try:
-        if requested_steps in (24, 32) and config != SpectrumCacheConfig.for_sdxl_variable(requested_steps, strict_post_grid=True):
+        if continuous_n and candidate_n:
+            expected_config = SpectrumCacheConfig.for_sdxl_continuous_n(requested_steps)
+        elif not continuous_n and legacy_n:
+            expected_config = SpectrumCacheConfig.for_sdxl_variable(requested_steps, strict_post_grid=True)
+        else:
+            expected_config = None
+        if expected_config is not None and config != expected_config:
             reasons.append("unexpected_spectrum_profile")
         for key, expected in _EULER_CONFIG.items():
             if pipe.scheduler.config[key] != expected:

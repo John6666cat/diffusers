@@ -174,6 +174,11 @@ class SpectrumCacheConfig:
         allow_krea2_raw_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for Krea 2 Raw N40–60 paired-CFG profiles. The historical
             N52 explicit-mask route remains unchanged.
+        sdxl_euler_continuous_n_candidate (`bool`, defaults to `False`):
+            Marks a separate, experimental positive-integer-N SDXL Euler route.
+            It requires ``sdxl_euler_post_grid_strict`` and the exact factory profile;
+            the pre-existing 24/32-step strict profiles are unaffected. An N
+            supported by the scheduler is not automatically quality-qualified.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -199,6 +204,7 @@ class SpectrumCacheConfig:
     forecast_step_indices: tuple[int, ...] | None = None
     denoiser_call_topology: str = "auto"
     sdxl_euler_post_grid_strict: bool = False
+    sdxl_euler_continuous_n_candidate: bool = False
     allow_unet_controlnet_residuals: bool = False
     allow_unet_t2i_adapter_residuals: bool = False
     allow_unet_ip_adapter_image_embeds: bool = False
@@ -284,6 +290,34 @@ class SpectrumCacheConfig:
             max_consecutive_forecast_steps=3,
             sdxl_euler_post_grid_strict=strict_post_grid,
         )
+
+    @classmethod
+    def for_sdxl_continuous_n(cls, num_inference_steps: int = 24) -> "SpectrumCacheConfig":
+        """Experimental, explicit-opt-in SDXL text2img Euler integer-N profile.
+
+        This factory accepts any positive integer N supported by the runtime
+        Euler scheduler. It does not impose an arbitrary low/high-step cutoff.
+        N20 keeps its historical all-real identity control. At N<=9 the six-step
+        warmup and three-step tail leave no forecastable steps, so those runs
+        are deliberately full-compute rather than forced sparse predictions.
+        All other N retain the original normalized predictor, maximum-three
+        forecast guard, and fixed warmup/tail; N24/N32 preserve their masks.
+
+        The paired SDXL pipeline gate checks the actual post-grid scheduler,
+        runtime N, configuration, dtype, and supported request shape before
+        enabling forecasts. This explicit opt-in is an *unqualified research
+        candidate*, not a quality or production approval at arbitrary N.
+        """
+        if type(num_inference_steps) is not int or num_inference_steps < 1:
+            raise ValueError("SDXL continuous N requires a positive integer.")
+        # The legacy profile requires tail_actual_steps <= N; for N=1/2
+        # construct the same coefficients first and safely shorten the tail.
+        config = cls.for_sdxl_variable(max(num_inference_steps, 3), strict_post_grid=True)
+        if num_inference_steps < 3:
+            config = replace(config, num_inference_steps=num_inference_steps, tail_actual_steps=num_inference_steps)
+        if num_inference_steps <= 9 or num_inference_steps == 20:
+            config = replace(config, max_consecutive_forecast_steps=None, forecast_step_indices=())
+        return replace(config, sdxl_euler_continuous_n_candidate=True)
 
     @classmethod
     def for_sd15(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
