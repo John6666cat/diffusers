@@ -36,6 +36,11 @@ from ...utils import (
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from ._spectrum_euler_gate import (
+    _spectrum_sd15_config,
+    _spectrum_sd15_euler_lifecycle,
+    _spectrum_sd15_euler_maybe_bypass,
+)
 from .pipeline_output import StableDiffusionPipelineOutput
 from .safety_checker import StableDiffusionSafetyChecker
 
@@ -776,6 +781,7 @@ class StableDiffusionPipeline(
         return self._interrupt
 
     @torch.no_grad()
+    @_spectrum_sd15_euler_lifecycle
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
@@ -922,6 +928,22 @@ class StableDiffusionPipeline(
                 else self.unet.config.sample_size[1]
             )
             height, width = height * self.vae_scale_factor, width * self.vae_scale_factor
+        # Capture the exact request before prompt encoding and scheduler setup.
+        _spectrum_requested_steps = num_inference_steps
+        _spectrum_plain_request = False
+        if _spectrum_sd15_config(self.unet) is not None:
+            _spectrum_plain_request = (
+                type(prompt) is str and type(negative_prompt) is str
+                and all(v is None for v in (timesteps, sigmas, prompt_embeds,
+                    negative_prompt_embeds, ip_adapter_image, ip_adapter_image_embeds,
+                    cross_attention_kwargs, clip_skip, callback_on_step_end))
+                and callback is None and callback_steps is None and not kwargs
+                and latents is not None and tuple(latents.shape) == (1, 4, 64, 64)
+                and latents.dtype == torch.float16 and latents.device.type == "cuda"
+                and height == 512 and width == 512 and guidance_scale == 7.0
+                and guidance_rescale == 0.0 and eta == 0.0
+                and num_images_per_prompt == 1 and output_type == "pil" and return_dict is True
+            )
         # to deal with lora scaling and other possible forward hooks
 
         # 1. Check inputs. Raise error if not correct
@@ -1028,6 +1050,10 @@ class StableDiffusionPipeline(
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
+        _spectrum_sd15_euler_maybe_bypass(
+            self, timesteps, num_inference_steps,
+            requested_steps=_spectrum_requested_steps, plain_request=_spectrum_plain_request,
+        )
         # A cache_context ends one denoiser call, not a generation.
         # Discard the previous generation's state before the new denoising loop.
         if hasattr(self.unet, "_reset_stateful_cache"):

@@ -179,6 +179,10 @@ class SpectrumCacheConfig:
             It requires ``sdxl_euler_post_grid_strict`` and the exact factory profile;
             the pre-existing 24/32-step strict profiles are unaffected. An N
             supported by the scheduler is not automatically quality-qualified.
+        sd15_euler_continuous_n_candidate (`bool`, defaults to `False`):
+            Explicit research opt-in to SD1.5 Euler integer-N masks, enforced by
+            the paired SD1.5 pipeline post-grid gate. It does not broaden the
+            previously qualified discrete ``for_sd15_variable`` route.
 
     Note:
         The default 50-step profile computes transformer blocks at steps
@@ -217,6 +221,7 @@ class SpectrumCacheConfig:
     allow_pony_v7_variable_n: bool = False
     allow_sd35_variable_n: bool = False
     allow_krea2_raw_variable_n: bool = False
+    sd15_euler_continuous_n_candidate: bool = False
 
     @classmethod
 
@@ -392,6 +397,69 @@ class SpectrumCacheConfig:
             coordinate_max=50.0,
             tail_actual_steps=3,
             forecast_step_indices=forecast_steps_by_count[num_inference_steps],
+        )
+
+    @classmethod
+    def for_sd15_continuous_n(cls, num_inference_steps: int = 24) -> "SpectrumCacheConfig":
+        """Explicit research candidate for ordinary SD1.5 Euler at positive integer N.
+
+        The six previously qualified discrete masks and predictor coefficients
+        remain bit-for-bit identical at N20/24/28/32/36/40. For other N, the
+        nearest historical mask is midpoint-retimed onto runtime steps; ties
+        prefer the lower anchor. Ineligible warmup/tail positions are full
+        compute, and no forecast run exceeds four steps. A non-anchor run uses
+        runtime-normalized predictor coordinates so high N does not extrapolate
+        indefinitely past the old 50-step coordinate horizon.
+
+        This is mechanical availability, NOT semantic quality qualification for
+        novel N or for other schedulers, models, or conditioning routes. The
+        StableDiffusionPipeline gate validates the actual Euler grid and the
+        exact factory config; invalid requests revert to ordinary UNet compute.
+        """
+        if type(num_inference_steps) is not int or num_inference_steps < 1:
+            raise ValueError("SD1.5 continuous N requires a positive integer.")
+
+        anchor_counts = (20, 24, 28, 32, 36, 40)
+        if num_inference_steps in anchor_counts:
+            return replace(
+                cls.for_sd15_variable(num_inference_steps),
+                sd15_euler_continuous_n_candidate=True,
+            )
+
+        anchor_n = min(anchor_counts, key=lambda anchor: (abs(anchor - num_inference_steps), anchor))
+        reference = cls.for_sd15_variable(anchor_n)
+        tail = min(3, num_inference_steps)
+        eligible = set(
+            step for step in _spectrum_retime_qualified_mask(
+                reference.forecast_step_indices, anchor_n, num_inference_steps
+            )
+            if 6 <= step < num_inference_steps - tail
+        )
+        # A long retimed run loses prediction anchors; promote actual calls
+        # locally without introducing any new forecast steps.
+        actual = [step not in eligible for step in range(num_inference_steps)]
+        while True:
+            runs = []
+            start = None
+            for index, compute in enumerate(actual + [True]):
+                if not compute and start is None:
+                    start = index
+                elif compute and start is not None:
+                    if index - start > 4:
+                        runs.append((start, index - 1))
+                    start = None
+            if not runs:
+                break
+            for first, last in runs:
+                actual[(first + last) // 2] = True
+
+        return replace(
+            reference,
+            num_inference_steps=num_inference_steps,
+            coordinate_policy="runtime_index_normalized",
+            tail_actual_steps=tail,
+            forecast_step_indices=tuple(step for step, compute in enumerate(actual) if not compute),
+            sd15_euler_continuous_n_candidate=True,
         )
 
     @classmethod
