@@ -34,7 +34,7 @@ def test_netayume_n50_anchor_keeps_legacy_predictor_coordinates_and_mask(profile
     assert reference.allow_netayume_variable_n is False
 
 
-@pytest.mark.parametrize("n,count", [(40, 25), (49, 30), (50, 30), (51, 31), (60, 35)])
+@pytest.mark.parametrize("n,count", [(11, 0), (12, 5), (40, 25), (49, 30), (50, 30), (51, 31), (60, 35), (80, 42)])
 @torch.no_grad()
 def test_netayume_variable_native_state_has_two_independent_cfg_lanes(n, count):
     config = SpectrumCacheConfig.for_netayume_variable(n)
@@ -71,7 +71,7 @@ def test_netayume_variable_registers_and_cleans_up(n, backend):
         assert not model.is_cache_enabled
 
 
-@pytest.mark.parametrize("bad", [True, False, 39, 61, 50.0, "50"])
+@pytest.mark.parametrize("bad", [True, False, 0, 81, 50.0, "50"])
 def test_netayume_variable_rejects_invalid_n(bad):
     with pytest.raises(ValueError, match="integer N"):
         SpectrumCacheConfig.for_netayume_variable(bad)

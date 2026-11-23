@@ -27,7 +27,7 @@ def test_pony_n30_anchor_keeps_legacy_predictor_coordinates_and_mask(profile, ma
     assert legacy.allow_pony_v7_variable_n is False
 
 
-@pytest.mark.parametrize("n,count", [(24, 6), (27, 8), (30, 8), (33, 10), (36, 10), (40, 11)])
+@pytest.mark.parametrize("n,count", [(11, 0), (12, 3), (24, 6), (27, 8), (30, 8), (33, 10), (36, 10), (40, 11), (80, 16)])
 @torch.no_grad()
 def test_pony_variable_native_state_retains_combined_cfg_feature(n, count):
     config = SpectrumCacheConfig.for_pony_v7_variable(n)
@@ -63,7 +63,7 @@ def test_pony_variable_registers_and_cleans_up(n, backend):
         assert not model.is_cache_enabled
 
 
-@pytest.mark.parametrize("bad", [True, False, 23, 41, 30.0, "30"])
+@pytest.mark.parametrize("bad", [True, False, 0, 81, 30.0, "30"])
 def test_pony_variable_rejects_invalid_n(bad):
     with pytest.raises(ValueError, match="integer N"):
         SpectrumCacheConfig.for_pony_v7_variable(bad)

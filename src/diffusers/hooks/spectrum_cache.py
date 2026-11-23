@@ -68,6 +68,24 @@ def _spectrum_retime_qualified_mask(
     )
 
 
+def _spectrum_guard_unreviewed_retime(
+    forecast_steps: tuple[int, ...], num_inference_steps: int, max_run: int
+) -> tuple[int, ...]:
+    """Protect early, tail and long forecast runs outside historical N ranges."""
+    if num_inference_steps <= 11:
+        return ()
+    candidates = frozenset(forecast_steps)
+    safe = []
+    run = 0
+    for step in range(num_inference_steps):
+        if 3 <= step < num_inference_steps - 2 and step in candidates and run < max_run:
+            safe.append(step)
+            run += 1
+        else:
+            run = 0
+    return tuple(safe)
+
+
 _UNET_RESIDUAL_ARGUMENTS = (
     "down_block_additional_residuals",
     "mid_block_additional_residual",
@@ -163,12 +181,12 @@ class SpectrumCacheConfig:
             return a mapping containing `step`, `num_inference_steps`, `num_conditions`, and `label` (`"cond"` or
             `"uncond"`), and may return `dynamic_conditioning=True` for sticky fail-closed behavior.
         allow_flux1_variable_n (`bool`, defaults to `False`):
-            Research-only opt-in for the FLUX.1-dev 40–60-step variable-N factory. It does
-            not relax the historical 50-step route or qualify untested step counts.
+            Research-only FLUX.1-dev N1–80 integer-step opt-in. N1–11 always compute;
+            the original N50 route and historical N40–60 candidates stay unchanged.
         allow_netayume_variable_n (`bool`, defaults to `False`):
-            Research-only opt-in for Neta Yume / Lumina2 N40–60 resampled masks.
+            Research-only Neta Yume / Lumina2 N1–80 paired-CFG masks.
         allow_pony_v7_variable_n (`bool`, defaults to `False`):
-            Research-only opt-in for Pony V7 / AuraFlow N24–40 resampled masks.
+            Research-only Pony V7 / AuraFlow N1–80 single-forward masks.
         allow_sd35_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for SD3.5 Large/Medium N20–40 step profiles. The historical N28 P13 factory is unchanged.
         allow_sd35_large_relayout_n (`bool`, defaults to `False`):
@@ -574,19 +592,31 @@ class SpectrumCacheConfig:
     ) -> "SpectrumCacheConfig":
         """Experimental FLUX.1-dev variable-N schedule, isolated from the qualified N50/P33 factory.
 
-        N40–60 is an initial evaluation window, not an established image-quality range.
+        N1–80 is a research input window; N1–11 is full REAL_COMPUTE.
+        Outside N40–60, predicted images are VISUAL_QUALITY_UNREVIEWED.
         The N50 dense arm returns the exact historical configuration. Non-anchor steps
         project the historical real-step positions onto i/N, retain its predictor history
         settings, and conservatively cap forecast runs at four steps with a two-step real tail.
         """
-        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
-            raise ValueError("Research FLUX.1-dev variable N requires an integer in [40, 60].")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Research FLUX.1-dev variable N requires an integer in [1, 80].")
         if predictor_backend not in {"dense", "fp32_weighted"}:
             raise ValueError("Research FLUX.1-dev variable N permits dense or fp32_weighted only.")
 
         anchor = cls.for_flux1_dev()
         if num_inference_steps == 50:
             return replace(anchor, predictor_backend=predictor_backend)
+        if num_inference_steps <= 11:
+            return replace(
+                anchor,
+                num_inference_steps=num_inference_steps,
+                predictor_backend=predictor_backend,
+                coordinate_policy="runtime_horizon_normalized",
+                tail_actual_steps=min(2, num_inference_steps),
+                denoiser_call_topology="single",
+                forecast_step_indices=(),
+                allow_flux1_variable_n=True,
+            )
 
         original_real = tuple(step for step in range(50) if step not in anchor.forecast_step_indices)
         real = {round(step * num_inference_steps / 50) for step in original_real}
@@ -662,15 +692,25 @@ class SpectrumCacheConfig:
         anchors, and insert real steps into the longest gaps until at least 30%
         of steps are real. Coordinates are runtime-horizon normalized. These are
         research candidates, not GPU/Owner-qualified or distilled presets.
+        N1–80 is supported for explicit research opt-in: N1–11 computes every step;
+        predictions outside N40–60 are VISUAL_QUALITY_UNREVIEWED.
         """
-        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
-            raise ValueError("Klein Base variable-N research requires integer N in [40, 60]")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Klein Base variable-N research requires integer N in [1, 80]")
         if predictor_backend not in {"dense", "fp32_weighted"}:
             raise ValueError("Klein Base variable-N research supports dense or fp32_weighted")
 
         anchor = cls.for_flux2_klein_base4b()
         if num_inference_steps == 50:
             return replace(anchor, predictor_backend=predictor_backend)
+        if num_inference_steps <= 11:
+            return replace(
+                anchor,
+                num_inference_steps=num_inference_steps,
+                predictor_backend=predictor_backend,
+                coordinate_policy="runtime_horizon_normalized",
+                forecast_step_indices=(),
+            )
 
         # The five interior real anchors are 10, 18, 25, 33, 41 at N=50.
         # Mapping 0..49 onto 0..N-1 has deterministic integer rounding.
@@ -704,14 +744,19 @@ class SpectrumCacheConfig:
 
         This is a research opt-in, not an assertion of semantic quality outside
         the old N50/P6/P9/P30 profiles. The paired CFG lanes stay independent.
+        N1–11 is full REAL_COMPUTE; new forecast horizons outside N40–60 are
+        VISUAL_QUALITY_UNREVIEWED.
         """
-        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
-            raise ValueError("Neta Yume variable-N research requires integer N in [40, 60]")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Neta Yume variable-N research requires integer N in [1, 80]")
         if profile not in {"p6", "p9", "p30"}:
             raise ValueError("Neta Yume variable-N profile must be p6, p9, or p30")
         if predictor_backend not in {"dense", "fp32_weighted"}:
             raise ValueError("Neta Yume variable-N research supports dense or fp32_weighted")
         anchor = _NETAYUME_QUALIFIED_SCHEDULES[{"p6": 0, "p9": 1, "p30": 2}[profile]]
+        forecast_steps = _spectrum_retime_qualified_mask(anchor, 50, num_inference_steps)
+        if not 40 <= num_inference_steps <= 60:
+            forecast_steps = _spectrum_guard_unreviewed_retime(forecast_steps, num_inference_steps, 4)
         return cls(
             num_inference_steps=num_inference_steps,
             warmup_steps=0,
@@ -724,7 +769,7 @@ class SpectrumCacheConfig:
             coordinate_policy="legacy_fixed_max",
             coordinate_max=float(num_inference_steps),
             tail_actual_steps=0,
-            forecast_step_indices=_spectrum_retime_qualified_mask(anchor, 50, num_inference_steps),
+            forecast_step_indices=forecast_steps,
             denoiser_call_topology="paired_cfg",
             predictor_backend=predictor_backend,
             allow_netayume_variable_n=True,
@@ -737,15 +782,19 @@ class SpectrumCacheConfig:
         """Experimental AuraFlow variable-N masks; N30 retains the P1/P4/P8 indices.
 
         The historical 8-unit predictor coordinate horizon scales with N,
-        preserving the old N30 anchor convention.
+        preserving the old N30 anchor convention. N1–11 is all real compute;
+        predictions outside N24–40 are VISUAL_QUALITY_UNREVIEWED.
         """
-        if type(num_inference_steps) is not int or not 24 <= num_inference_steps <= 40:
-            raise ValueError("Pony V7 variable-N research requires integer N in [24, 40]")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Pony V7 variable-N research requires integer N in [1, 80]")
         if profile not in {"p1", "p4", "p8"}:
             raise ValueError("Pony V7 variable-N profile must be p1, p4, or p8")
         if predictor_backend not in {"dense", "fp32_weighted"}:
             raise ValueError("Pony V7 variable-N research supports dense or fp32_weighted")
         anchor = _PONY_V7_QUALIFIED_SCHEDULES[{"p1": 0, "p4": 1, "p8": 2}[profile]]
+        forecast_steps = _spectrum_retime_qualified_mask(anchor, 30, num_inference_steps)
+        if not 24 <= num_inference_steps <= 40:
+            forecast_steps = _spectrum_guard_unreviewed_retime(forecast_steps, num_inference_steps, 2)
         return cls(
             num_inference_steps=num_inference_steps,
             warmup_steps=0,
@@ -758,7 +807,7 @@ class SpectrumCacheConfig:
             coordinate_policy="legacy_fixed_max",
             coordinate_max=8.0 * num_inference_steps / 30,
             tail_actual_steps=0,
-            forecast_step_indices=_spectrum_retime_qualified_mask(anchor, 30, num_inference_steps),
+            forecast_step_indices=forecast_steps,
             denoiser_call_topology="single",
             predictor_backend=predictor_backend,
             allow_pony_v7_variable_n=True,
@@ -3349,7 +3398,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         variable_opt_in = (
             config.allow_flux1_variable_n is True
             and type(config.num_inference_steps) is int
-            and 40 <= config.num_inference_steps <= 60
+            and 1 <= config.num_inference_steps <= 80
             and config.predictor_backend in {"dense", "fp32_weighted"}
             and config == SpectrumCacheConfig.for_flux1_dev_variable(
                 config.num_inference_steps, predictor_backend=config.predictor_backend

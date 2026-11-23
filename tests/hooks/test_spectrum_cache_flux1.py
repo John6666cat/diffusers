@@ -128,7 +128,7 @@ def test_spectrum_flux1_variable_n_schedule_is_explicit_and_bounded(steps):
         assert all(right - left - 1 <= 4 for left, right in zip(real, real[1:]))
 
 
-@pytest.mark.parametrize("steps", (True, False, 0, 39, 61, 50.0, "50"))
+@pytest.mark.parametrize("steps", (True, False, 0, 81, 50.0, "50"))
 def test_spectrum_flux1_variable_n_rejects_invalid_step_count(steps):
     with pytest.raises(ValueError, match="integer in"):
         SpectrumCacheConfig.for_flux1_dev_variable(steps)
@@ -160,7 +160,7 @@ def test_spectrum_flux1_variable_n_rejects_unqualified_backends_and_bypass_confi
     assert not model.is_cache_enabled
 
 
-@pytest.mark.parametrize("steps", (49, 51))
+@pytest.mark.parametrize("steps", (11, 16, 49, 51, 80))
 @torch.no_grad()
 def test_spectrum_flux1_variable_n_native_context_and_cleanup(steps):
     torch.manual_seed(47)

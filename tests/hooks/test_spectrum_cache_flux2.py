@@ -65,7 +65,7 @@ def test_spectrum_flux2_klein_base4b_variable_backend_is_independent_of_mask():
         assert fp32.predictor_backend == "fp32_weighted"
         assert dense.forecast_step_indices == fp32.forecast_step_indices
         assert dense.coordinate_policy == fp32.coordinate_policy
-    for steps in (True, 0, 39, 61, 100):
+    for steps in (True, 0, 81, 100):
         try:
             SpectrumCacheConfig.for_flux2_klein_base4b_variable(steps)
         except ValueError:
@@ -78,7 +78,7 @@ def test_spectrum_flux2_klein_base4b_variable_backend_is_independent_of_mask():
 def test_spectrum_flux2_klein_base4b_variable_native_cpu_actual_n_and_cleanup():
     # A schedule preview does not establish that an actual model respects N.
     # The tiny model exercises the adapter, forecast path and state lifetime.
-    for steps, backend in ((40, "dense"), (60, "fp32_weighted")):
+    for steps, backend in ((11, "dense"), (16, "dense"), (40, "dense"), (60, "fp32_weighted"), (80, "fp32_weighted")):
         model = make_model()
         cfg = SpectrumCacheConfig.for_flux2_klein_base4b_variable(
             steps, predictor_backend=backend
