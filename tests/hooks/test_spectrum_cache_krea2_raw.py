@@ -180,7 +180,7 @@ def test_variable_n_schedule_cpu_policy(num_steps):
         assert max(map(len, binary.split("0"))) <= 7
 
 
-@pytest.mark.parametrize("num_steps", (40, 45, 50, 55, 60))
+@pytest.mark.parametrize("num_steps", (10, 20, 39, 40, 45, 50, 55, 60, 61, 80))
 def test_variable_n_real_paired_cfg_cpu_mechanics(num_steps):
     model = make_model()
     cfg = SpectrumCacheConfig.for_krea2_raw_variable(num_steps)
@@ -209,7 +209,7 @@ def test_variable_n_real_paired_cfg_cpu_mechanics(num_steps):
     model.disable_cache()
 
 
-@pytest.mark.parametrize("invalid", (39, 61, 52.0, True))
+@pytest.mark.parametrize("invalid", (-1, 0, 81, 52.0, True))
 def test_variable_n_rejects_invalid_horizon(invalid):
     with pytest.raises(ValueError, match="integer"):
         SpectrumCacheConfig.for_krea2_raw_variable(invalid)
@@ -232,3 +232,47 @@ def test_variable_n_requires_exact_opt_in_and_canonical_guard():
         model = make_model()
         with pytest.raises(ValueError, match="canonical opt-in"):
             model.enable_cache(cfg)
+
+
+@pytest.mark.parametrize("num_steps", range(1, 81))
+def test_continuous_n_cpu_schedule_guards(num_steps):
+    cfg = SpectrumCacheConfig.for_krea2_raw_variable(num_steps)
+    assert cfg.num_inference_steps == num_steps
+    assert cfg.denoiser_call_topology == "paired_cfg"
+    assert cfg.coordinate_policy == "runtime_horizon_normalized"
+    assert cfg.allow_krea2_raw_variable_n == (num_steps != 52)
+    assert cfg.forecast_step_indices == tuple(sorted(set(cfg.forecast_step_indices)))
+    forecasts = set(cfg.forecast_step_indices)
+    if num_steps <= 11:
+        assert not forecasts  # Not enough history; full real compute.
+    else:
+        assert not forecasts.intersection(range(7))
+        assert not forecasts.intersection(range(num_steps - 2, num_steps))
+        assert len(forecasts) > 0
+        runs = "".join("1" if i in forecasts else "0" for i in range(num_steps))
+        assert max(map(len, runs.split("0"))) <= 7
+    if num_steps != 52:
+        assert cfg.tail_actual_steps == min(2, num_steps)
+
+
+@pytest.mark.parametrize("num_steps", (1, 9, 10, 11))
+def test_continuous_n_all_real_cpu_mechanics(num_steps):
+    model = make_model()
+    model.enable_cache(SpectrumCacheConfig.for_krea2_raw_variable(num_steps))
+    positive = torch.ones(1, 3, 12, 4)
+    negative = torch.full((1, 3, 12, 4), 2.0)
+    ids = torch.zeros(5, 3)
+    with torch.no_grad():
+        for step in range(num_steps):
+            for embed in (positive, negative):
+                with model.cache_context("krea", step_index=step, num_inference_steps=num_steps):
+                    model(
+                        hidden_states=torch.ones(1, 2, 4) + step,
+                        encoder_hidden_states=embed,
+                        timestep=torch.ones(1), position_ids=ids, return_dict=False,
+                    )
+    report = model._diffusers_hook.get_hook("spectrum_cache_denoiser").latest_summary
+    assert report["prediction_call_count"] == 0
+    assert report["full_call_count"] == 2 * num_steps
+    assert sum(block.calls for block in model.transformer_blocks) == 28 * 2 * num_steps
+    model.disable_cache()

@@ -179,8 +179,10 @@ class SpectrumCacheConfig:
             exist at N12/16 (SPARSE preference), N28 (BASELINE) and N48 (exploratory).
             Unreviewed N runs full REAL_COMPUTE with no forecast; no generalization.
         allow_krea2_raw_variable_n (`bool`, defaults to `False`):
-            Research-only opt-in for Krea 2 Raw N40–60 paired-CFG profiles. The historical
-            N52 explicit-mask route remains unchanged.
+            Research-only opt-in for Krea 2 Raw N1–80 paired-CFG profiles. N40–60
+            retains its original masks, and the N52 explicit-mask route is unchanged.
+            Only N40/52/60 have previous, narrowly scoped Owner visual review;
+            all other N values are VISUAL_QUALITY_UNREVIEWED.
         sdxl_euler_continuous_n_candidate (`bool`, defaults to `False`):
             Marks a separate, experimental positive-integer-N SDXL Euler route.
             It requires ``sdxl_euler_post_grid_strict`` and the exact factory profile;
@@ -473,16 +475,16 @@ class SpectrumCacheConfig:
 
     @classmethod
     def for_krea2_raw_variable(cls, num_inference_steps: int = 52) -> "SpectrumCacheConfig":
-        """Isolated Krea 2 Raw paired-CFG variable-N research profile.
+        """Opt-in Krea 2 Raw paired-CFG integer-N research profile, N1–80.
 
-        N52/P32 exactly reproduces the existing owner-reviewed Source recipe,
-        including predictor settings, not only the explicit mask.
-        Other N40–60 profiles conservatively project its real-call positions,
-        keep the first seven and last two steps real, and cap forecast runs at
-        seven. These projected masks are CPU candidates, not visual qualifications.
+        N52/P32 and every original N40–60 mask and predictor setting are kept
+        unchanged. Outside that window, N<=11 is full real compute; N>=12
+        projects the old anchor with real early/tail steps and at most seven
+        consecutive forecasts. Only N40/52/60 have previous limited visual
+        evidence; other N values are VISUAL_QUALITY_UNREVIEWED.
         """
-        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
-            raise ValueError("Krea 2 Raw variable N requires an integer in [40, 60].")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Krea 2 Raw variable N requires an integer in [1, 80].")
 
         anchor_forecast = (
             7, 8, 9, 10, 11, 13, 15, 16, 17, 19, 21, 23, 24, 25, 27, 28,
@@ -505,9 +507,17 @@ class SpectrumCacheConfig:
         )
         if num_inference_steps == 52:
             return anchor
+        if num_inference_steps <= 11:
+            return replace(
+                anchor,
+                num_inference_steps=num_inference_steps,
+                tail_actual_steps=min(2, num_inference_steps),
+                forecast_step_indices=(),
+                allow_krea2_raw_variable_n=True,
+            )
 
         anchor_real = tuple(step for step in range(52) if step not in anchor_forecast)
-        real = {round(step * num_inference_steps / 52) for step in anchor_real}
+        real = {min(num_inference_steps - 1, round(step * num_inference_steps / 52)) for step in anchor_real}
         real.update(range(7))
         real.update((num_inference_steps - 2, num_inference_steps - 1))
         min_real = math.ceil(num_inference_steps * len(anchor_real) / 52)
@@ -3401,7 +3411,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
                 not config.allow_krea2_raw_variable_n
                 or config != SpectrumCacheConfig.for_krea2_raw_variable(config.num_inference_steps)
             ):
-                raise ValueError("Research Krea 2 Raw variable N requires the canonical opt-in N40–60 profile.")
+                raise ValueError("Research Krea 2 Raw variable N requires the canonical opt-in N1–80 profile.")
 
         signature = {
             "in_channels": 64,
