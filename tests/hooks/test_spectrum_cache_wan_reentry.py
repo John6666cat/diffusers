@@ -91,9 +91,9 @@ def test_profile_scheduled_counts_and_bounds(steps):
     assert config.degree == 4 and config.ridge_lambda == 0.1 and config.blend_w == 0.5
 
 
-@pytest.mark.parametrize("steps", (39, 61))
-def test_profile_outside_measured_range_rejected(steps):
-    with pytest.raises(ValueError, match="40 <= num_inference_steps <= 60"):
+@pytest.mark.parametrize("steps", (True, False, -1, 0, 81, 50.0, "50", None))
+def test_profile_invalid_step_count_rejected(steps):
+    with pytest.raises(ValueError, match="integer N in"):
         SpectrumCacheConfig.for_wan21_13b_variable(steps)
 
 
@@ -225,7 +225,7 @@ def test_wan_nfe12_anchored_variable_full_integer_range(steps):
     assert len(config.forecast_step_indices) + len(real) == steps
 
 
-@pytest.mark.parametrize("steps", (39, 61, 40.0, True, None))
+@pytest.mark.parametrize("steps", (-1, 0, 81, 40.0, True, False, "50", None))
 def test_wan_nfe12_anchored_variable_rejects_invalid_n(steps):
     with pytest.raises(ValueError, match="requires integer N in"):
         SpectrumCacheConfig.for_wan21_13b_nfe12_anchored_variable(steps)
@@ -259,3 +259,166 @@ def test_wan_nfe12_anchored_variable_real_block_calls_both_lanes(steps, real_ste
     assert all(block.calls == 2 * len(real_steps) for block in model.blocks)
     model.disable_cache()
     assert not model.is_cache_enabled
+
+
+# N1–80 is an opt-in mechanical capability, not new video-quality acceptance.
+WAN_N1_80_FACTORY_DIGESTS = {
+    "for_wan21_13b_variable": "4322e0bdf5cc9ddd9c6fa87620e2f42de9162d108157b104fc09cf613eada9b2",
+    "for_wan21_13b_nfe12_anchored_variable": "bc3b7f6b74febc2713ddb8e3c302100c42b5c57fcb3c217319b82c026fae01a5",
+}
+
+
+@pytest.mark.parametrize("factory_name,expected", WAN_N1_80_FACTORY_DIGESTS.items())
+def test_wan_n1_80_historical_40_60_configs_exact(factory_name, expected):
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    digest = hashlib.sha256()
+    for n in range(40, 61):
+        config = getattr(SpectrumCacheConfig, factory_name)(n)
+        digest.update(json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode())
+        digest.update(b"\n")
+    assert digest.hexdigest() == expected
+
+
+@pytest.mark.parametrize("factory_name,expected", (
+    ("for_wan21_13b_nfe12_nested", "a8633ba4aa3cbe5ed0f70d65a6dcc58f6b8676eeed1b44cc1e322c9641a8f57e"),
+    ("for_wan21_13b_nfe11_add5", "185d669d3e6232b713b817b821b2274a813413daed55f152dc82bf393a83260b"),
+))
+def test_wan_fixed_challenge_and_nfe12_unchanged(factory_name, expected):
+    import hashlib
+    import json
+    from dataclasses import asdict
+
+    config = getattr(SpectrumCacheConfig, factory_name)()
+    digest = hashlib.sha256(json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert digest == expected
+
+
+@pytest.mark.parametrize("factory_name", WAN_N1_80_FACTORY_DIGESTS)
+def test_wan_all_n1_80_retimed_schedule_and_temporal_guards(factory_name):
+    import math
+
+    factory = getattr(SpectrumCacheConfig, factory_name)
+    for n in range(1, 81):
+        config = factory(n)
+        predicted = config.forecast_step_indices
+        actual = tuple(i for i in range(n) if i not in predicted)
+        assert config.num_inference_steps == n
+        assert config.coordinate_policy == "runtime_horizon_normalized"
+        assert config.predictor_backend == "dense"
+        assert config.denoiser_call_topology != "paired_cfg"
+        assert predicted == tuple(sorted(set(predicted)))
+        assert predicted == tuple(i for i in range(n) if not SpectrumSchedule(config).decide(i))
+        assert actual[0] == 0 and actual[-1] == n - 1
+        if n <= 19:
+            assert predicted == ()
+        else:
+            assert predicted
+            assert all(config.warmup_steps <= step < n - config.tail_actual_steps for step in predicted)
+        if factory_name.endswith("anchored_variable") and not 40 <= n <= 60 and n >= 20:
+            assert actual[:4] == (0, 1, 2, 3)
+            assert len(actual) >= max(12, math.ceil(n / 4))
+            binary = "".join("1" if i in predicted else "0" for i in range(n))
+            assert max(map(len, binary.split("0"))) <= 4
+        if factory_name == "for_wan21_13b_variable" and n >= 20:
+            binary = "".join("1" if i in predicted else "0" for i in range(n))
+            assert max(map(len, binary.split("0"))) <= 2
+
+
+@pytest.mark.parametrize("factory_name", WAN_N1_80_FACTORY_DIGESTS)
+@pytest.mark.parametrize("steps", (1, 11, 12, 19, 20, 39, 40, 50, 60, 61, 80))
+def test_wan_n1_80_tiny_video_body_real_counts_and_two_cfg_lanes(factory_name, steps):
+    model = make_tiny_wan()
+    config = getattr(SpectrumCacheConfig, factory_name)(steps)
+    model.enable_cache(config)
+    predicted = len(config.forecast_step_indices)
+    latent = torch.ones((1, 16, 3, 4, 4))  # three latent temporal slices
+    text = torch.ones((1, 5, 8))
+    with torch.no_grad():
+        for step in range(steps):
+            for lane in ("cond", "uncond"):
+                with model.cache_context(lane, step_index=step, num_inference_steps=steps):
+                    out = model(
+                        hidden_states=latent,
+                        timestep=torch.tensor([step], dtype=torch.float32),
+                        encoder_hidden_states=text,
+                        return_dict=False,
+                    )
+                    assert torch.isfinite(out[0]).all()
+    hook = HookRegistry.check_if_exists_or_initialize(model).get_hook("spectrum_cache_denoiser")
+    assert sorted(hook.state_manager._state_cache) == ["cond", "uncond"]
+    for lane in ("cond", "uncond"):
+        summary = hook.state_manager._state_cache[lane].summary()
+        assert not summary["guard_latched"]
+        assert not summary["coordinate"]["failure_latched"]
+        assert not summary["prediction_failure_latched"]
+        assert summary["prediction_call_count"] == predicted
+        assert summary["full_call_count"] == steps - predicted
+    assert all(block.calls == 2 * (steps - predicted) for block in model.blocks)
+    model.disable_cache()
+    assert not model.is_cache_enabled
+
+
+@pytest.mark.parametrize("factory_name", WAN_N1_80_FACTORY_DIGESTS)
+@pytest.mark.parametrize("n", (20, 39, 61, 80))
+def test_wan_n1_80_new_horizon_install_rejects_noncanonical_config(factory_name, n):
+    factory = getattr(SpectrumCacheConfig, factory_name)
+    config = factory(n)
+    model = make_tiny_wan()
+    for mutation in (
+        replace(config, blend_w=0.7),
+        replace(config, coordinate_max=40.0),
+        replace(config, forecast_step_indices=config.forecast_step_indices[:-1]),
+    ):
+        with pytest.raises(ValueError, match="exact N1–80 research native-context"):
+            model.enable_cache(mutation)
+        assert not model.is_cache_enabled
+
+
+@pytest.mark.parametrize("factory_name", WAN_N1_80_FACTORY_DIGESTS)
+def test_wan_n1_80_new_horizon_conditional_image_path_stays_full_compute(factory_name):
+    n = 20
+    model = make_tiny_wan()
+    config = getattr(SpectrumCacheConfig, factory_name)(n)
+    model.enable_cache(config)
+    with torch.no_grad():
+        for step in range(n):
+            with model.cache_context("cond", step_index=step, num_inference_steps=n):
+                model(
+                    hidden_states=torch.ones((1, 16, 3, 4, 4)),
+                    timestep=torch.tensor([step], dtype=torch.float32),
+                    encoder_hidden_states=torch.ones((1, 5, 8)),
+                    encoder_hidden_states_image=torch.ones((1, 3, 8)) if step == 0 else None,
+                    return_dict=False,
+                )
+    hook = HookRegistry.check_if_exists_or_initialize(model).get_hook("spectrum_cache_denoiser")
+    summary = hook.state_manager._state_cache["cond"].summary()
+    assert summary["guard_latched"]
+    assert summary["prediction_call_count"] == 0
+    assert summary["full_call_count"] == n
+    assert all(block.calls == n for block in model.blocks)
+    model.disable_cache()
+
+
+@pytest.mark.parametrize("factory_name", WAN_N1_80_FACTORY_DIGESTS)
+def test_wan_n1_80_new_horizon_runtime_drift_fails_closed(factory_name):
+    n = 20
+    model = make_tiny_wan()
+    model.enable_cache(getattr(SpectrumCacheConfig, factory_name)(n))
+    with torch.no_grad():
+        for step in range(n):
+            with model.cache_context("cond", step_index=step, num_inference_steps=n + 1):
+                model(
+                    hidden_states=torch.ones((1, 16, 3, 4, 4)),
+                    timestep=torch.tensor([step], dtype=torch.float32),
+                    encoder_hidden_states=torch.ones((1, 5, 8)),
+                    return_dict=False,
+                )
+    hook = HookRegistry.check_if_exists_or_initialize(model).get_hook("spectrum_cache_denoiser")
+    summary = hook.state_manager._state_cache["cond"].summary()
+    assert summary["coordinate"]["failure_latched"]
+    assert summary["prediction_call_count"] == 0
+    assert summary["full_call_count"] == n
+    model.disable_cache()

@@ -852,17 +852,18 @@ class SpectrumCacheConfig:
     def for_wan21_13b_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
         """Research reentry profile for text-only Wan2.1 T2V 1.3B.
 
-        Preserve the previously tested 50-step mid19/keep10 schedule. Scale the
-        protected early and tail regions to 40–60 steps, retaining two forecast
-        positions per three interior steps. This is not a Wan2.1 14B / Wan2.2
-        or a general video-quality qualification.
+        The historical N40–60 schedule is unchanged (including N50 mid19/keep10).
+        New integer N20–39/61–80 projects the same early/tail and 2-of-3 mask;
+        N1–19 executes every step. New-N video quality is VISUAL_QUALITY_UNREVIEWED.
+        This does not qualify Wan2.1 14B, Wan2.2, I2V or production video.
         """
-        if not 40 <= num_inference_steps <= 60:
-            raise ValueError("for_wan21_13b_variable requires 40 <= num_inference_steps <= 60")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("for_wan21_13b_variable requires integer N in [1, 80]")
         early = max(1, math.floor(0.22 * num_inference_steps + 0.5))
         tail = max(1, math.floor(0.20 * num_inference_steps + 0.5))
-        forecast = tuple(
-            index for index in range(early, num_inference_steps - tail) if (index - early) % 3 != 1
+        forecast = (
+            tuple(index for index in range(early, num_inference_steps - tail) if (index - early) % 3 != 1)
+            if num_inference_steps >= 20 else ()
         )
         return cls(
             num_inference_steps=num_inference_steps,
@@ -897,19 +898,28 @@ class SpectrumCacheConfig:
 
     @classmethod
     def for_wan21_13b_nfe12_anchored_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
-        """Opt-in 40–60-step Wan2.1 T2V 1.3B profile based on the N50/NFE12 anchor.
+        """Opt-in Wan2.1 text-only T2V 1.3B integer N1–80 NFE12-anchor research.
 
-        N40 and N50 preserve the owner-reviewed layouts; N60 uses the
-        owner-preferred EARLY_15 layout. Other integer step counts retain the
-        staged deterministic retiming policy, without a video-quality claim.
-        This does not change the existing Wan factories or cache defaults.
+        Historical N40–60 schedules are identical, notably the N50/NFE12 mask
+        and Owner-preferred N60 EARLY_15. N1–19 is full REAL_COMPUTE. Other
+        N20–39/61–80 retime N50 real anchors, use at least 25% real calls,
+        and cap forecast runs at four steps. Those N are
+        VISUAL_QUALITY_UNREVIEWED, not accepted video quality.
         """
-        if type(num_inference_steps) is not int or not 40 <= num_inference_steps <= 60:
-            raise ValueError("Wan NFE12 anchored variable profile requires integer N in [40, 60]")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Wan NFE12 anchored variable profile requires integer N in [1, 80]")
         if num_inference_steps == 50:
             return cls.for_wan21_13b_nfe12_nested()
 
         n = num_inference_steps
+        if n <= 19:
+            return replace(
+                cls.for_wan21_13b_nfe12_nested(),
+                num_inference_steps=n,
+                warmup_steps=min(4, n),
+                tail_actual_steps=1,
+                forecast_step_indices=(),
+            )
         if n == 60:
             real = (0, 1, 2, 3, 5, 7, 10, 14, 19, 25, 32, 39, 46, 52, 59)
         else:
@@ -923,6 +933,15 @@ class SpectrumCacheConfig:
                 gaps = [(right - left, left, right) for left, right in zip(sorted(real), sorted(real)[1:])]
                 width, left, right = max(gaps, key=lambda gap: (gap[0], -gap[1]))
                 real.add((left + right) // 2)
+            if not 40 <= n <= 60:
+                # Temporal conservatism for unreviewed horizons only: no run of
+                # more than four skipped transformer-body evaluations.
+                while True:
+                    gaps = [(right - left, left, right) for left, right in zip(sorted(real), sorted(real)[1:])]
+                    width, left, right = max(gaps, key=lambda gap: (gap[0], -gap[1]))
+                    if width <= 5:
+                        break
+                    real.add((left + right) // 2)
             real = tuple(sorted(real))
 
         real_set = frozenset(real)
@@ -3354,13 +3373,23 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_wan import WanTransformer3DModel
 
     if isinstance(unwrapped, WanTransformer3DModel):
+        historical_n = type(config.num_inference_steps) is int and 40 <= config.num_inference_steps <= 60
+        research_n = (
+            type(config.num_inference_steps) is int
+            and 1 <= config.num_inference_steps <= 80
+            and not historical_n
+            and config in (
+                SpectrumCacheConfig.for_wan21_13b_variable(config.num_inference_steps),
+                SpectrumCacheConfig.for_wan21_13b_nfe12_anchored_variable(config.num_inference_steps),
+            )
+        )
         if (
-            not 40 <= config.num_inference_steps <= 60
+            not (historical_n or research_n)
             or config.coordinate_policy != "runtime_horizon_normalized"
             or config.forecast_step_indices is None
             or config.denoiser_call_topology == "paired_cfg"
         ):
-            raise ValueError("Research Wan2.1 1.3B requires a 40–60-step explicit native-context schedule.")
+            raise ValueError("Research Wan2.1 1.3B requires an explicit native-context schedule: historical N40–60 or exact N1–80 research native-context.")
         expected = {
             "num_layers": 30,
             "num_attention_heads": 12,
