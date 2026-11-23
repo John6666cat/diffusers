@@ -141,7 +141,7 @@ def test_base_p8_spread_is_n28_only_and_default_is_unchanged():
 )
 def test_unqualified_short_step_profiles_rejected(config):
     model = make_model()
-    with pytest.raises(ValueError, match="20–40-step Base profile or the exact 8-step Turbo"):
+    with pytest.raises(ValueError, match="historical N20–40 Base, exact N1–80 research Base"):
         model.enable_cache(config)
     assert not model.is_cache_enabled
 
@@ -151,4 +151,32 @@ def test_turbo_nonstandard_architecture_rejected():
     model.register_to_config(n_layers=29)
     with pytest.raises(ValueError, match="standard 30-block T2I architecture"):
         model.enable_cache(SpectrumCacheConfig.for_zimage_turbo())
+    assert not model.is_cache_enabled
+
+
+@pytest.mark.parametrize("n", (11, 12, 41, 80))
+def test_new_base_n_enable_full_or_sparse_and_disable(n):
+    cfg = SpectrumCacheConfig.for_zimage_base_variable(n)
+    model = make_model()
+    model.enable_cache(cfg)
+    with torch.no_grad():
+        for step in range(n):
+            with model.cache_context("t2i", step_index=step, num_inference_steps=n):
+                model(
+                    x=[torch.full((1, 2, 8), 0.25 + step / n)],
+                    t=torch.tensor([step / n]), cap_feats=[torch.ones(5, 8)], return_dict=False
+                )
+    summary = HookRegistry.check_if_exists_or_initialize(model).get_hook("spectrum_cache_denoiser").latest_summary
+    forecast = tuple(cfg.forecast_step_indices)
+    assert summary["prediction_call_count"] == len(forecast), summary
+    assert not summary["guard_latched"]
+    assert not summary["coordinate"]["failure_latched"]
+    model.disable_cache()
+
+
+def test_unreviewed_zimage_rogue_config_is_not_accepted():
+    model = make_model()
+    cfg = SpectrumCacheConfig.for_zimage_base_variable(12)
+    with pytest.raises(ValueError, match="exact N1–80 research Base"):
+        model.enable_cache(replace(cfg, warmup_steps=cfg.warmup_steps + 1))
     assert not model.is_cache_enabled

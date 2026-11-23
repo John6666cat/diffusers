@@ -953,10 +953,12 @@ class SpectrumCacheConfig:
         """Construct a bounded Qwen-Image variable-step cache profile.
 
         Supports Qwen-Image-2512 text-to-image and single-reference
-        Qwen-Image-Edit-2511 with 16 to 40 denoising steps.
+        Qwen-Image-Edit-2511 with positive integer N1–80. Historical N16–40
+        configs are unchanged; new-N forecasts are VISUAL_QUALITY_UNREVIEWED.
+        N1–11 is full REAL_COMPUTE. Calling the factory does not enable cache.
         """
-        if not 16 <= num_inference_steps <= 40:
-            raise ValueError("for_qwen_image_variable requires 16 <= num_inference_steps <= 40")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("for_qwen_image_variable requires integer N in [1, 80]")
 
         warmup_steps = max(1, math.floor(0.30 * num_inference_steps + 0.5))
         tail_actual_steps = max(1, math.floor(0.20 * num_inference_steps + 0.5))
@@ -972,6 +974,10 @@ class SpectrumCacheConfig:
             coordinate_policy="runtime_horizon_normalized",
             coordinate_max=20.0,
             tail_actual_steps=tail_actual_steps,
+            forecast_step_indices=() if num_inference_steps <= 11 else None,
+            max_consecutive_forecast_steps=(
+                3 if num_inference_steps >= 12 and not 16 <= num_inference_steps <= 40 else None
+            ),
         )
 
     @classmethod
@@ -1006,11 +1012,13 @@ class SpectrumCacheConfig:
         28-step P12 was visually selected in the owner's narrow NF4 0.42.1 probe.
         N28/P8_SPREAD is a separately selected, narrowly owner-reviewed research
         alternative; the two original scenes do not establish general quality.
-        Other 20–40-step counts keep the historical, not requalified schedule.
+        N20–40 keeps the historical, not requalified schedule. Other integer
+        N1–80 values are opt-in CPU research candidates and VISUAL_QUALITY_UNREVIEWED.
+        N1–11 computes every step; P8_SPREAD remains restricted to N28.
         P13_355 remains challenge-only; cache is never enabled by default.
         """
-        if not 20 <= num_inference_steps <= 40:
-            raise ValueError("for_zimage_base_variable requires 20 <= num_inference_steps <= 40")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("for_zimage_base_variable requires integer N in [1, 80]")
         if profile not in ("p12", "p8_spread"):
             raise ValueError("Z-Image Base variable-N profile must be 'p12' or 'p8_spread'")
         if profile == "p8_spread" and num_inference_steps != 28:
@@ -1024,6 +1032,8 @@ class SpectrumCacheConfig:
                 if profile == "p8_spread"
                 else (9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23)
             )
+        elif num_inference_steps <= 11:
+            forecast_steps = ()
         else:
             forecast_steps = tuple(range(early_actual_steps, num_inference_steps - tail_actual_steps, 2))
         return cls(
@@ -1222,18 +1232,20 @@ class SpectrumCacheConfig:
     def for_qwen_image21_variable(
         cls, num_inference_steps: int = 20, *, forecast_fraction: float = 0.55
     ) -> "SpectrumCacheConfig":
-        """Opt-in Qwen-Image 2.1 native-KV profile for 16–40 steps.
+        """Opt-in Qwen-Image 2.1 native-KV profile for positive integer N1–80.
 
-        The 55% default is the visually selected research Source profile.
-        Other fractions, especially 60% or more, remain experimental.
+        N16–40 preserves the historical 55% default and alternate fractions.
+        Outside that window, only the exact 55% factory config is enable-eligible;
+        new N is VISUAL_QUALITY_UNREVIEWED, not owner quality-approved.
+        N1–11 computes every step; native-KV first-step prefill stays real.
         """
-        if not 16 <= num_inference_steps <= 40:
-            raise ValueError("for_qwen_image21_variable requires 16 <= num_inference_steps <= 40")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("for_qwen_image21_variable requires integer N in [1, 80]")
         if not 0.0 < forecast_fraction < 1.0:
             raise ValueError("forecast_fraction must be between 0 and 1")
-        warmup_steps = max(5, round(0.18 * num_inference_steps))
-        tail_actual_steps = max(2, round(0.08 * num_inference_steps))
-        eligible = list(range(warmup_steps, num_inference_steps - tail_actual_steps))
+        warmup_steps = min(num_inference_steps, max(5, round(0.18 * num_inference_steps)))
+        tail_actual_steps = min(num_inference_steps, max(2, round(0.08 * num_inference_steps)))
+        eligible = list(range(warmup_steps, max(warmup_steps, num_inference_steps - tail_actual_steps)))
         desired = min(len(eligible), round(forecast_fraction * num_inference_steps))
         anchors = len(eligible) - desired
         real_positions = {
@@ -1241,6 +1253,11 @@ class SpectrumCacheConfig:
             for j in range(anchors)
         }
         forecast_steps = tuple(step for step in eligible if step not in real_positions)
+        if num_inference_steps <= 11:
+            forecast_steps = ()
+        elif not 16 <= num_inference_steps <= 40:
+            # Limit unreviewed native-KV target-only prediction bursts.
+            forecast_steps = _spectrum_guard_unreviewed_retime(forecast_steps, num_inference_steps, 3)
         return cls(
             num_inference_steps=num_inference_steps,
             warmup_steps=warmup_steps,
@@ -3511,12 +3528,19 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_qwenimage21 import QwenImage21Transformer2DModel
 
     if isinstance(unwrapped, QwenImage21Transformer2DModel):
+        historical_qwen21 = 16 <= config.num_inference_steps <= 40
+        experimental_qwen21 = (
+            type(config.num_inference_steps) is int
+            and 1 <= config.num_inference_steps <= 80
+            and not historical_qwen21
+            and config == SpectrumCacheConfig.for_qwen_image21_variable(config.num_inference_steps)
+        )
         if (
-            not 16 <= config.num_inference_steps <= 40
+            not (historical_qwen21 or experimental_qwen21)
             or config.coordinate_policy != "runtime_horizon_normalized"
             or config.forecast_step_indices is None
         ):
-            raise ValueError("SPECTRUM Qwen-Image 2.1 requires an explicit 16–40-step native-KV profile.")
+            raise ValueError("SPECTRUM Qwen-Image 2.1 requires an explicit 16–40-step historical or exact N1–80 research native-KV profile.")
         signature = {"patch_size": 1, "in_channels": 64, "out_channels": 64, "num_layers": 32}
         if any(getattr(unwrapped.config, name, None) != value for name, value in signature.items()):
             raise ValueError("SPECTRUM Qwen-Image 2.1 requires the standard 32-block architecture.")
@@ -3537,8 +3561,15 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_qwenimage import QwenImageTransformer2DModel
 
     if isinstance(unwrapped, QwenImageTransformer2DModel):
-        if config.coordinate_policy != "runtime_horizon_normalized" or not 16 <= config.num_inference_steps <= 40:
-            raise ValueError("SPECTRUM Qwen-Image requires the bounded 16–40-step variable-step profile.")
+        historical_qwen = 16 <= config.num_inference_steps <= 40
+        experimental_qwen = (
+            type(config.num_inference_steps) is int
+            and 1 <= config.num_inference_steps <= 80
+            and not historical_qwen
+            and config == SpectrumCacheConfig.for_qwen_image_variable(config.num_inference_steps)
+        )
+        if config.coordinate_policy != "runtime_horizon_normalized" or not (historical_qwen or experimental_qwen):
+            raise ValueError("SPECTRUM Qwen-Image requires historical N16–40 or exact opt-in N1–80 research profile.")
         common_signature = {
             "patch_size": 2,
             "in_channels": 64,
@@ -3587,15 +3618,22 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
     from ..models.transformers.transformer_z_image import ZImageTransformer2DModel
 
     if isinstance(unwrapped, ZImageTransformer2DModel):
-        base_profile = (
+        historical_base = (
             config.coordinate_policy == "runtime_horizon_normalized"
             and 20 <= config.num_inference_steps <= 40
             and config.forecast_step_indices is not None
         )
+        experimental_base = (
+            type(config.num_inference_steps) is int
+            and 1 <= config.num_inference_steps <= 80
+            and not 20 <= config.num_inference_steps <= 40
+            and config == SpectrumCacheConfig.for_zimage_base_variable(config.num_inference_steps)
+        )
+        base_profile = historical_base or experimental_base
         turbo_profile = config == SpectrumCacheConfig.for_zimage_turbo()
         if not (base_profile or turbo_profile):
             raise ValueError(
-                "Z-Image SPECTRUM requires a 20–40-step Base profile or the exact 8-step Turbo P3_356 profile."
+                "Z-Image SPECTRUM requires historical N20–40 Base, exact N1–80 research Base, or exact 8-step Turbo P3_356 profile."
             )
         expected = {
             "all_patch_size": (2,),

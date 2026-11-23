@@ -12,6 +12,7 @@ from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockR
 from diffusers.hooks.hooks import HookRegistry, StateManager
 from diffusers.hooks.spectrum_cache import (
     SpectrumCacheConfig,
+    SpectrumSchedule,
     SpectrumQwenBlockHook,
     SpectrumQwenHeadBlockHook,
     SpectrumQwenImageDenoiserHook,
@@ -73,13 +74,13 @@ def _config():
     )
 
 
-def _install_toy(*, route="t2i"):
+def _install_toy(*, route="t2i", config=None):
     TransformerBlockRegistry.register(
         _ToyQwenBlock,
         TransformerBlockMetadata(return_hidden_states_index=1, return_encoder_hidden_states_index=0),
     )
     model = _ToyQwenTransformer().eval()
-    config = _config()
+    config = _config() if config is None else config
     manager = StateManager(SpectrumQwenImageState, init_args=(config,))
     HookRegistry.check_if_exists_or_initialize(model).register_hook(
         SpectrumQwenImageDenoiserHook(manager, route), _SPECTRUM_DENOISER_HOOK
@@ -122,9 +123,9 @@ def test_qwen_variable_step_profile_is_bounded(steps):
     assert cfg.history_limit == 8
 
 
-@pytest.mark.parametrize("steps", [0, 15, 41, 60])
+@pytest.mark.parametrize("steps", [True, False, -1, 0, 81, 20.5, "20"])
 def test_unqualified_variable_step_profile_fails_closed(steps):
-    with pytest.raises(ValueError, match="16 <= num_inference_steps <= 40"):
+    with pytest.raises(ValueError, match="integer N in"):
         SpectrumCacheConfig.for_qwen_image_variable(steps)
 
 
@@ -229,3 +230,21 @@ def test_nonmatching_qwen_architecture_is_rejected():
     with pytest.raises(ValueError, match="Qwen-Image-2512"):
         model.enable_cache(SpectrumCacheConfig.for_qwen_image_variable(20))
     assert not model.is_cache_enabled
+
+
+@pytest.mark.parametrize("n", (11, 12, 41, 80))
+@pytest.mark.parametrize("route", ("t2i", "edit"))
+@torch.no_grad()
+def test_qwen_new_n_both_lanes_keep_separate_native_history(n, route):
+    cfg = SpectrumCacheConfig.for_qwen_image_variable(n)
+    model, manager = _install_toy(route=route, config=cfg)
+    expected = sum(not SpectrumSchedule(cfg).decide(i) for i in range(n))
+    for step in range(n):
+        for lane in ("cond", "uncond"):
+            assert torch.isfinite(_run(model, step, lane=lane, route=route, expected_steps=n)).all()
+    for lane in ("cond", "uncond"):
+        summary = manager._state_cache[lane].summary()
+        assert summary["prediction_call_count"] == expected, summary
+        assert summary["full_call_count"] == n - expected
+        assert not summary["guard_latched"]
+    model.disable_cache()
