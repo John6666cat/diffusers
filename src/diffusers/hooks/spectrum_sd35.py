@@ -32,14 +32,14 @@ class SD35SpectrumGate:
     def __init__(self, config: SpectrumCacheConfig):
         if not isinstance(config, SpectrumCacheConfig):
             raise TypeError("SD3 SPECTRUM requires a SpectrumCacheConfig")
-        medium_single_step_full_real = (
-            config.allow_sd35_medium_continuous_n
+        sd35_single_step_full_real = (
+            (config.allow_sd35_medium_continuous_n or config.allow_sd35_large_relayout_n)
             and config.num_inference_steps == 1
             and config.tail_actual_steps == 1
             and config.forecast_step_indices == ()
         )
         if config.forecast_step_indices is None or (
-            config.tail_actual_steps < 2 and not medium_single_step_full_real
+            config.tail_actual_steps < 2 and not sd35_single_step_full_real
         ):
             raise ValueError("SD3 SPECTRUM requires explicit forecast steps and at least two real tail steps")
         if config.allow_sd35_large_relayout_n:

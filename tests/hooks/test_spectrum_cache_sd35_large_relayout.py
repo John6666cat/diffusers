@@ -47,9 +47,9 @@ def test_failed_prediction_uses_full_compute(n):
     assert _run_gate(config, steps=n, inject_failure=True) == {"real": n, "forecast": 0, "fallback": 1}
 
 
-@pytest.mark.parametrize("bad", [True, False, 0, 9, 10, 12, 16, 19, 21, 25, 36, 41, 47, 50, 60, 72, 100, 28.0, "28", None])
-def test_unqualified_n_rejected(bad):
-    with pytest.raises(ValueError, match="Owner-reviewed integer N"):
+@pytest.mark.parametrize("bad", [True, False, -1, 0, 81, 100, 28.0, "28", None])
+def test_invalid_n_rejected(bad):
+    with pytest.raises(ValueError, match="integer N in"):
         SpectrumCacheConfig.for_sd35_large_relayout(bad)
 
 

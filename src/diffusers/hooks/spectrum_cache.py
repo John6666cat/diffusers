@@ -190,12 +190,13 @@ class SpectrumCacheConfig:
         allow_sd35_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for SD3.5 Large/Medium N20–40 step profiles. The historical N28 P13 factory is unchanged.
         allow_sd35_large_relayout_n (`bool`, defaults to `False`):
-            Explicit research-only SD3.5 Large relayout at six Owner-reviewed N values.
-            Does not change the P13 factory or cache default.
+            Research-only SD3.5 Large integer-N1–80 opt-in. The six Owner-reviewed
+            N20/24/28/32/40/48 masks are unchanged; N1–19 remains full real compute.
+            Forecasts at other N are VISUAL_QUALITY_UNREVIEWED.
         allow_sd35_medium_continuous_n (`bool`, defaults to `False`):
-            Explicit Medium positive-integer-N experimental route. Reviewed masks
-            exist at N12/16 (SPARSE preference), N28 (BASELINE) and N48 (exploratory).
-            Unreviewed N runs full REAL_COMPUTE with no forecast; no generalization.
+            Research-only Medium positive-integer-N opt-in. N12/16 SPARSE, N28
+            BASELINE, N48 exploratory masks are unchanged. Unreviewed N12–80 may
+            forecast; N1–11 and N81+ run full REAL_COMPUTE. No quality inference.
         allow_krea2_raw_variable_n (`bool`, defaults to `False`):
             Research-only opt-in for Krea 2 Raw N1–80 paired-CFG profiles. N40–60
             retains its original masks, and the N52 explicit-mask route is unchanged.
@@ -1119,15 +1120,17 @@ class SpectrumCacheConfig:
 
     @classmethod
     def _for_sd35_large_relayout_n(cls, num_inference_steps: int) -> "SpectrumCacheConfig":
-        """Exact Large-only relayout observed at N20/24/28/32/40/48.
+        """Research-only Large relayout at integer N1–80.
 
-        No extrapolation to other N, Medium, different weights or conditions.
-        The forecast budget follows the sparse reference; only positions shift.
+        N20/24/28/32/40/48 are byte-identical to the Owner-reviewed profiles.
+        Unreviewed N20–80 projects the same sparse relayout rule; N1–19 is all
+        real compute to retain low-N HOLD. Other N / weights / conditions are not
+        image-quality qualified. The historical P13/variable-N route is separate.
         """
-        if type(num_inference_steps) is not int or num_inference_steps not in (20, 24, 28, 32, 40, 48):
-            raise ValueError("SD3.5 Large relayout requires an Owner-reviewed integer N")
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("SD3.5 Large relayout requires integer N in [1, 80]")
         n = num_inference_steps
-        if n <= 40:
+        if 20 <= n <= 40:
             base = cls._for_sd35_variable_n(n)
         else:
             warmup = min(n, max(4, math.ceil(5 * n / 28)))
@@ -1148,7 +1151,7 @@ class SpectrumCacheConfig:
 
         first = max(6, (5 * n + 27) // 28)
         last = n - base.tail_actual_steps
-        candidates = tuple(range(first, last, 2))
+        candidates = tuple(range(first, last, 2)) if n >= 20 else ()
         quota = min(len(candidates), n // 3)
 
         def spread(values: tuple[int, ...], count: int) -> tuple[int, ...]:
@@ -1170,17 +1173,17 @@ class SpectrumCacheConfig:
 
     @classmethod
     def for_sd35_large_relayout(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
-        """Explicit opt-in; qualified only for the reviewed Large/NF4 research matrix."""
+        """Opt-in Large integer-N1–80; only six original masks have Owner review."""
         return cls._for_sd35_large_relayout_n(num_inference_steps)
 
     @classmethod
     def _for_sd35_medium_continuous_n(cls, num_inference_steps: int) -> "SpectrumCacheConfig":
-        """Opt-in integer-N Medium route with fail-closed unreviewed horizons.
+        """Opt-in Medium positive-integer N with bounded experimental masks.
 
-        The schedules at N12/16 reproduce low-N SPARSE, N28 preserves the
-        historical baseline, N48 reproduces the observed exploratory mask.
-        Other N are accepted as integer input but never forecast. This is
-        a conservative source capability, not an all-N quality qualification.
+        N12/16 SPARSE, N28 baseline and N48 exploratory stay byte-identical.
+        Other N12–80 project the sparse every-other-step rule, with real warmup
+        and tail; N1–11 and N81+ compute every step. Experimental N images are
+        VISUAL_QUALITY_UNREVIEWED and the cache remains off by default.
         """
         if type(num_inference_steps) is not int or num_inference_steps < 1:
             raise ValueError("SD3.5 Medium continuous-N requires positive integer N")
@@ -1192,6 +1195,11 @@ class SpectrumCacheConfig:
             16: (6, 8, 10, 12),
             48: (9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43),
         }
+        tail = min(n, max(2, (2 * n + 27) // 28))
+        indices = reviewed_forecast.get(n)
+        if indices is None:
+            first = max(6, (5 * n + 27) // 28)
+            indices = tuple(range(first, n - tail, 2)) if 12 <= n <= 80 else ()
         return cls(
             num_inference_steps=n,
             warmup_steps=min(n, max(4, (5 * n + 27) // 28)),
@@ -1201,15 +1209,15 @@ class SpectrumCacheConfig:
             history_limit=8,
             predictor_backend="chunked",
             coordinate_policy="runtime_index_normalized",
-            tail_actual_steps=min(n, max(2, (2 * n + 27) // 28)),
-            forecast_step_indices=reviewed_forecast.get(n, ()),
+            tail_actual_steps=tail,
+            forecast_step_indices=indices,
             allow_sd35_variable_n=True,
             allow_sd35_medium_continuous_n=True,
         )
 
     @classmethod
     def for_sd35_medium_continuous_n(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
-        """Explicit Medium integer-N opt-in. Unsupported N computes all steps."""
+        """Medium integer-N opt-in; N81+ is accepted but all real compute."""
         return cls._for_sd35_medium_continuous_n(num_inference_steps)
 
     @classmethod

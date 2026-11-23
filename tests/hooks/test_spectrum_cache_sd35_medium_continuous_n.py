@@ -20,8 +20,8 @@ QUALIFIED_SCHEDULES = {
 }
 
 
-@pytest.mark.parametrize("n", [1, 2, 3, 8, 9, 10, 11, 12, 13, 16, 19, 20, 24, 28, 32, 40, 48, 50, 60, 100])
-def test_medium_continuous_n_accepts_positive_integers_with_conservative_fallback(n):
+@pytest.mark.parametrize("n", [1, 2, 3, 8, 9, 10, 11, 12, 13, 16, 19, 20, 24, 28, 32, 40, 48, 50, 60, 80, 81, 100])
+def test_medium_continuous_n_accepts_positive_integers_with_bounded_forecast(n):
     config = MEDIUM(n)
     assert config.num_inference_steps == n
     assert config.allow_sd35_medium_continuous_n
@@ -30,13 +30,18 @@ def test_medium_continuous_n_accepts_positive_integers_with_conservative_fallbac
     assert config.coordinate_policy == "runtime_index_normalized"
     assert config.predictor_backend == "chunked"
     assert 1 <= config.tail_actual_steps <= n
-    assert config.forecast_step_indices == QUALIFIED_SCHEDULES.get(n, ())
+    if n in QUALIFIED_SCHEDULES:
+        expected = QUALIFIED_SCHEDULES[n]
+    else:
+        first = max(6, (5*n + 27)//28)
+        expected = tuple(range(first, n-config.tail_actual_steps, 2)) if 12 <= n <= 80 else ()
+    assert config.forecast_step_indices == expected
     assert all(config.warmup_steps <= x < n - config.tail_actual_steps
                for x in config.forecast_step_indices)
     assert SD35SpectrumGate(config).forecast_steps == frozenset(config.forecast_step_indices)
 
 
-@pytest.mark.parametrize("n", [1, 8, 12, 16, 20, 28, 32, 48, 60])
+@pytest.mark.parametrize("n", [1, 8, 12, 16, 20, 28, 32, 48, 49, 60, 80, 100])
 def test_medium_continuous_n_cpu_real_forecast_and_drift(n):
     config = MEDIUM(n)
     p = len(config.forecast_step_indices)
