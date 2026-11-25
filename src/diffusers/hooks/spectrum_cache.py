@@ -849,6 +849,78 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_anima_base_turbo_variable(
+        cls, num_inference_steps: int = 30, *, checkpoint: str
+    ) -> "SpectrumCacheConfig":
+        """Experimental Anima text-to-image Base/Turbo integer-N1–80 profile.
+
+        Select the checkpoint explicitly; Base and Turbo have different low-step
+        schedules. Base N1–8 and Turbo N1–5 perform full computation. The ordinary
+        Anima factory is unchanged. Calling this factory does not enable caching.
+        Image quality is not established for every step count or input.
+        """
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Anima Base/Turbo variable profile requires integer N in [1, 80]")
+        if checkpoint not in ("base", "turbo"):
+            raise ValueError("Anima checkpoint must be 'base' or 'turbo'")
+        n = num_inference_steps
+        config = replace(cls.for_anima_variable(max(20, n)), history_limit=6)
+        if n >= 30 and checkpoint == "base":
+            return config
+        if n >= 20:
+            warmup = max(5, math.ceil(5 * n / 19))
+            tail = max(2, math.ceil(2 * n / 19))
+            cap = 1 if checkpoint == "base" else 2
+            steps = tuple(i for i in range(warmup, n - tail) if (i - warmup) % (cap + 1) < cap)
+            return replace(config, warmup_steps=warmup, tail_actual_steps=tail, forecast_step_indices=steps)
+
+        # The low-step masks are calibrated separately rather than retimed.
+        masks = {
+            "base": {
+                9: (6,),
+                10: (6,),
+                11: (7,),
+                12: (5, 7, 9),
+                13: (5, 7, 8, 10),
+                14: (5, 7, 9, 11),
+                15: (5, 8, 10, 12),
+                16: (5, 7, 9, 11, 13),
+                17: (5, 7, 9, 11, 14),
+                18: (5, 7, 9, 11, 13, 15),
+                19: (5, 8, 10, 12, 14, 16),
+            },
+            "turbo": {
+                6: (3,),
+                7: (3, 4),
+                8: (3, 5),
+                9: (4, 6),
+                10: (5, 7),
+                11: (5, 7),
+                12: (5, 7, 9),
+                13: (5, 8, 10),
+                14: (5, 7, 9, 11),
+                15: (5, 6, 8, 9, 11, 12),
+                16: (5, 7, 9, 11, 13),
+                17: (5, 6, 7, 9, 10, 11, 13, 14),
+                18: (5, 6, 7, 9, 10, 11, 13, 14, 15),
+                19: (5, 7, 8, 10, 11, 12, 14, 15, 16),
+            },
+        }
+        steps = masks[checkpoint].get(n, ())
+        if not steps:
+            return replace(config, num_inference_steps=n, warmup_steps=n, tail_actual_steps=0, forecast_step_indices=())
+        short_history = checkpoint == "turbo" and n <= 9
+        return replace(
+            config,
+            num_inference_steps=n,
+            warmup_steps=3 if short_history else 5,
+            tail_actual_steps=2,
+            degree=2 if short_history else 4,
+            history_limit=3 if short_history else 6,
+            forecast_step_indices=steps,
+        )
+
+    @classmethod
     def for_wan21_13b_variable(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
         """Research reentry profile for text-only Wan2.1 T2V 1.3B.
 
