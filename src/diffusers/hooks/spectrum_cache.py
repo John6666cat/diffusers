@@ -683,6 +683,43 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_flux2_klein_distilled4b_variable(cls, num_inference_steps: int = 4) -> "SpectrumCacheConfig":
+        """Build an opt-in experimental FLUX.2 Klein Distilled 4B T2I profile.
+
+        N1–4 and N12 retain full computation. N9–15 (except N12) omit the
+        first and last eligible forecast steps. Other N use alternating
+        forecasts with growing real-compute margins. The factory does not
+        enable caching or qualify other weights, image-conditioned routes,
+        or image quality at untested step counts.
+        """
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("Klein Distilled 4B variable-N research requires integer N in [1, 80]")
+
+        n = num_inference_steps
+        steps = ()
+        if n > 4 and n != 12:
+            start = max(2, (n + 7) // 8)
+            tail = max(1, (n + 15) // 16)
+            steps = tuple(range(start, n - tail, 2))
+            if 9 <= n <= 15:
+                steps = steps[1:-1]
+
+        return cls(
+            num_inference_steps=n,
+            warmup_steps=0,
+            window_size=2.0,
+            flex_window=0.0,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=4,
+            coordinate_policy="runtime_index_normalized",
+            coordinate_max=float(n),
+            tail_actual_steps=0,
+            forecast_step_indices=steps,
+        )
+
+    @classmethod
     def for_flux2_klein_base4b_variable(
         cls, num_inference_steps: int = 50, *, predictor_backend: str = "dense"
     ) -> "SpectrumCacheConfig":
