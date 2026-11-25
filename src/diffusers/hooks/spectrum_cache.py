@@ -1197,6 +1197,44 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_zimage_turbo_variable(cls, num_inference_steps: int = 8) -> "SpectrumCacheConfig":
+        """Opt-in N1–80 Turbo research profile; preserve the N8 P3_356 anchor.
+
+        Only the tested NF4 T2I scenes have narrow Owner visual acceptance.
+        Unmeasured N values are VISUAL_QUALITY_UNREVIEWED, not production defaults.
+        """
+        n = num_inference_steps
+        if type(n) is not int or not 1 <= n <= 80:
+            raise ValueError("for_zimage_turbo_variable requires integer N in [1, 80]")
+        anchor = cls.for_zimage_turbo()
+        if n == 8:
+            return anchor
+        warm = min(n, max(3, (3 * n + 4) // 8))
+        tail = max(1, (n + 4) // 8)
+        # Repeat the anchor's forecast/real/forecast pattern inside protected margins.
+        mask = () if n <= 5 else tuple(i for i in range(warm, n - tail) if (i - warm) % 3 != 1)
+        return replace(
+            anchor, num_inference_steps=n, warmup_steps=warm, tail_actual_steps=tail, forecast_step_indices=mask
+        )
+
+    @classmethod
+    def for_zimage_base_late50(cls, num_inference_steps: int = 28) -> "SpectrumCacheConfig":
+        """Opt-in N1–80 Base LATE50 research profile; keep legacy factories unchanged.
+
+        Retain the last half of the V01 nonconsecutive forecast mask (N28 uses
+        P8_SPREAD), rounded down with at least one forecast when nonempty.
+        N1–11 is full compute. Only the V04 bicycle scenes were visually reviewed
+        for LATE50; other inputs/N are VISUAL_QUALITY_UNREVIEWED. LATE75 remains
+        a research challenge, not an adopted profile. Cache is not enabled here.
+        """
+        cfg = cls.for_zimage_base_variable(
+            num_inference_steps, profile="p8_spread" if num_inference_steps == 28 else "p12"
+        )
+        mask = cfg.forecast_step_indices
+        k = max(1, len(mask) // 2) if mask else 0
+        return replace(cfg, forecast_step_indices=mask[-k:] if k else ())
+
+    @classmethod
     def for_zimage_base_variable(
         cls, num_inference_steps: int = 28, *, profile: str = "p12"
     ) -> "SpectrumCacheConfig":
@@ -3837,13 +3875,21 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
             type(config.num_inference_steps) is int
             and 1 <= config.num_inference_steps <= 80
             and not 20 <= config.num_inference_steps <= 40
-            and config == SpectrumCacheConfig.for_zimage_base_variable(config.num_inference_steps)
+            and config in (
+                SpectrumCacheConfig.for_zimage_base_variable(config.num_inference_steps),
+                SpectrumCacheConfig.for_zimage_base_late50(config.num_inference_steps),
+            )
         )
         base_profile = historical_base or experimental_base
-        turbo_profile = config == SpectrumCacheConfig.for_zimage_turbo()
+        turbo_profile = config == SpectrumCacheConfig.for_zimage_turbo() or (
+            type(config.num_inference_steps) is int
+            and 1 <= config.num_inference_steps <= 80
+            and config == SpectrumCacheConfig.for_zimage_turbo_variable(config.num_inference_steps)
+        )
         if not (base_profile or turbo_profile):
             raise ValueError(
-                "Z-Image SPECTRUM requires historical N20–40 Base, exact N1–80 research Base, or exact 8-step Turbo P3_356 profile."
+                "Z-Image SPECTRUM requires historical N20–40 Base, exact N1–80 research Base (including LATE50), "
+                "or exact N1–80 research Turbo (including 8-step P3_356) profile."
             )
         expected = {
             "all_patch_size": (2,),
