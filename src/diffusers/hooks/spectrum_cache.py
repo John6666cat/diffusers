@@ -738,6 +738,70 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_flux3_variable(
+        cls, num_inference_steps: int, *, checkpoint: str, workflow: str
+    ) -> "SpectrumCacheConfig":
+        """Build an opt-in FLUX.3 Base/Distilled T2I/I2I research profile.
+
+        The 50-step Base and 16-step Distilled anchors are preserved exactly.
+        Integer N1–11 uses full computation; N12–80 uses a bounded forecast mask
+        projected from the corresponding anchor. Cache is not enabled by this
+        factory. Image quality has not been established for every N and input.
+        """
+        if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 80:
+            raise ValueError("FLUX.3 variable profile requires integer N in [1, 80]")
+        if checkpoint not in ("base", "distilled"):
+            raise ValueError("FLUX.3 checkpoint must be 'base' or 'distilled'")
+        if workflow not in ("t2i", "i2i"):
+            raise ValueError("FLUX.3 workflow must be 't2i' or 'i2i'")
+
+        if checkpoint == "base":
+            anchor_n, warmup, degree = 50, 5, 3
+            if workflow == "t2i":
+                anchor = (
+                    6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 23, 24, 26,
+                    27, 29, 30, 32, 33, 35, 36, 38, 39, 41, 42, 44,
+                )
+                max_run = 2
+            else:
+                anchor = (8, 12, 18, 24, 30, 36, 42, 44)
+                max_run = 1
+        else:
+            anchor_n, warmup, degree = 16, 4, 2
+            anchor = (6, 10)
+            max_run = 1
+
+        n = num_inference_steps
+        steps = ()
+        if n == anchor_n:
+            steps = anchor
+        elif n > 11:
+            # Retain the normalized forecast band, absolute warmup and two final real steps.
+            start = max(warmup, ((2 * anchor[0] + 1) * n) // (2 * anchor_n))
+            end = min(n - 3, ((2 * anchor[-1] + 1) * n) // (2 * anchor_n))
+            span = end - start + 1
+            count = min(span, (2 * n * len(anchor) + anchor_n) // (2 * anchor_n))
+            while count > 0:
+                mask = tuple(start + ((2 * j + 1) * span) // (2 * count) for j in range(count))
+                # Sorted distinct indices separated by max_run imply an overlong run.
+                if all(mask[i + max_run] - mask[i] != max_run for i in range(len(mask) - max_run)):
+                    steps = mask
+                    break
+                count -= 1
+
+        return cls(
+            num_inference_steps=n,
+            warmup_steps=min(warmup, n),
+            forecast_step_indices=steps,
+            degree=degree,
+            blend_w=0.35,
+            coordinate_policy="runtime_horizon_normalized",
+            allow_flux3_image_conditioned=checkpoint == "base" and workflow == "i2i",
+            allow_flux3_distilled=checkpoint == "distilled",
+            allow_flux3_distilled_image_conditioned=checkpoint == "distilled" and workflow == "i2i",
+        )
+
+    @classmethod
     def for_netayume_variable(
         cls, num_inference_steps: int = 50, *, profile: str = "p30", predictor_backend: str = "dense"
     ) -> "SpectrumCacheConfig":
