@@ -245,3 +245,49 @@ def test_n14_selected_mask_and_exact_gate():
                 p, p.scheduler.timesteps, 14, requested_steps=14, plain_request=True
             )
             assert p.unet.disabled == p.unet.reset == 1
+
+
+@pytest.mark.parametrize(
+    "n, expected, previous",
+    [
+        (
+            64,
+            (
+                24, 25, 27, 28, 29, 31, 32, 33, 35, 36, 37, 39, 40, 41, 43, 44,
+                46, 47, 50, 53, 54, 56, 57, 58,
+            ),
+            (
+                10, 13, 16, 17, 18, 21, 24, 25, 27, 28, 29, 31, 32, 33, 35, 36,
+                37, 39, 40, 41, 43, 44, 46, 47, 50, 53, 54, 56, 57, 58,
+            ),
+        ),
+        (
+            80,
+            (
+                26, 27, 30, 31, 34, 35, 36, 38, 39, 40, 41, 44, 45, 46, 48, 49,
+                50, 51, 54, 55, 57, 58, 59, 62, 63, 66, 67, 68, 70, 71, 72, 73,
+            ),
+            (
+                12, 13, 16, 17, 20, 21, 22, 23, 26, 27, 30, 31, 34, 35, 36, 38,
+                39, 40, 41, 44, 45, 46, 48, 49, 50, 51, 54, 55, 57, 58, 59, 62,
+                63, 66, 67, 68, 70, 71, 72, 73,
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_high_n_early_protect_exact_gate(n, expected, previous):
+    cfg = SpectrumCacheConfig.for_sd15_continuous_n(n)
+    assert cfg.forecast_step_indices == expected
+    assert cfg.max_consecutive_forecast_steps is None
+    assert tuple(i for i, actual in enumerate(decisions(cfg)) if not actual) == expected
+    pipe = make_pipe(n, cfg)
+    assert _spectrum_sd15_euler_reasons(
+        pipe, pipe.scheduler.timesteps, n, requested_steps=n, plain_request=True
+    ) == ()
+    for mask in (previous, expected[1:]):
+        pipe = make_pipe(n, replace(cfg, forecast_step_indices=mask))
+        assert _spectrum_sd15_euler_maybe_bypass(
+            pipe, pipe.scheduler.timesteps, n, requested_steps=n, plain_request=True
+        )
+        assert pipe.unet.disabled == pipe.unet.reset == 1

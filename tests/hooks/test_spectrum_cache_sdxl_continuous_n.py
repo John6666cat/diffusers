@@ -227,3 +227,58 @@ def test_switching_n_requires_exact_new_factory_and_revisiting_is_deterministic(
                 original = mask
             else:
                 assert original == mask
+
+
+@pytest.mark.parametrize(
+    "n, expected, previous",
+    [
+        (
+            64,
+            (
+                15, 17, 19, 20, 22, 24, 25, 27, 28, 30, 31, 33, 34, 36, 37, 38,
+                40, 41, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 56, 57, 59, 60,
+            ),
+            (
+                6, 8, 10, 11, 13, 14, 15, 17, 19, 20, 22, 24, 25, 27, 28, 30,
+                31, 33, 34, 36, 37, 38, 40, 41, 42, 44, 45, 46, 48, 49, 50, 52,
+                53, 54, 56, 57, 59, 60,
+            ),
+        ),
+        (
+            80,
+            (
+                17, 19, 20, 22, 24, 25, 27, 28, 30, 31, 33, 34, 36, 37, 38, 40,
+                41, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 56, 57, 58, 60, 62,
+                63, 65, 67, 68, 70, 72, 73, 75, 76,
+            ),
+            (
+                6, 8, 10, 11, 13, 14, 15, 17, 19, 20, 22, 24, 25, 27, 28, 30,
+                31, 33, 34, 36, 37, 38, 40, 41, 42, 44, 45, 46, 48, 49, 50, 52,
+                53, 54, 56, 57, 58, 60, 62, 63, 65, 67, 68, 70, 72, 73, 75, 76,
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_high_n_early_protect_exact_gate(n, expected, previous):
+    cfg = SpectrumCacheConfig.for_sdxl_continuous_n(n)
+    assert cfg.forecast_step_indices == expected
+    assert cfg.max_consecutive_forecast_steps is None
+    assert tuple(i for i, actual in enumerate(decisions(cfg)) if not actual) == expected
+    pipe = fake_pipe(n, cfg)
+    assert _spectrum_sdxl_euler_reasons(
+        pipe, pipe.scheduler.timesteps, n, requested_steps=n, plain_request=True
+    ) == ()
+    for mask in (previous, expected[1:]):
+        pipe = fake_pipe(n, replace(cfg, forecast_step_indices=mask))
+        assert _spectrum_sdxl_euler_maybe_bypass(
+            pipe, pipe.scheduler.timesteps, n, requested_steps=n, plain_request=True
+        )
+        assert pipe.unet.disabled == pipe.unet.reset == 1
+    old = replace(SpectrumCacheConfig.for_sdxl_variable(n, strict_post_grid=True),
+                  sdxl_euler_continuous_n_candidate=True)
+    pipe = fake_pipe(n, old)
+    assert _spectrum_sdxl_euler_maybe_bypass(
+        pipe, pipe.scheduler.timesteps, n, requested_steps=n, plain_request=True
+    )
+    assert pipe.unet.disabled == pipe.unet.reset == 1
