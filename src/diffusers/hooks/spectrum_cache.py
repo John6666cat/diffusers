@@ -437,7 +437,8 @@ class SpectrumCacheConfig:
         remain bit-for-bit identical at N20/24/28/32/36/40. For other N, the
         nearest historical mask is midpoint-retimed onto runtime steps; ties
         prefer the lower anchor. Ineligible warmup/tail positions are full
-        compute, and no forecast run exceeds four steps. A non-anchor run uses
+        compute, and no forecast run exceeds four steps. At N14, keep step 8
+        (zero-based) as an additional actual anchor. A non-anchor run uses
         runtime-normalized predictor coordinates so high N does not extrapolate
         indefinitely past the old 50-step coordinate horizon.
 
@@ -465,6 +466,9 @@ class SpectrumCacheConfig:
             )
             if 6 <= step < num_inference_steps - tail
         )
+        # N14 retains an actual anchor between the selected forecast groups.
+        if num_inference_steps == 14:
+            eligible.discard(8)
         # A long retimed run loses prediction anchors; promote actual calls
         # locally without introducing any new forecast steps.
         actual = [step not in eligible for step in range(num_inference_steps)]

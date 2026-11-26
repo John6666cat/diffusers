@@ -228,3 +228,20 @@ def test_repeatable_schedules(n):
     b = SpectrumCacheConfig.for_sd15_continuous_n(n)
     assert a == b
     assert decisions(a) == decisions(b)
+
+
+def test_n14_selected_mask_and_exact_gate():
+    cfg = SpectrumCacheConfig.for_sd15_continuous_n(14)
+    assert cfg.forecast_step_indices == (7, 9, 10)
+    assert tuple(i for i, actual in enumerate(decisions(cfg)) if not actual) == (7, 9, 10)
+    with torch.no_grad():
+        p = make_pipe(14, cfg)
+        assert _spectrum_sd15_euler_reasons(
+            p, p.scheduler.timesteps, 14, requested_steps=14, plain_request=True
+        ) == ()
+        for mask in ((7, 8, 9, 10), (7, 10)):
+            p = make_pipe(14, replace(cfg, forecast_step_indices=mask))
+            assert _spectrum_sd15_euler_maybe_bypass(
+                p, p.scheduler.timesteps, 14, requested_steps=14, plain_request=True
+            )
+            assert p.unet.disabled == p.unet.reset == 1
