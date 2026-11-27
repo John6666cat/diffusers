@@ -335,10 +335,10 @@ class SpectrumCacheConfig:
         N20 keeps its historical all-real identity control. At N<=9 the six-step
         warmup and three-step tail leave no forecastable steps, so those runs
         are deliberately full-compute rather than forced sparse predictions.
-        All other N retain the original normalized predictor, maximum-three
-        forecast guard, and fixed warmup/tail; N24/N32 preserve their masks.
-        At N30/N50/N64/N80 only, retain the tested late subset of the guarded mask
-        to protect the early denoising steps with real compute.
+        The baseline retains the normalized predictor, maximum-three forecast
+        guard, and fixed warmup/tail. For N1-80, restore the earliest forecasts to
+        real compute, with a count of 9% of N (rounded half up, leaving at least one forecast).
+        The separate strict N24/N32 factory remains unchanged.
 
         The paired SDXL pipeline gate checks the actual post-grid scheduler,
         runtime N, configuration, dtype, and supported request shape before
@@ -354,15 +354,20 @@ class SpectrumCacheConfig:
             config = replace(config, num_inference_steps=num_inference_steps, tail_actual_steps=num_inference_steps)
         if num_inference_steps <= 9 or num_inference_steps == 20:
             config = replace(config, max_consecutive_forecast_steps=None, forecast_step_indices=())
-        if num_inference_steps in (30, 50, 64, 80):
-            first_forecast = {30: 11, 50: 14, 64: 15, 80: 17}[num_inference_steps]
-            schedule = SpectrumSchedule(config)
-            forecast = tuple(
-                step for step in range(num_inference_steps)
-                if not schedule.decide(step) and step >= first_forecast
-            )
-            config = replace(config, max_consecutive_forecast_steps=None, forecast_step_indices=forecast)
+        config = config._with_early_forecast_protection(9)
         return replace(config, sdxl_euler_continuous_n_candidate=True)
+
+    def _with_early_forecast_protection(self, rate_percent: int) -> "SpectrumCacheConfig":
+        """Protect the earliest forecasts of an unprotected continuous-N baseline."""
+        n = self.num_inference_steps
+        if n > 80:
+            return self
+        schedule = SpectrumSchedule(self)
+        forecast = tuple(step for step in range(n) if not schedule.decide(step))
+        if len(forecast) <= 1:
+            return self
+        protected_count = min(len(forecast) - 1, (rate_percent * n + 50) // 100)
+        return replace(self, max_consecutive_forecast_steps=None, forecast_step_indices=forecast[protected_count:])
 
     @classmethod
     def for_sd15(cls, num_inference_steps: int = 20) -> "SpectrumCacheConfig":
@@ -443,15 +448,13 @@ class SpectrumCacheConfig:
     def for_sd15_continuous_n(cls, num_inference_steps: int = 24) -> "SpectrumCacheConfig":
         """Explicit research candidate for ordinary SD1.5 Euler at positive integer N.
 
-        The six previously qualified discrete masks and predictor coefficients
-        remain bit-for-bit identical at N20/24/28/32/36/40. For other N, the
-        nearest historical mask is midpoint-retimed onto runtime steps; ties
-        prefer the lower anchor. Ineligible warmup/tail positions are full
-        compute, and no forecast run exceeds four steps. At N14, keep step 8
-        (zero-based) as an additional actual anchor. At N30/N50/N64/N80 only,
-        retain the tested late subset of the capped mask. A non-anchor run uses
-        runtime-normalized predictor coordinates so high N does not extrapolate
-        indefinitely past the old 50-step coordinate horizon.
+        The discrete factory remains unchanged. The continuous baseline uses
+        its six historical anchor masks and coefficients, or midpoint-retimes
+        the nearest anchor (ties prefer the lower anchor). Warmup/tail stay real,
+        with at most four consecutive forecasts. For N1-80, restore the earliest forecasts
+        to real compute, with a count of 10% of N (rounded half up, leaving at least one forecast).
+        N14 retains its selected actual anchor at step 8 (zero-based) instead.
+        Non-anchor runs retain runtime-normalized predictor coordinates.
 
         This is mechanical availability, NOT semantic quality qualification for
         novel N or for other schedulers, models, or conditioning routes. The
@@ -461,12 +464,16 @@ class SpectrumCacheConfig:
         if type(num_inference_steps) is not int or num_inference_steps < 1:
             raise ValueError("SD1.5 continuous N requires a positive integer.")
 
+        config = cls._for_sd15_continuous_baseline(num_inference_steps)
+        if num_inference_steps != 14:
+            config = config._with_early_forecast_protection(10)
+        return replace(config, sd15_euler_continuous_n_candidate=True)
+
+    @classmethod
+    def _for_sd15_continuous_baseline(cls, num_inference_steps: int) -> "SpectrumCacheConfig":
         anchor_counts = (20, 24, 28, 32, 36, 40)
         if num_inference_steps in anchor_counts:
-            return replace(
-                cls.for_sd15_variable(num_inference_steps),
-                sd15_euler_continuous_n_candidate=True,
-            )
+            return cls.for_sd15_variable(num_inference_steps)
 
         anchor_n = min(anchor_counts, key=lambda anchor: (abs(anchor - num_inference_steps), anchor))
         reference = cls.for_sd15_variable(anchor_n)
@@ -498,17 +505,12 @@ class SpectrumCacheConfig:
             for first, last in runs:
                 actual[(first + last) // 2] = True
 
-        # Protect early steps after compiling the historical capped mask.
-        first_forecast = {30: 12, 50: 14, 64: 24, 80: 26}.get(num_inference_steps, 0)
         return replace(
             reference,
             num_inference_steps=num_inference_steps,
             coordinate_policy="runtime_index_normalized",
             tail_actual_steps=tail,
-            forecast_step_indices=tuple(
-                step for step, compute in enumerate(actual) if not compute and step >= first_forecast
-            ),
-            sd15_euler_continuous_n_candidate=True,
+            forecast_step_indices=tuple(step for step, compute in enumerate(actual) if not compute),
         )
 
     @classmethod

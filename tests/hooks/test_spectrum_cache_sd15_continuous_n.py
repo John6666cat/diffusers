@@ -99,12 +99,18 @@ def test_any_integer_n_has_safe_schedule(n):
 
 
 @pytest.mark.parametrize("n", [20, 24, 28, 32, 36, 40])
-def test_historical_discrete_configs_bit_identical_except_opt_in(n):
+def test_continuous_anchors_only_change_schedule(n):
     historical = SpectrumCacheConfig.for_sd15_variable(n)
     candidate = SpectrumCacheConfig.for_sd15_continuous_n(n)
-    assert replace(candidate, sd15_euler_continuous_n_candidate=False) == historical
-    assert decisions(candidate) == decisions(historical)
+    forecast = tuple(i for i, actual in enumerate(decisions(historical)) if not actual)
+    expected = forecast[(10 * n + 50) // 100 :]
+    assert candidate == replace(
+        historical, sd15_euler_continuous_n_candidate=True,
+        max_consecutive_forecast_steps=None, forecast_step_indices=expected,
+    )
+    assert tuple(i for i, actual in enumerate(decisions(candidate)) if not actual) == expected
     assert historical.sd15_euler_continuous_n_candidate is False
+    assert SpectrumCacheConfig.for_sd15_variable(n) == historical
 
 
 @pytest.mark.parametrize("invalid", [0, -1, True, False, 20.0, None, "20"])
@@ -250,6 +256,48 @@ def test_n14_selected_mask_and_exact_gate():
 @pytest.mark.parametrize(
     "n, expected, previous",
     [
+        (
+            12,
+            (
+                7,
+            ),
+            (
+                6, 7,
+            ),
+        ),
+        (
+            15,
+            (
+                9, 11,
+            ),
+            (
+                6, 7, 9, 11,
+            ),
+        ),
+        (
+            42,
+            (
+                12, 14, 16, 18, 19, 20, 21, 23, 24, 25, 26, 28,
+                29, 30, 33, 35, 36, 37, 38,
+            ),
+            (
+                6, 8, 10, 11, 12, 14, 16, 18, 19, 20, 21, 23,
+                24, 25, 26, 28, 29, 30, 33, 35, 36, 37, 38,
+            ),
+        ),
+        (
+            62,
+            (
+                17, 18, 20, 21, 23, 24, 26, 27, 28, 30, 31, 32,
+                34, 35, 37, 38, 39, 42, 43, 44, 45, 48, 49, 51,
+                52, 54, 55, 56,
+            ),
+            (
+                9, 10, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24,
+                26, 27, 28, 30, 31, 32, 34, 35, 37, 38, 39, 42,
+                43, 44, 45, 48, 49, 51, 52, 54, 55, 56,
+            ),
+        ),
         (
             30,
             (
