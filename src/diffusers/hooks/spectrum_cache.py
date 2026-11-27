@@ -337,7 +337,7 @@ class SpectrumCacheConfig:
         are deliberately full-compute rather than forced sparse predictions.
         All other N retain the original normalized predictor, maximum-three
         forecast guard, and fixed warmup/tail; N24/N32 preserve their masks.
-        At N64/N80 only, retain the tested late subset of the guarded mask
+        At N30/N50/N64/N80 only, retain the tested late subset of the guarded mask
         to protect the early denoising steps with real compute.
 
         The paired SDXL pipeline gate checks the actual post-grid scheduler,
@@ -354,8 +354,8 @@ class SpectrumCacheConfig:
             config = replace(config, num_inference_steps=num_inference_steps, tail_actual_steps=num_inference_steps)
         if num_inference_steps <= 9 or num_inference_steps == 20:
             config = replace(config, max_consecutive_forecast_steps=None, forecast_step_indices=())
-        if num_inference_steps in (64, 80):
-            first_forecast = {64: 15, 80: 17}[num_inference_steps]
+        if num_inference_steps in (30, 50, 64, 80):
+            first_forecast = {30: 11, 50: 14, 64: 15, 80: 17}[num_inference_steps]
             schedule = SpectrumSchedule(config)
             forecast = tuple(
                 step for step in range(num_inference_steps)
@@ -448,8 +448,8 @@ class SpectrumCacheConfig:
         nearest historical mask is midpoint-retimed onto runtime steps; ties
         prefer the lower anchor. Ineligible warmup/tail positions are full
         compute, and no forecast run exceeds four steps. At N14, keep step 8
-        (zero-based) as an additional actual anchor. At N64/N80 only, retain
-        the tested late subset of the capped mask. A non-anchor run uses
+        (zero-based) as an additional actual anchor. At N30/N50/N64/N80 only,
+        retain the tested late subset of the capped mask. A non-anchor run uses
         runtime-normalized predictor coordinates so high N does not extrapolate
         indefinitely past the old 50-step coordinate horizon.
 
@@ -499,7 +499,7 @@ class SpectrumCacheConfig:
                 actual[(first + last) // 2] = True
 
         # Protect early steps after compiling the historical capped mask.
-        first_forecast = {64: 24, 80: 26}.get(num_inference_steps, 0)
+        first_forecast = {30: 12, 50: 14, 64: 24, 80: 26}.get(num_inference_steps, 0)
         return replace(
             reference,
             num_inference_steps=num_inference_steps,

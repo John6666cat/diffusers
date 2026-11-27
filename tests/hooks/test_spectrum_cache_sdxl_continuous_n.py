@@ -233,6 +233,26 @@ def test_switching_n_requires_exact_new_factory_and_revisiting_is_deterministic(
     "n, expected, previous",
     [
         (
+            30,
+            (
+                11, 13, 14, 15, 17, 19, 20, 22, 24, 25,
+            ),
+            (
+                6, 8, 10, 11, 13, 14, 15, 17, 19, 20, 22, 24, 25,
+            ),
+        ),
+        (
+            50,
+            (
+                14, 15, 17, 19, 20, 22, 24, 25, 27, 28, 30, 31, 33, 34, 36, 37,
+                38, 40, 41, 42, 44, 45, 46,
+            ),
+            (
+                6, 8, 10, 11, 13, 14, 15, 17, 19, 20, 22, 24, 25, 27, 28, 30,
+                31, 33, 34, 36, 37, 38, 40, 41, 42, 44, 45, 46,
+            ),
+        ),
+        (
             64,
             (
                 15, 17, 19, 20, 22, 24, 25, 27, 28, 30, 31, 33, 34, 36, 37, 38,
@@ -260,7 +280,7 @@ def test_switching_n_requires_exact_new_factory_and_revisiting_is_deterministic(
     ],
 )
 @torch.no_grad()
-def test_high_n_early_protect_exact_gate(n, expected, previous):
+def test_early_protect_exact_gate(n, expected, previous):
     cfg = SpectrumCacheConfig.for_sdxl_continuous_n(n)
     assert cfg.forecast_step_indices == expected
     assert cfg.max_consecutive_forecast_steps is None

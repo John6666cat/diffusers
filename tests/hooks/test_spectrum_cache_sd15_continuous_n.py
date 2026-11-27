@@ -251,6 +251,26 @@ def test_n14_selected_mask_and_exact_gate():
     "n, expected, previous",
     [
         (
+            30,
+            (
+                12, 14, 16, 18, 20, 21, 24, 25, 26,
+            ),
+            (
+                6, 9, 11, 12, 14, 16, 18, 20, 21, 24, 25, 26,
+            ),
+        ),
+        (
+            50,
+            (
+                14, 16, 19, 21, 22, 24, 25, 27, 28, 30, 31, 34, 35, 36, 39, 41,
+                42, 44, 45,
+            ),
+            (
+                7, 8, 10, 12, 13, 14, 16, 19, 21, 22, 24, 25, 27, 28, 30, 31,
+                34, 35, 36, 39, 41, 42, 44, 45,
+            ),
+        ),
+        (
             64,
             (
                 24, 25, 27, 28, 29, 31, 32, 33, 35, 36, 37, 39, 40, 41, 43, 44,
@@ -276,7 +296,7 @@ def test_n14_selected_mask_and_exact_gate():
     ],
 )
 @torch.no_grad()
-def test_high_n_early_protect_exact_gate(n, expected, previous):
+def test_early_protect_exact_gate(n, expected, previous):
     cfg = SpectrumCacheConfig.for_sd15_continuous_n(n)
     assert cfg.forecast_step_indices == expected
     assert cfg.max_consecutive_forecast_steps is None
