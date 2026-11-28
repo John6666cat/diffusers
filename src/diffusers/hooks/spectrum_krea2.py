@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental Krea 2 Raw paired-CFG adapter (opt-in, research-only; not Product/Stable).
+"""Experimental Krea 2 Raw / Kroma Turbo OPD adapter (opt-in, research-only).
 
-Both positive and negative denoiser calls use the *same* ``cache_context('krea')``
-but retain independent feature histories. The first and last transformer blocks
+Paired CFG calls use the same ``cache_context('krea')`` but retain independent
+feature histories; single-call Turbo uses only the positive history. The first and last transformer blocks
 form the body feature boundary, as in the historical 0.41 Krea adapter.
 """
 
@@ -41,7 +41,8 @@ class SpectrumKrea2RawState(BaseState):
 
     def reset(self) -> None:
         self.schedule.reset()
-        self.forecasters = {lane: SpectrumForecaster(self.config) for lane in ("positive", "negative")}
+        lanes = ("positive",) if self.config.denoiser_call_topology == "single" else ("positive", "negative")
+        self.forecasters = {lane: SpectrumForecaster(self.config) for lane in lanes}
         self.call_index = -1
         self.step_index = -1
         self.current_lane: str | None = None
@@ -66,7 +67,8 @@ class SpectrumKrea2RawState(BaseState):
 
     def prepare_call(self, context: Any, conditioning_identity: Any) -> None:
         self.call_index += 1
-        self.step_index, phase = divmod(self.call_index, 2)
+        calls_per_step = 1 if self.config.denoiser_call_topology == "single" else 2
+        self.step_index, phase = divmod(self.call_index, calls_per_step)
         self.current_lane = "positive" if phase == 0 else "negative"
 
         if (
@@ -74,7 +76,7 @@ class SpectrumKrea2RawState(BaseState):
             or context.step_index != self.step_index
             or context.num_inference_steps != self.config.num_inference_steps
         ):
-            self.latch("Krea native cache context / dual-lane logical-step mismatch")
+            self.latch("Krea native cache context / logical-step topology mismatch")
         if self.step_index >= self.config.num_inference_steps:
             self.latch("Krea denoiser calls exceeded configured logical-step count")
 

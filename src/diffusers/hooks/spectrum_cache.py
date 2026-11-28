@@ -580,6 +580,42 @@ class SpectrumCacheConfig:
         )
 
     @classmethod
+    def for_kroma_turbo_opd(cls, num_inference_steps: int = 10) -> "SpectrumCacheConfig":
+        """Opt-in Kroma v0.3.1 Turbo OPD single-call research profile, N8–12.
+
+        Use the distilled Krea 2 pipeline (fixed mu=1.15) with guidance_scale=0.0
+        (conventional CFG 1.0). The five masks preserve at least three initial
+        actual steps and the final actual step, with at most two consecutive
+        forecasts. Other step counts, weights, and CFG settings are unqualified.
+        """
+        masks = {
+            8: (3, 5, 6),
+            9: (3, 5, 7),
+            10: (3, 5, 7, 8),
+            11: (3, 5, 7, 9),
+            12: (4, 6, 8, 9),
+        }
+        if type(num_inference_steps) is not int or num_inference_steps not in masks:
+            raise ValueError("Kroma Turbo OPD requires an integer in [8, 12].")
+        forecast = masks[num_inference_steps]
+        return cls(
+            num_inference_steps=num_inference_steps,
+            forecast_step_indices=forecast,
+            denoiser_call_topology="single",
+            coordinate_policy="runtime_horizon_normalized",
+            coordinate_max=100.0,
+            degree=2,
+            ridge_lambda=0.1,
+            blend_w=0.5,
+            history_limit=6,
+            predictor_backend="fp32_weighted",
+            warmup_steps=0,
+            window_size=2.0,
+            flex_window=0.0,
+            tail_actual_steps=num_inference_steps - 1 - forecast[-1],
+        )
+
+    @classmethod
     def for_flux1_dev(cls, num_inference_steps: int = 50) -> "SpectrumCacheConfig":
         """Build the opt-in 50-step FLUX.1-dev distributed-refresh profile.
 
@@ -3730,23 +3766,26 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
         )
         return
 
-    # Experimental Krea 2 Raw paired-CFG path; old N52 masks stay valid.
-    # Keep its two-lane adapter isolated from the currently qualified families.
+    # Krea 2 Raw paired-CFG and Kroma Turbo OPD single-call share the body adapter.
     from ..models.transformers.transformer_krea2 import Krea2Transformer2DModel
 
     if isinstance(unwrapped, Krea2Transformer2DModel):
-        if (
-            config.denoiser_call_topology != "paired_cfg"
-            or config.coordinate_policy != "runtime_horizon_normalized"
-            or config.forecast_step_indices is None
-        ):
-            raise ValueError("Research Krea 2 Raw requires an explicit paired-CFG horizon-normalized profile.")
-        if config.num_inference_steps != 52:
+        if config.denoiser_call_topology == "single":
+            if config != SpectrumCacheConfig.for_kroma_turbo_opd(config.num_inference_steps):
+                raise ValueError("Research Kroma Turbo OPD requires the canonical opt-in N8–12 profile.")
+        else:
             if (
-                not config.allow_krea2_raw_variable_n
-                or config != SpectrumCacheConfig.for_krea2_raw_variable(config.num_inference_steps)
+                config.denoiser_call_topology != "paired_cfg"
+                or config.coordinate_policy != "runtime_horizon_normalized"
+                or config.forecast_step_indices is None
             ):
-                raise ValueError("Research Krea 2 Raw variable N requires the canonical opt-in N1–80 profile.")
+                raise ValueError("Research Krea 2 Raw requires an explicit paired-CFG horizon-normalized profile.")
+            if config.num_inference_steps != 52:
+                if (
+                    not config.allow_krea2_raw_variable_n
+                    or config != SpectrumCacheConfig.for_krea2_raw_variable(config.num_inference_steps)
+                ):
+                    raise ValueError("Research Krea 2 Raw variable N requires the canonical opt-in N1–80 profile.")
 
         signature = {
             "in_channels": 64,
@@ -3964,7 +4003,7 @@ def apply_spectrum_cache(module: torch.nn.Module, config: SpectrumCacheConfig) -
 
     raise ValueError(
         "SPECTRUM supports qualified FLUX.2 Klein Base, Neta Yume/Lumina2, Pony V7/AuraFlow, "
-        "experimental Krea 2 Raw, bounded Qwen-Image, Z-Image Base/Turbo, FLUX.3 Base, Anima/Cosmos "
+        "experimental Krea 2 Raw/Kroma Turbo OPD, bounded Qwen-Image, Z-Image Base/Turbo, FLUX.3 Base, Anima/Cosmos "
         "and SDXL/SD1.5 UNet only: "
         f"got {type(unwrapped).__name__}."
     )

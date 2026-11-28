@@ -276,3 +276,77 @@ def test_continuous_n_all_real_cpu_mechanics(num_steps):
     assert report["full_call_count"] == 2 * num_steps
     assert sum(block.calls for block in model.transformer_blocks) == 28 * 2 * num_steps
     model.disable_cache()
+
+
+@pytest.mark.parametrize(
+    "num_steps, forecasts",
+    ((8, (3, 5, 6)), (9, (3, 5, 7)), (10, (3, 5, 7, 8)), (11, (3, 5, 7, 9)), (12, (4, 6, 8, 9))),
+)
+def test_kroma_turbo_opd_native_single_call(num_steps, forecasts):
+    from diffusers import FlowMatchEulerDiscreteScheduler, Krea2Pipeline
+
+    model = make_model()
+    model.register_parameter("probe_device_anchor", torch.nn.Parameter(torch.zeros(1)))
+    scheduler = FlowMatchEulerDiscreteScheduler(
+        use_dynamic_shifting=True, base_shift=0.5, max_shift=1.15, base_image_seq_len=256, max_image_seq_len=6400
+    )
+    pipe = Krea2Pipeline(
+        scheduler=scheduler, vae=None, text_encoder=None, tokenizer=None, transformer=model, is_distilled=True
+    )
+    pipe.set_progress_bar_config(disable=True)
+    positive = torch.ones(1, 3, 12, 4)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    latents = torch.zeros(1, 4, 64)
+    cfg = SpectrumCacheConfig.for_kroma_turbo_opd(num_steps)
+    assert cfg.forecast_step_indices == forecasts
+
+    def sample(guidance=0.0):
+        return pipe(
+            prompt_embeds=positive, prompt_embeds_mask=mask,
+            negative_prompt_embeds=torch.full_like(positive, 2.0), negative_prompt_embeds_mask=mask,
+            latents=latents.clone(), height=32, width=32, num_inference_steps=num_steps,
+            guidance_scale=guidance, output_type="latent",
+        ).images
+
+    with torch.no_grad():
+        reference = sample()
+        before = sum(block.calls for block in model.transformer_blocks)
+        model.enable_cache(cfg)
+        try:
+            output = sample()
+            report = model._diffusers_hook.get_hook("spectrum_cache_denoiser").latest_summary
+            assert not report["guard_latched"], report["guard_reasons"]
+            assert report["forecast_steps"] == list(forecasts)
+            assert report["lane_prediction_call_count"] == {"positive": len(forecasts), "negative": 0}
+            assert report["full_call_count"] == num_steps - len(forecasts)
+            assert sum(block.calls for block in model.transformer_blocks) - before == 28 * (num_steps - len(forecasts))
+            assert torch.isfinite(output).all()
+        finally:
+            model.disable_cache()
+        torch.testing.assert_close(reference, sample(), rtol=0, atol=0)
+        if num_steps == 8:
+            model.enable_cache(cfg)
+            try:
+                sample(guidance=0.5)
+                report = model._diffusers_hook.get_hook("spectrum_cache_denoiser").latest_summary
+                assert report["guard_latched"] and report["prediction_call_count"] == 0
+            finally:
+                model.disable_cache()
+    assert not model.is_cache_enabled
+
+
+@pytest.mark.parametrize("bad", (True, 0, 7, 13, 80, 8.0))
+def test_kroma_turbo_opd_rejects_unqualified_horizon(bad):
+    with pytest.raises(ValueError, match="integer"):
+        SpectrumCacheConfig.for_kroma_turbo_opd(bad)
+
+
+def test_kroma_turbo_opd_rejects_noncanonical_profile():
+    from dataclasses import replace
+
+    cfg = SpectrumCacheConfig.for_kroma_turbo_opd(8)
+    model = make_model()
+    for invalid in (replace(cfg, degree=3), replace(cfg, forecast_step_indices=(3, 4, 5))):
+        with pytest.raises(ValueError, match="canonical opt-in"):
+            model.enable_cache(invalid)
+        assert not model.is_cache_enabled
